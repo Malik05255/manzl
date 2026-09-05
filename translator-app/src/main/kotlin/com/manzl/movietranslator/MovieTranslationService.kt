@@ -95,6 +95,14 @@ class MovieTranslationService : Service() {
         fun clearError() {
             _state.update { it.copy(error = null) }
         }
+
+        fun stateMutableUpdateForUi(stage: String) {
+            _state.update { it.copy(stage = stage) }
+        }
+
+        fun stateMutableErrorForUi(message: String) {
+            _state.update { it.copy(error = message) }
+        }
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
