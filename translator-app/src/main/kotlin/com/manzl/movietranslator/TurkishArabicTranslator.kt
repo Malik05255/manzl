@@ -3,36 +3,24 @@ package com.manzl.movietranslator
 import android.content.Context
 import android.os.PowerManager
 import android.os.SystemClock
-import com.google.android.gms.tasks.Task
-import com.google.mlkit.common.model.DownloadConditions
-import com.google.mlkit.nl.translate.TranslateLanguage
-import com.google.mlkit.nl.translate.Translation
-import com.google.mlkit.nl.translate.Translator
-import com.google.mlkit.nl.translate.TranslatorOptions
 import dev.ffmpegkit.llama.Llama
 import dev.ffmpegkit.llama.LlamaConfig
 import dev.ffmpegkit.llama.LlamaModel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.suspendCancellableCoroutine
 import java.util.Locale
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 
 /**
- * Human-oriented Turkish -> Arabic subtitle translator.
+ * Direct Turkish -> Arabic film subtitle translator.
  *
- * Qwen is the primary direct Turkish -> Arabic path. The translator dynamically enlarges scene
- * batches when measured throughput predicts a deadline miss, so we preserve direct semantic
- * translation for as much of the movie as possible. ML Kit is kept only as a last-resort tail or
- * device fallback; it is never the preferred path.
+ * The main rule is quality before fallback: every spoken line is translated by the local direct
+ * model. Time pressure may enlarge batches and disable no essential meaning, but it never swaps the
+ * remaining movie to a weaker translator. If marker fidelity fails, the batch is split and retried.
  */
 class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
     private var directModel: LlamaModel? = null
     private var directFailed = false
-    private var fallbackTranslator: Translator? = null
     private val powerManager = context.getSystemService(PowerManager::class.java)
 
-    /** Returns true when the direct Turkish -> Arabic model is active. */
     suspend fun ensureModel(
         onProgress: (Float) -> Unit = {},
         allowDownload: Boolean = true,
@@ -41,46 +29,36 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
             onProgress(1f)
             return true
         }
+        if (directFailed) return false
 
-        if (!directFailed) {
-            val manager = DirectTranslationModelManager(context)
-            if (!allowDownload && !manager.isInstalled()) {
-                directFailed = true
-            } else {
-                val loaded = runCatching {
-                    val modelFile = manager.ensureModel(onProgress)
-                    directModel = Llama.loadModel(
-                        modelPath = modelFile.absolutePath,
-                        config = LlamaConfig(
-                            contextSize = 2_048,
-                            // The free Android AAR is CPU/NEON. Four threads avoid pushing sustained
-                            // inference onto efficiency cores on heterogeneous Snapdragon CPUs.
-                            threads = 4,
-                            gpuLayers = 0,
-                            // Translation quality comes from context/prompting, not randomness.
-                            temperature = 0.25f,
-                            topP = 0.85f,
-                            topK = 20,
-                            seed = 42,
-                        ),
-                    )
-                }.isSuccess
-                if (loaded && directModel != null) {
-                    onProgress(1f)
-                    return true
-                }
-                directFailed = true
-            }
+        val manager = DirectTranslationModelManager(context)
+        if (!allowDownload && !manager.isInstalled()) {
+            directFailed = true
+            return false
         }
 
-        ensureFallbackModel()
-        onProgress(1f)
-        return false
-    }
+        val loaded = runCatching {
+            val modelFile = manager.ensureModel(onProgress)
+            directModel = Llama.loadModel(
+                modelPath = modelFile.absolutePath,
+                config = LlamaConfig(
+                    contextSize = 1_792,
+                    threads = 4,
+                    gpuLayers = 0,
+                    temperature = 0.10f,
+                    topP = 0.80f,
+                    topK = 20,
+                    seed = 42,
+                ),
+            )
+        }.isSuccess
 
-    /** Downloads the small emergency translator before the processing clock starts. */
-    suspend fun prepareFallbackModel() {
-        ensureFallbackModel()
+        if (!loaded || directModel == null) {
+            directFailed = true
+            return false
+        }
+        onProgress(1f)
+        return true
     }
 
     suspend fun translate(
@@ -89,6 +67,9 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
         onProgress: (done: Int, total: Int) -> Unit,
     ): List<SubtitleCue> {
         if (cues.isEmpty()) return emptyList()
+        check(directModel != null && !directFailed) {
+            "المترجم التركي ← العربي المباشر غير جاهز."
+        }
 
         val semanticCues = mergeSemanticCues(cues)
         val result = ArrayList<SubtitleCue>(semanticCues.size)
@@ -100,10 +81,8 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
         while (cursor < semanticCues.size) {
             thermalYieldIfNeeded()
 
-            val now = SystemClock.elapsedRealtime()
-            val remainingMs = deadlineAtElapsedRealtimeMs - now
+            val remainingMs = deadlineAtElapsedRealtimeMs - SystemClock.elapsedRealtime()
             val remainingCues = semanticCues.size - cursor
-
             if (!compressed && observedCues >= MIN_CALIBRATION_CUES && remainingMs > 0L) {
                 val averageMsPerCue = observedMs.toDouble() / observedCues.toDouble()
                 val projectedMs = averageMsPerCue * remainingCues.toDouble()
@@ -115,22 +94,13 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
             val batch = buildNextBatch(semanticCues, cursor, compressed)
             val recentContext = result.takeLast(RECENT_CONTEXT_CUES)
             val startedAt = SystemClock.elapsedRealtime()
+            val translated = translateBatch(
+                batch = batch,
+                recentContext = recentContext,
+                compressed = compressed,
+            )
 
-            val translated = if (remainingMs <= HARD_FALLBACK_TAIL_MS) {
-                // Absolute deadline safety valve. This should affect only a small tail on a slow or
-                // thermally throttled device; the main movie remains direct Turkish -> Arabic.
-                translateFallbackBatch(batch)
-            } else {
-                translateBatch(
-                    batch = batch,
-                    recentContext = recentContext,
-                    deadlineAtElapsedRealtimeMs = deadlineAtElapsedRealtimeMs,
-                    compressed = compressed,
-                )
-            }
-
-            val tookMs = (SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(1L)
-            observedMs += tookMs
+            observedMs += (SystemClock.elapsedRealtime() - startedAt).coerceAtLeast(1L)
             observedCues += batch.size
             result += translated
             cursor += batch.size
@@ -143,61 +113,55 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
     private suspend fun translateBatch(
         batch: List<SubtitleCue>,
         recentContext: List<SubtitleCue>,
-        deadlineAtElapsedRealtimeMs: Long,
         compressed: Boolean,
     ): List<SubtitleCue> {
         if (batch.size == 1) {
             fixedHumanPhrase(batch.first())?.let { return listOf(it) }
         }
 
-        val model = directModel
-        if (model != null && !directFailed) {
-            val direct = runCatching {
-                translateDirectBatch(
-                    model = model,
-                    batch = batch,
-                    recentContext = recentContext,
-                    compressed = compressed,
-                    repairMode = false,
-                )
-            }.getOrNull()
+        val model = directModel ?: error("المترجم المباشر غير محمل.")
+        val direct = runCatching {
+            translateDirectBatch(
+                model = model,
+                batch = batch,
+                recentContext = recentContext,
+                compressed = compressed,
+                repairMode = false,
+            )
+        }.getOrNull()
 
-            if (direct != null && direct.size == batch.size && direct.all { hasUsefulArabic(it.translatedText) }) {
-                return qualityRepairIfNeeded(
-                    model = model,
-                    sourceBatch = batch,
-                    translatedBatch = direct,
-                    recentContext = recentContext,
-                    deadlineAtElapsedRealtimeMs = deadlineAtElapsedRealtimeMs,
-                    compressed = compressed,
-                )
-            }
-
-            // Marker fidelity can occasionally degrade on a complex scene. Retry smaller direct
-            // batches only when enough time remains; otherwise use the emergency translator rather
-            // than letting recursive retries destroy the global time budget.
-            if (batch.size > 1 &&
-                deadlineAtElapsedRealtimeMs - SystemClock.elapsedRealtime() > SPLIT_RETRY_MIN_MS
-            ) {
-                val middle = batch.size / 2
-                val left = translateBatch(
-                    batch.subList(0, middle),
-                    recentContext,
-                    deadlineAtElapsedRealtimeMs,
-                    compressed,
-                )
-                val rightContext = (recentContext + left).takeLast(RECENT_CONTEXT_CUES)
-                val right = translateBatch(
-                    batch.subList(middle, batch.size),
-                    rightContext,
-                    deadlineAtElapsedRealtimeMs,
-                    compressed,
-                )
-                return left + right
-            }
+        if (isValidBatch(direct, batch.size)) {
+            return qualityRepairIfNeeded(
+                model = model,
+                sourceBatch = batch,
+                translatedBatch = direct!!,
+                recentContext = recentContext,
+            )
         }
 
-        return translateFallbackBatch(batch)
+        // Never replace a failed direct batch with a lower-quality translator. Split the scene until
+        // marker fidelity is restored. A single line gets one strict retry, then the run fails loudly
+        // rather than silently outputting Turkish or dropping dialogue.
+        if (batch.size > 1) {
+            val middle = batch.size / 2
+            val left = translateBatch(batch.subList(0, middle), recentContext, compressed = false)
+            val rightContext = (recentContext + left).takeLast(RECENT_CONTEXT_CUES)
+            val right = translateBatch(batch.subList(middle, batch.size), rightContext, compressed = false)
+            return left + right
+        }
+
+        val retry = runCatching {
+            translateDirectBatch(
+                model = model,
+                batch = batch,
+                recentContext = recentContext,
+                compressed = false,
+                repairMode = true,
+            )
+        }.getOrNull()
+        if (isValidBatch(retry, 1)) return retry!!
+
+        error("تعذر إخراج ترجمة عربية موثوقة للسطر: ${batch.first().sourceText.take(80)}")
     }
 
     private suspend fun qualityRepairIfNeeded(
@@ -205,15 +169,7 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
         sourceBatch: List<SubtitleCue>,
         translatedBatch: List<SubtitleCue>,
         recentContext: List<SubtitleCue>,
-        deadlineAtElapsedRealtimeMs: Long,
-        compressed: Boolean,
     ): List<SubtitleCue> {
-        if (compressed ||
-            deadlineAtElapsedRealtimeMs - SystemClock.elapsedRealtime() <= QUALITY_REPAIR_MIN_MS
-        ) {
-            return translatedBatch
-        }
-
         val suspicious = sourceBatch.indices
             .filter { index -> needsQualityRepair(sourceBatch[index], translatedBatch[index]) }
             .take(MAX_QUALITY_REPAIRS_PER_BATCH)
@@ -221,8 +177,7 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
 
         val repaired = translatedBatch.toMutableList()
         for (index in suspicious) {
-            if (deadlineAtElapsedRealtimeMs - SystemClock.elapsedRealtime() <= QUALITY_REPAIR_MIN_MS) break
-
+            thermalYieldIfNeeded()
             val localContext = (recentContext + repaired.take(index)).takeLast(RECENT_CONTEXT_CUES)
             val retry = runCatching {
                 translateDirectBatch(
@@ -254,16 +209,16 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
         val prompt = buildString {
             appendLine("/no_think")
             if (recentContext.isNotEmpty()) {
-                appendLine("سياق سابق للفهم فقط، لا تعِد إخراجه:")
+                appendLine("سياق سابق للفهم فقط — لا تعِد ترجمته:")
                 recentContext.forEach { cue ->
-                    append("TR: ").append(cue.sourceText.take(120))
-                        .append(" | AR: ").append(cue.translatedText.take(120)).append('\n')
+                    append("TR: ").append(cue.sourceText.take(110))
+                        .append(" | AR: ").append(cue.translatedText.take(110)).append('\n')
                 }
             }
             if (repairMode) {
-                appendLine("أصلح هذا السطر: افهم التركية أولًا ثم اكتب المقابل العربي الطبيعي، بلا حرفية أو شرح:")
+                appendLine("أعد ترجمة السطر التالي بدقة: لا تحذف أي معنى، ولا تشرح، ولا تكتب التركية:")
             } else {
-                appendLine("ترجم الحوار المطلوب مباشرة، وحافظ على كل علامة:")
+                appendLine("ترجم كل سطر تركي إلى العربية سطرًا بسطر. لا تدمج سطرين ولا تسقط أي سطر. حافظ على العلامات كما هي:")
             }
             batch.forEachIndexed { index, cue ->
                 append(marker(index)).append(' ').append(cue.sourceText.trim()).append('\n')
@@ -271,8 +226,8 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
         }
 
         val sourceChars = batch.sumOf { it.sourceText.length }
-        val tokenCap = if (compressed) 560 else 640
-        val maxTokens = (sourceChars * 2 / 3 + 80).coerceIn(112, tokenCap)
+        val tokenCap = if (compressed) 560 else 620
+        val maxTokens = (sourceChars * 2 / 3 + 96).coerceIn(112, tokenCap)
         val response = Llama.complete(
             model = model,
             prompt = prompt,
@@ -283,60 +238,14 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
         val pieces = parseMarkedTranslation(sanitizeModelOutput(response), batch.size) ?: return null
         return batch.mapIndexed { index, cue ->
             val arabic = cleanArabic(pieces[index])
-            cue.copy(translatedText = arabic.ifBlank { cue.sourceText })
+            cue.copy(translatedText = arabic)
         }
     }
 
-    private suspend fun translateFallbackBatch(batch: List<SubtitleCue>): List<SubtitleCue> {
-        val translator = ensureFallbackModel()
-        if (batch.size == 1) {
-            val cue = batch.first()
-            fixedHumanPhrase(cue)?.let { return listOf(it) }
-            val arabic = cleanArabic(translator.translate(cue.sourceText).await())
-            return listOf(cue.copy(translatedText = arabic.ifBlank { cue.sourceText }))
-        }
-
-        val payload = buildString {
-            batch.forEachIndexed { index, cue ->
-                append(marker(index)).append(' ').append(cue.sourceText.trim()).append('\n')
-            }
-        }
-        val translated = translator.translate(payload).await()
-        val pieces = parseMarkedTranslation(translated, batch.size)
-        if (pieces != null) {
-            return batch.mapIndexed { index, cue ->
-                val arabic = cleanArabic(pieces[index])
-                cue.copy(translatedText = arabic.ifBlank { cue.sourceText })
-            }
-        }
-
-        return batch.map { cue ->
-            fixedHumanPhrase(cue) ?: run {
-                val arabic = cleanArabic(translator.translate(cue.sourceText).await())
-                cue.copy(translatedText = arabic.ifBlank { cue.sourceText })
-            }
-        }
-    }
-
-    private suspend fun ensureFallbackModel(): Translator {
-        val existing = fallbackTranslator
-        if (existing != null) return existing
-
-        val created = Translation.getClient(
-            TranslatorOptions.Builder()
-                .setSourceLanguage(TranslateLanguage.TURKISH)
-                .setTargetLanguage(TranslateLanguage.ARABIC)
-                .build(),
-        )
-        try {
-            created.downloadModelIfNeeded(DownloadConditions.Builder().build()).await()
-        } catch (error: Throwable) {
-            created.close()
-            throw error
-        }
-        fallbackTranslator = created
-        return created
-    }
+    private fun isValidBatch(batch: List<SubtitleCue>?, expected: Int): Boolean =
+        batch != null &&
+            batch.size == expected &&
+            batch.all { hasUsefulArabic(it.translatedText) }
 
     private fun buildNextBatch(
         cues: List<SubtitleCue>,
@@ -389,7 +298,7 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
         if (value.isBlank()) return false
         val letters = value.count { it.isLetter() }.coerceAtLeast(1)
         val arabic = value.count { it in '\u0600'..'\u06FF' }
-        return arabic.toFloat() / letters.toFloat() >= 0.45f
+        return arabic.toFloat() / letters.toFloat() >= 0.62f
     }
 
     private fun needsQualityRepair(source: SubtitleCue, translated: SubtitleCue): Boolean =
@@ -415,25 +324,20 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
     override fun close() {
         directModel?.let { runCatching { Llama.releaseModel(it) } }
         directModel = null
-        fallbackTranslator?.close()
-        fallbackTranslator = null
     }
 
     companion object {
-        private const val NORMAL_BATCH_SIZE = 8
-        private const val NORMAL_BATCH_CHARS = 900
-        private const val COMPRESSED_BATCH_SIZE = 12
-        private const val COMPRESSED_BATCH_CHARS = 1_300
-        private const val MAX_CONTEXT_GAP_MS = 4_500L
-        private const val MAX_SEMANTIC_GAP_MS = 900L
-        private const val MAX_SEMANTIC_DURATION_MS = 6_500L
-        private const val MAX_SEMANTIC_CHARS = 140
-        private const val RECENT_CONTEXT_CUES = 2
-        private const val MIN_CALIBRATION_CUES = 12
-        private const val COMPRESSION_TRIGGER_RATIO = 0.88
-        private const val HARD_FALLBACK_TAIL_MS = 25_000L
-        private const val SPLIT_RETRY_MIN_MS = 40_000L
-        private const val QUALITY_REPAIR_MIN_MS = 90_000L
+        private const val NORMAL_BATCH_SIZE = 6
+        private const val NORMAL_BATCH_CHARS = 760
+        private const val COMPRESSED_BATCH_SIZE = 9
+        private const val COMPRESSED_BATCH_CHARS = 1_050
+        private const val MAX_CONTEXT_GAP_MS = 3_500L
+        private const val MAX_SEMANTIC_GAP_MS = 450L
+        private const val MAX_SEMANTIC_DURATION_MS = 4_800L
+        private const val MAX_SEMANTIC_CHARS = 110
+        private const val RECENT_CONTEXT_CUES = 3
+        private const val MIN_CALIBRATION_CUES = 10
+        private const val COMPRESSION_TRIGGER_RATIO = 0.90
         private const val MAX_QUALITY_REPAIRS_PER_BATCH = 2
 
         private val TURKISH_LOCALE = Locale.forLanguageTag("tr")
@@ -444,17 +348,16 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
         private val THINK_BLOCK = Regex("<think>.*?</think>", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
         private val LATIN_WORD = Regex("\\b[A-Za-zÇĞİÖŞÜçğıöşü]{3,}\\b")
         private val MODEL_PREFACE = Regex("^(بالطبع|إليك|الترجمة(?: العربية)?[:：]?)\\s*", RegexOption.IGNORE_CASE)
+        private val REPEATED_ARABIC_WORD = Regex("\\b([\\u0600-\\u06FF]{2,})\\s+\\1\\s+\\1\\b")
 
         private val DIRECT_SYSTEM_PROMPT = """
             /no_think
-            أنت مترجم أفلام محترف من التركية إلى العربية. افهم المقصود أولًا ثم اكتب ما سيقوله مترجم بشري عربي، لا ترجمة كلمة بكلمة.
-            حافظ على كل معنى مهم، الأسماء، العلاقات، النبرة، المزاح، السخرية، الشتائم والتودد، ولا تلخص الحوار ولا تخترع معنى.
-            استخدم عربية فصحى طبيعية قصيرة مناسبة للترجمة على الشاشة، ولا تخمّن جنس المتحدث إذا لم يوضحه السياق.
-            أعد علامات §n§ نفسها وبالترتيب، وبعد كل علامة العربية فقط. لا تشرح ولا تذكر أنك تترجم.
+            أنت مترجم أفلام تركية محترف إلى العربية. افهم الجملة في سياق المشهد ثم اكتب المقابل الذي سيختاره مترجم عربي بشري، لا ترجمة كلمة بكلمة.
+            لا تختصر ولا تحذف أي معلومة أو رد قصير. لا تخترع معنى. حافظ على الأسماء والعلاقات والضمائر والنبرة والمزاح والسخرية والشتائم والتودد.
+            استخدم عربية فصحى طبيعية سهلة وقصيرة مناسبة للشاشة. إذا كان التعبير التركي اصطلاحيًا فانقل معناه العربي الطبيعي لا ألفاظه الحرفية.
+            لكل علامة §n§ أعد علامة §n§ نفسها مرة واحدة ثم ترجمة ذلك السطر فقط. ممنوع دمج سطرين أو إسقاط علامة. لا تشرح ولا تكتب التركية.
         """.trimIndent()
 
-        // Keep only context-stable phrases. Ambiguous replies are deliberately left to Qwen so
-        // tone and scene context can decide the human Arabic wording.
         private val COMMON_PHRASES = mapOf(
             "evet" to "نعم.",
             "hayır" to "لا.",
@@ -513,13 +416,15 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
             val clean = arabic.trim()
             if (clean.isBlank()) return true
             if (MODEL_PREFACE.containsMatchIn(clean)) return true
-            if (source.length >= 18 && clean.length < 4) return true
+            if (source.length >= 14 && clean.length < 4) return true
+            if (source.length >= 24 && clean.length < source.length * 0.10) return true
             if (clean.length > source.length * 3 + 80) return true
-            if (LATIN_WORD.findAll(clean).count() >= 3) return true
+            if (LATIN_WORD.findAll(clean).count() >= 2) return true
+            if (REPEATED_ARABIC_WORD.containsMatchIn(clean)) return true
 
             val letters = clean.count { it.isLetter() }.coerceAtLeast(1)
             val arabicLetters = clean.count { it in '\u0600'..'\u06FF' }
-            return arabicLetters.toDouble() / letters.toDouble() < 0.55
+            return arabicLetters.toDouble() / letters.toDouble() < 0.62
         }
 
         private fun mergeSemanticCues(cues: List<SubtitleCue>): List<SubtitleCue> {
@@ -563,14 +468,4 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
             .replace(';', '؛')
             .replace('?', '؟')
     }
-}
-
-private suspend fun <T> Task<T>.await(): T = suspendCancellableCoroutine { continuation ->
-    addOnSuccessListener { value ->
-        if (continuation.isActive) continuation.resume(value)
-    }
-    addOnFailureListener { error ->
-        if (continuation.isActive) continuation.resumeWithException(error)
-    }
-    addOnCanceledListener { continuation.cancel() }
 }
