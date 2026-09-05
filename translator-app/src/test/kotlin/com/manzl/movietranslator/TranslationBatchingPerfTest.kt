@@ -15,30 +15,30 @@ class TranslationBatchingPerfTest {
     }
 
     @Test
-    fun normalContextBatches_amortizeModelCallsOnShortClips() {
+    fun normalContextBatches_preserveEveryCueAndKeepScenesSmall() {
         val input = cues(24)
         val batches = TurkishArabicTranslator.buildContextBatchesForTest(input)
 
-        assertTrue(batches.size <= 2)
-        assertTrue(batches.all { it.size <= 14 })
-        assertTrue(batches.all { batch -> batch.sumOf { it.sourceText.length } <= 1_500 })
+        assertTrue(batches.all { it.size <= 8 })
+        assertTrue(batches.all { batch -> batch.sumOf { it.sourceText.length } <= 800 })
         assertEquals(input.size, batches.sumOf { it.size })
+        assertEquals(input.map { it.sourceText }, batches.flatten().map { it.sourceText })
     }
 
     @Test
-    fun compressedContextBatches_reduceCallsFurtherWhenDeadlineIsAtRisk() {
+    fun compactBatches_remainBoundedWhenDeadlineIsTight() {
         val input = cues(24)
         val normal = TurkishArabicTranslator.buildContextBatchesForTest(input)
-        val compressed = TurkishArabicTranslator.buildContextBatchesForTest(input, compressed = true)
+        val compact = TurkishArabicTranslator.buildContextBatchesForTest(input, compressed = true)
 
-        assertTrue(compressed.size <= normal.size)
-        assertTrue(compressed.all { it.size <= 20 })
-        assertTrue(compressed.all { batch -> batch.sumOf { it.sourceText.length } <= 2_100 })
-        assertEquals(input.size, compressed.sumOf { it.size })
+        assertTrue(compact.size <= normal.size)
+        assertTrue(compact.all { it.size <= 10 })
+        assertTrue(compact.all { batch -> batch.sumOf { it.sourceText.length } <= 1_000 })
+        assertEquals(input.size, compact.sumOf { it.size })
     }
 
     @Test
-    fun qualityGate_flagsModelPrefacesAndNonArabicLeakage() {
+    fun qualityGate_flagsPrefacesAndNonArabicLeakage() {
         assertTrue(
             TurkishArabicTranslator.translationNeedsRepairForTest(
                 source = "Seni burada görmeyi beklemiyordum.",
