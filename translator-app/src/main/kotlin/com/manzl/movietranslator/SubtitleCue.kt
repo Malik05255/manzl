@@ -5,6 +5,7 @@ data class SubtitleCue(
     val endMs: Long,
     val sourceText: String,
     val translatedText: String = "",
+    val confidence: Float = 1f,
 )
 
 object SrtFormatter {
