@@ -48,15 +48,17 @@ class MovieTranslationService : Service() {
                 videoUri = uri,
                 videoName = displayName,
                 stage = "جاهز للترجمة: $displayName",
-                modelInstalled = VoskModelManager(context.applicationContext).isInstalled(),
+                modelInstalled = allModelsInstalled(context.applicationContext),
             )
         }
 
         fun refreshModelStatus(context: Context) {
-            _state.update {
-                it.copy(modelInstalled = VoskModelManager(context.applicationContext).isInstalled())
-            }
+            _state.update { it.copy(modelInstalled = allModelsInstalled(context.applicationContext)) }
         }
+
+        private fun allModelsInstalled(context: Context): Boolean =
+            WhisperRepairEngine(context).isModelInstalled() &&
+                DirectTranslationModelManager(context).isInstalled()
 
         fun start(context: Context) {
             val current = _state.value
@@ -96,17 +98,9 @@ class MovieTranslationService : Service() {
             }
         }
 
-        fun clearError() {
-            _state.update { it.copy(error = null) }
-        }
-
-        fun stateMutableUpdateForUi(stage: String) {
-            _state.update { it.copy(stage = stage) }
-        }
-
-        fun stateMutableErrorForUi(message: String) {
-            _state.update { it.copy(error = message) }
-        }
+        fun clearError() { _state.update { it.copy(error = null) } }
+        fun stateMutableUpdateForUi(stage: String) { _state.update { it.copy(stage = stage) } }
+        fun stateMutableErrorForUi(message: String) { _state.update { it.copy(error = message) } }
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -134,11 +128,9 @@ class MovieTranslationService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         when (intent?.action) {
             ACTION_CANCEL -> cancelWork()
-            ACTION_START, null -> {
-                if (worker?.isActive != true) {
-                    if (!promoteToForeground()) return START_NOT_STICKY
-                    beginTranslation()
-                }
+            ACTION_START, null -> if (worker?.isActive != true) {
+                if (!promoteToForeground()) return START_NOT_STICKY
+                beginTranslation()
             }
         }
         return START_NOT_STICKY
@@ -188,111 +180,65 @@ class MovieTranslationService : Service() {
 
         worker = scope.launch {
             var translator: TurkishArabicTranslator? = null
-            var repairCandidates: List<RepairCandidate> = emptyList()
+            var speechWindows: List<SpeechWindow> = emptyList()
             try {
-                // Model downloads are one-time setup and intentionally outside the movie timer.
-                publish(0f, "تجهيز النماذج المحلية…", force = true)
-                val modelManager = VoskModelManager(applicationContext)
-                val modelDir = withContext(Dispatchers.IO) {
-                    modelManager.ensureModel { p ->
-                        publish(p * 0.03f, "تجهيز نموذج الاستماع التركي…")
-                    }
-                }
-                _state.update { it.copy(modelInstalled = true) }
+                // Downloads are one-time setup and remain outside the movie processing timer.
+                publish(0f, "تجهيز نموذج الاستماع التركي الدقيق…", force = true)
+                val whisperEngine = WhisperRepairEngine(applicationContext)
+                check(whisperEngine.prepareModel()) { "تعذر تجهيز نموذج الاستماع التركي الدقيق." }
 
+                publish(0.03f, "تجهيز مترجم تركي ← عربي متخصص…", force = true)
                 val directReady = runCatching {
                     DirectTranslationModelManager(applicationContext).ensureModel { p ->
-                        publish(0.03f + (p * 0.03f), "تجهيز نموذج الترجمة التركية ← العربية…")
+                        publish(0.03f + p * 0.03f, "تجهيز مترجم تركي ← عربي متخصص…")
                     }
                 }.isSuccess
-
-                val whisperEngine = WhisperRepairEngine(applicationContext)
-                val whisperReady = whisperEngine.prepareModel()
+                check(directReady) { "تعذر تجهيز نموذج الترجمة التركي ← العربي." }
+                _state.update { it.copy(modelInstalled = true) }
 
                 val movieDurationMs = withContext(Dispatchers.IO) { readMovieDurationMs(videoUri) }
                 val plan = ProcessingBudget.forMovie(movieDurationMs)
                 currentPlan = plan
                 budgetStartedAtMs = SystemClock.elapsedRealtime()
 
-                publish(0.08f, "التقاط كل الحوار التركي…", force = true)
-                val transcription = MediaAudioTranscriber(applicationContext).transcribe(
+                publish(0.08f, "تحديد مناطق الحوار الحقيقي داخل الصوت…", force = true)
+                speechWindows = MediaAudioTranscriber(applicationContext).extractSpeech(
                     uri = videoUri,
-                    modelDir = modelDir,
                     onProgress = { p ->
-                        publish(0.08f + p * 0.44f, "التقاط كل الحوار التركي…")
+                        publish(0.08f + p * 0.20f, "تحديد مناطق الحوار الحقيقي داخل الصوت…")
                     },
                 )
-
-                repairCandidates = transcription.repairCandidates
-                check(transcription.cues.isNotEmpty() || repairCandidates.isNotEmpty()) {
+                check(speechWindows.isNotEmpty()) {
                     "لم أجد حوارًا تركيًا قابلًا للترجمة في هذا الملف."
                 }
 
-                var sourceCues = transcription.cues
-                val mandatoryCount = repairCandidates.count { it.mandatory }
-                val elapsedAfterFastAsr = elapsedBudgetMs()
-                val translationReserve = (plan.targetTotalMs * 0.62).toLong()
-                val availableForOptionalWhisper = (
-                    plan.targetTotalMs - elapsedAfterFastAsr - translationReserve - plan.finalReserveMs
-                ).coerceAtLeast(0L)
-                val optionalWhisperBudget = minOf(
-                    plan.whisperWallBudgetMs,
-                    availableForOptionalWhisper,
-                )
-
-                if (repairCandidates.isNotEmpty()) {
-                    if (!whisperReady && mandatoryCount > 0) {
-                        error("تعذر تشغيل نموذج الاستماع الدقيق، لذلك أوقفت العملية بدل حذف كلام من الترجمة.")
-                    }
-
-                    val shouldRunWhisper = whisperReady &&
-                        (mandatoryCount > 0 || optionalWhisperBudget >= 8_000L)
-
-                    if (shouldRunWhisper) {
-                        val stage = if (mandatoryCount > 0) {
-                            "استرجاع الكلام الذي لم يلتقطه الاستماع السريع…"
-                        } else {
-                            "تحسين المقاطع الأقل ثقة…"
-                        }
-                        publish(0.52f, stage, force = true)
-                        sourceCues = whisperEngine.repair(
-                            original = sourceCues,
-                            candidates = repairCandidates,
-                            maxWallTimeMs = optionalWhisperBudget,
-                        ) { done, total ->
-                            val ratio = done.toFloat() / total.coerceAtLeast(1).toFloat()
-                            publish(0.52f + ratio * 0.12f, stage)
-                        }
-                        repairCandidates = emptyList()
-                    } else {
-                        repairCandidates.forEach { it.wavFile.delete() }
-                        repairCandidates = emptyList()
-                        publish(0.64f, "الحوار واضح — تجاوزت المراجعة الإضافية", force = true)
-                    }
-                } else {
-                    publish(0.64f, "تم التقاط الحوار كاملًا", force = true)
+                val listeningStage = "الاستماع الدقيق لكل الحوار التركي…"
+                publish(0.28f, listeningStage, force = true)
+                val sourceCues = whisperEngine.transcribeAll(speechWindows) { done, total ->
+                    val ratio = done.toFloat() / total.coerceAtLeast(1).toFloat()
+                    publish(0.28f + ratio * 0.35f, listeningStage)
                 }
+                speechWindows = emptyList()
+                check(sourceCues.isNotEmpty()) { "لم ينتج الاستماع الدقيق نصًا تركيًا قابلًا للترجمة." }
 
-                check(sourceCues.isNotEmpty()) {
-                    "لم ينتج نص تركي كافٍ بعد مراجعة الاستماع."
-                }
-
+                // Whisper has been released at this point. Only now load Hy-MT2, preventing the two
+                // heavy models from occupying RAM together.
                 translator = TurkishArabicTranslator(applicationContext)
-                publish(0.64f, "تحميل المترجم التركي ← العربي المباشر…", force = true)
+                publish(0.63f, "تحميل المترجم التركي ← العربي المتخصص…", force = true)
                 val directActive = translator.ensureModel(
                     onProgress = { p ->
-                        publish(0.64f + p * 0.04f, "تحميل المترجم التركي ← العربي المباشر…")
+                        publish(0.63f + p * 0.05f, "تحميل المترجم التركي ← العربي المتخصص…")
                     },
                     allowDownload = false,
                 )
-                check(directReady && directActive) {
-                    "تعذر تشغيل المترجم التركي ← العربي المباشر. أوقفت العملية بدل استخدام ترجمة أقل جودة."
+                check(directActive) {
+                    "تعذر تشغيل المترجم التركي ← العربي المتخصص."
                 }
 
-                val translationStage = "صياغة ترجمة عربية طبيعية من التركية…"
+                val translationStage = "صياغة ترجمة عربية طبيعية مع الحفاظ على كل الحوار…"
                 translationStartedAtMs = SystemClock.elapsedRealtime()
                 translationDone = 0
-                translationTotal = 0
+                translationTotal = sourceCues.size
                 publish(0.68f, translationStage, force = true)
 
                 val translated = translator.translate(
@@ -305,6 +251,9 @@ class MovieTranslationService : Service() {
                     publish(0.68f + ratio * 0.31f, translationStage)
                 }
 
+                check(translated.size == sourceCues.size) {
+                    "اكتشفت فقدًا في عدد سطور الحوار، لذلك لم أحفظ ترجمة ناقصة."
+                }
                 check(translated.isNotEmpty()) { "لم ينتج المترجم أي سطور عربية." }
 
                 publish(0.99f, "تنسيق التوقيت وتجهيز ملف الترجمة…", force = true)
@@ -324,7 +273,7 @@ class MovieTranslationService : Service() {
                 val targetNote = if (processingElapsed <= plan.targetTotalMs) {
                     "ضمن الهدف ${formatDuration(plan.targetTotalMs)}"
                 } else {
-                    "تم الحفاظ على اكتمال الحوار ولو تجاوز الوقت المستهدف"
+                    "اكتمل الحوار كاملًا ولو تجاوز هدف الوقت"
                 }
                 _state.update {
                     it.copy(
@@ -355,7 +304,7 @@ class MovieTranslationService : Service() {
                     )
                 }
             } finally {
-                repairCandidates.forEach { it.wavFile.delete() }
+                speechWindows.forEach { it.wavFile.delete() }
                 statusTicker?.cancel()
                 statusTicker = null
                 translator?.close()
@@ -374,7 +323,6 @@ class MovieTranslationService : Service() {
             lastUiProgress = bounded
             _state.update { it.copy(progress = bounded, stage = decoratedStage, isRunning = true) }
         }
-
         val percent = (bounded * 100f).toInt().coerceIn(0, 100)
         if (force || percent - lastNotificationPercent >= 3 || stage != lastNotificationStage) {
             lastNotificationPercent = percent
@@ -404,22 +352,15 @@ class MovieTranslationService : Service() {
         if (operationStartedAtMs <= 0L) return stage
         val elapsed = if (budgetStartedAtMs > 0L) elapsedBudgetMs() else elapsedOperationMs()
         val target = currentPlan?.let { " • الهدف ${formatDuration(it.targetTotalMs)}" }.orEmpty()
-
         if (translationStartedAtMs > 0L && stage.contains("ترجم")) {
             val translatedInfo = if (translationTotal > 0) {
                 "${translationDone.coerceAtMost(translationTotal)} من $translationTotal"
-            } else {
-                "بدء المرحلة"
-            }
+            } else "بدء المرحلة"
             val eta = estimateTranslationRemainingMs()
-            val etaText = if (eta != null) {
-                "متبقي تقريبًا ${formatDuration(eta)}"
-            } else {
-                "جارٍ حساب الوقت المتبقي"
-            }
+            val etaText = if (eta != null) "متبقي تقريبًا ${formatDuration(eta)}"
+            else "جارٍ حساب الوقت المتبقي"
             return "$stage\n$translatedInfo • مضى ${formatDuration(elapsed)}$target • $etaText"
         }
-
         return "$stage\nمضى ${formatDuration(elapsed)}$target"
     }
 
@@ -430,8 +371,7 @@ class MovieTranslationService : Service() {
         val stageElapsed = (SystemClock.elapsedRealtime() - translationStartedAtMs).coerceAtLeast(1L)
         val remainingUnits = translationTotal - translationDone
         return (stageElapsed.toDouble() * remainingUnits.toDouble() / translationDone.toDouble())
-            .toLong()
-            .coerceAtLeast(0L)
+            .toLong().coerceAtLeast(0L)
     }
 
     private fun readMovieDurationMs(uri: Uri): Long {
@@ -439,9 +379,7 @@ class MovieTranslationService : Service() {
         return try {
             retriever.setDataSource(this, uri)
             retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)
-                ?.toLongOrNull()
-                ?.coerceAtLeast(1L)
-                ?: DEFAULT_MOVIE_DURATION_MS
+                ?.toLongOrNull()?.coerceAtLeast(1L) ?: DEFAULT_MOVIE_DURATION_MS
         } catch (_: Throwable) {
             DEFAULT_MOVIE_DURATION_MS
         } finally {
@@ -449,30 +387,21 @@ class MovieTranslationService : Service() {
         }
     }
 
-    private fun elapsedOperationMs(): Long =
-        if (operationStartedAtMs > 0L) {
-            (SystemClock.elapsedRealtime() - operationStartedAtMs).coerceAtLeast(0L)
-        } else {
-            0L
-        }
+    private fun elapsedOperationMs(): Long = if (operationStartedAtMs > 0L) {
+        (SystemClock.elapsedRealtime() - operationStartedAtMs).coerceAtLeast(0L)
+    } else 0L
 
-    private fun elapsedBudgetMs(): Long =
-        if (budgetStartedAtMs > 0L) {
-            (SystemClock.elapsedRealtime() - budgetStartedAtMs).coerceAtLeast(0L)
-        } else {
-            0L
-        }
+    private fun elapsedBudgetMs(): Long = if (budgetStartedAtMs > 0L) {
+        (SystemClock.elapsedRealtime() - budgetStartedAtMs).coerceAtLeast(0L)
+    } else 0L
 
     private fun formatDuration(milliseconds: Long): String {
         val totalSeconds = (milliseconds / 1_000L).coerceAtLeast(0L)
         val hours = totalSeconds / 3_600L
         val minutes = (totalSeconds % 3_600L) / 60L
         val seconds = totalSeconds % 60L
-        return if (hours > 0L) {
-            "%d:%02d:%02d".format(hours, minutes, seconds)
-        } else {
-            "%02d:%02d".format(minutes, seconds)
-        }
+        return if (hours > 0L) "%d:%02d:%02d".format(hours, minutes, seconds)
+        else "%02d:%02d".format(minutes, seconds)
     }
 
     private fun cancelWork() {
@@ -494,16 +423,17 @@ class MovieTranslationService : Service() {
 
     private fun acquireWakeLock() {
         val power = getSystemService(PowerManager::class.java)
-        wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:movie-translation").apply {
+        wakeLock = power.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "$packageName:movie-translation",
+        ).apply {
             setReferenceCounted(false)
             acquire(6 * 60 * 60 * 1_000L)
         }
     }
 
     private fun releaseWakeLock() {
-        wakeLock?.let { lock ->
-            if (lock.isHeld) runCatching { lock.release() }
-        }
+        wakeLock?.let { lock -> if (lock.isHeld) runCatching { lock.release() } }
         wakeLock = null
     }
 
@@ -545,7 +475,8 @@ class MovieTranslationService : Service() {
             .setAutoCancel(true)
             .build()
         runCatching {
-            getSystemService(NotificationManager::class.java).notify(COMPLETE_NOTIFICATION_ID, notification)
+            getSystemService(NotificationManager::class.java)
+                .notify(COMPLETE_NOTIFICATION_ID, notification)
         }
     }
 

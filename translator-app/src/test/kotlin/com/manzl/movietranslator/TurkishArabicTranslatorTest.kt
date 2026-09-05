@@ -6,31 +6,31 @@ import org.junit.Test
 
 class TurkishArabicTranslatorTest {
     @Test
-    fun semanticMerge_joinsFragmentedDialogueUntilSentenceBoundary() {
+    fun batching_preservesFragmentedWhisperCuesOneForOne() {
         val cues = listOf(
             SubtitleCue(0, 900, "Seni"),
             SubtitleCue(950, 1_700, "burada beklemiyordum."),
             SubtitleCue(2_600, 3_300, "Neden geldin?"),
         )
 
-        val merged = TurkishArabicTranslator.mergeSemanticCuesForTest(cues)
+        val flattened = TurkishArabicTranslator.buildContextBatchesForTest(cues).flatten()
 
-        assertEquals(2, merged.size)
-        assertEquals("Seni burada beklemiyordum.", merged[0].sourceText)
-        assertEquals(0, merged[0].startMs)
-        assertEquals(1_700, merged[0].endMs)
-        assertEquals("Neden geldin?", merged[1].sourceText)
+        assertEquals(cues.size, flattened.size)
+        assertEquals(cues.map { it.sourceText }, flattened.map { it.sourceText })
+        assertEquals(cues.map { it.startMs }, flattened.map { it.startMs })
+        assertEquals(cues.map { it.endMs }, flattened.map { it.endMs })
     }
 
     @Test
-    fun semanticMerge_doesNotCreateVeryLongSubtitle() {
-        val cues = (0 until 8).map { index ->
+    fun batching_keepsLongDialogueInSeveralBoundedWindows() {
+        val cues = (0 until 20).map { index ->
             SubtitleCue(index * 900L, index * 900L + 800L, "uzun diyalog parçası $index")
         }
 
-        val merged = TurkishArabicTranslator.mergeSemanticCuesForTest(cues)
+        val batches = TurkishArabicTranslator.buildContextBatchesForTest(cues)
 
-        assertTrue(merged.size > 1)
-        assertTrue(merged.all { it.endMs - it.startMs <= 6_500L })
+        assertTrue(batches.size > 1)
+        assertTrue(batches.all { it.size <= 8 })
+        assertEquals(cues.size, batches.sumOf { it.size })
     }
 }
