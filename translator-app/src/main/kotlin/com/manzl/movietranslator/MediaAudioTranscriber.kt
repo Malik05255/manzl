@@ -180,6 +180,7 @@ private class SilenceSkippingSpeechProcessor(
     private val output: MutableList<SubtitleCue>,
 ) {
     private val segment = ByteArrayOutputStream(256 * 1024)
+    private val feedBuffer = ByteArray(FEED_CHUNK_BYTES)
     private var segmentStartMs = 0L
     private var mediaClockMs = 0L
     private var trailingQuietMs = 0L
@@ -224,9 +225,9 @@ private class SilenceSkippingSpeechProcessor(
             recognizer.reset()
             var offset = 0
             while (offset < bytes.size) {
-                val count = minOf(FEED_CHUNK_BYTES, bytes.size - offset)
-                val chunk = bytes.copyOfRange(offset, offset + count)
-                if (recognizer.acceptWaveForm(chunk, chunk.size)) {
+                val count = minOf(feedBuffer.size, bytes.size - offset)
+                bytes.copyInto(feedBuffer, destinationOffset = 0, startIndex = offset, endIndex = offset + count)
+                if (recognizer.acceptWaveForm(feedBuffer, count)) {
                     parseResult(recognizer.result, segmentStartMs)?.let(::addIfUseful)
                 }
                 offset += count
