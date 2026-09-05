@@ -162,6 +162,15 @@ dependencies {
     // HTML parsing (web search)
     implementation(libs.jsoup)
 
+    // Local movie translation. The Whisper model itself is downloaded once at runtime
+    // and remains on-device; ML Kit translation models are also cached on-device.
+    implementation("dev.ffmpegkit-maintained:whisper-android:1.0.0")
+    implementation("com.google.mlkit:translate:17.0.3")
+
+    // Play the original movie with the generated Arabic SRT without re-encoding/copying video.
+    implementation("androidx.media3:media3-exoplayer:1.10.1")
+    implementation("androidx.media3:media3-ui:1.10.1")
+
     // Hidden API bypass — lets plugin inspector reflect WindowManagerGlobal.getRootViews()
     // so that dialogs / popup menus / bottom sheets are visible to the agent on API 30+.
     implementation("org.lsposed.hiddenapibypass:hiddenapibypass:4.3")
