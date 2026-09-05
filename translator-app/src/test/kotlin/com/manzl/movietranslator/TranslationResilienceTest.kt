@@ -1,31 +1,37 @@
 package com.manzl.movietranslator
 
-import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TranslationResilienceTest {
     @Test
-    fun singleArabicCandidate_acceptsBareArabicWithoutMarker() {
-        assertEquals("مني.", TurkishArabicTranslator.singleArabicCandidateForTest("مني."))
-    }
-
-    @Test
-    fun singleArabicCandidate_stripsModelPrefaceAndTurkishParenthetical() {
-        assertEquals(
-            "مني",
-            TurkishArabicTranslator.singleArabicCandidateForTest("الترجمة العربية: مني (benden)")
+    fun qualityGate_acceptsNaturalArabic() {
+        assertFalse(
+            TurkishArabicTranslator.translationNeedsRepairForTest(
+                source = "Seni burada beklemiyordum.",
+                arabic = "لم أتوقع أن أراك هنا.",
+            )
         )
     }
 
     @Test
-    fun singleArabicCandidate_rejectsUntranslatedTurkish() {
-        assertTrue(TurkishArabicTranslator.singleArabicCandidateForTest("benden").isBlank())
+    fun qualityGate_rejectsUntranslatedTurkish() {
+        assertTrue(
+            TurkishArabicTranslator.translationNeedsRepairForTest(
+                source = "Benden bunu isteme.",
+                arabic = "Benden bunu isteme.",
+            )
+        )
     }
 
     @Test
-    fun contextualFragmentFallback_coversObservedAblativePronoun() {
-        assertEquals("مني.", TurkishArabicTranslator.contextualFragmentFallbackForTest("benden"))
-        assertTrue(TurkishArabicTranslator.contextualFragmentFallbackForTest("bilinmeyenkelime").isBlank())
+    fun qualityGate_rejectsExplanatoryPreface() {
+        assertTrue(
+            TurkishArabicTranslator.translationNeedsRepairForTest(
+                source = "Benden bunu isteme.",
+                arabic = "بالطبع، لا تطلب مني ذلك.",
+            )
+        )
     }
 }
