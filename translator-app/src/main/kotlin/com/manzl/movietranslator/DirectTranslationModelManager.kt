@@ -10,28 +10,22 @@ import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
-/**
- * Manages the local Turkish -> Arabic language model.
- *
- * Qwen3.5 2B proved far too slow on the current CPU-only Android llama.cpp AAR on real devices.
- * Qwen2.5 1.5B Instruct uses the older, mature qwen2 transformer architecture that this runtime
- * handles efficiently, while still providing multilingual Arabic support and materially more
- * capacity than the former 0.8B checkpoint.
- */
+/** Manages the local Turkish -> Arabic specialist translation model. */
 class DirectTranslationModelManager(private val context: Context) {
     companion object {
-        private const val MODEL_NAME = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+        private const val MODEL_NAME = "Hy-MT2-1.8B-Q4_K_M.gguf"
         private const val MODEL_URL =
-            "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf?download=true"
+            "https://huggingface.co/tencent/Hy-MT2-1.8B-GGUF/resolve/main/Hy-MT2-1.8B-Q4_K_M.gguf?download=true"
 
         private val LEGACY_MODELS = listOf(
+            "qwen2.5-1.5b-instruct-q4_k_m.gguf",
             "qwen3.5-2b-q4_0.gguf",
             "qwen3.5-0.8b-q4_0.gguf",
         )
 
-        // Q4_K_M is about 0.99 GB. Keep a conservative lower bound to catch interrupted downloads.
-        private const val MIN_VALID_BYTES = 900L * 1024L * 1024L
-        private const val REQUIRED_FREE_BYTES = 1_250L * 1024L * 1024L
+        // Official Q4_K_M is about 1.13 GB. Bounds only reject interrupted downloads.
+        private const val MIN_VALID_BYTES = 1_040L * 1024L * 1024L
+        private const val REQUIRED_FREE_BYTES = 1_450L * 1024L * 1024L
     }
 
     suspend fun ensureModel(onProgress: (Float) -> Unit = {}): File = withContext(Dispatchers.IO) {
@@ -47,18 +41,16 @@ class DirectTranslationModelManager(private val context: Context) {
         val alreadyDownloaded = partial.takeIf { it.isFile }?.length() ?: 0L
         val extraNeeded = (MIN_VALID_BYTES - alreadyDownloaded).coerceAtLeast(0L)
         check(modelDir.usableSpace >= maxOf(extraNeeded, REQUIRED_FREE_BYTES - alreadyDownloaded)) {
-            "المساحة الحرة غير كافية لتنزيل نموذج الترجمة السريع عالي الجودة."
+            "المساحة الحرة غير كافية لتنزيل نموذج الترجمة التركي ← العربي."
         }
 
         download(partial, onProgress)
         check(partial.length() >= MIN_VALID_BYTES) {
-            "تعذر تنزيل نموذج الترجمة السريع كاملًا."
+            "تعذر تنزيل نموذج الترجمة التركي ← العربي كاملًا."
         }
 
         if (model.exists()) model.delete()
-        check(partial.renameTo(model)) {
-            "تعذر تثبيت نموذج الترجمة السريع."
-        }
+        check(partial.renameTo(model)) { "تعذر تثبيت نموذج الترجمة التركي ← العربي." }
         deleteLegacyModels(modelDir)
         onProgress(1f)
         model
@@ -92,7 +84,6 @@ class DirectTranslationModelManager(private val context: Context) {
             check(connection.responseCode in 200..299) {
                 "فشل تنزيل نموذج الترجمة (${connection.responseCode})."
             }
-
             val resumed = connection.responseCode == HttpURLConnection.HTTP_PARTIAL && existing > 0L
             val startAt = if (resumed) existing else 0L
             if (!resumed && existing > 0L) target.delete()
