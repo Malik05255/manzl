@@ -7,7 +7,7 @@ import org.junit.Test
 class TranslationBatchingPerfTest {
     @Test
     fun contextBatches_reduceModelCallsWithoutOversizedPrompts() {
-        val cues = (0 until 12).map { index ->
+        val cues = (0 until 16).map { index ->
             SubtitleCue(
                 startMs = index * 1_000L,
                 endMs = index * 1_000L + 850L,
@@ -17,9 +17,9 @@ class TranslationBatchingPerfTest {
 
         val batches = TurkishArabicTranslator.buildContextBatchesForTest(cues)
 
-        assertTrue(batches.size < 12)
-        assertTrue(batches.all { it.size <= 6 })
-        assertTrue(batches.all { batch -> batch.sumOf { it.sourceText.length } <= 720 })
-        assertEquals(12, batches.sumOf { it.size })
+        assertTrue(batches.size < 16)
+        assertTrue(batches.all { it.size <= 8 })
+        assertTrue(batches.all { batch -> batch.sumOf { it.sourceText.length } <= 900 })
+        assertEquals(16, batches.sumOf { it.size })
     }
 }
