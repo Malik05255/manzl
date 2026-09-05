@@ -1,7 +1,6 @@
 package com.manzl.movietranslator
 
 import android.content.Context
-import android.os.SystemClock
 import dev.ffmpegkit.whisper.Whisper
 import dev.ffmpegkit.whisper.WhisperConfig
 import kotlinx.coroutines.Dispatchers
@@ -13,19 +12,10 @@ import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
-data class RepairCandidate(
-    val startMs: Long,
-    val endMs: Long,
-    val confidence: Float,
-    val wavFile: File,
-    val mandatory: Boolean = false,
-)
-
-data class TranscriptionResult(
-    val cues: List<SubtitleCue>,
-    val repairCandidates: List<RepairCandidate>,
-)
-
+/**
+ * Primary Turkish speech recognizer. Every Silero-confirmed speech window is transcribed; there is
+ * no fast ASR gate allowed to discard dialogue before Whisper sees it.
+ */
 class WhisperRepairEngine(private val context: Context) {
     suspend fun prepareModel(): Boolean = runCatching {
         WhisperModelManager(context).ensureModel()
@@ -33,79 +23,103 @@ class WhisperRepairEngine(private val context: Context) {
 
     fun isModelInstalled(): Boolean = WhisperModelManager(context).isInstalled()
 
-    suspend fun repair(
-        original: List<SubtitleCue>,
-        candidates: List<RepairCandidate>,
-        maxWallTimeMs: Long = Long.MAX_VALUE,
+    suspend fun transcribeAll(
+        windows: List<SpeechWindow>,
         onProgress: (done: Int, total: Int) -> Unit,
     ): List<SubtitleCue> = withContext(Dispatchers.Default) {
-        if (candidates.isEmpty()) return@withContext original
-
-        val ordered = candidates.sortedWith(
-            compareByDescending<RepairCandidate> { it.mandatory }
-                .thenBy { it.confidence }
-                .thenBy { it.startMs }
-        )
+        if (windows.isEmpty()) return@withContext emptyList()
+        val ordered = windows.sortedBy { it.startMs }
         val modelFile = WhisperModelManager(context).ensureModel()
         val model = Whisper.loadModel(context, modelFile.absolutePath)
-        val repaired = original.toMutableList()
-        val startedAt = SystemClock.elapsedRealtime()
+        val raw = mutableListOf<SubtitleCue>()
 
         try {
-            var processed = 0
-            for (candidate in ordered) {
+            ordered.forEachIndexed { index, window ->
                 currentCoroutineContext().ensureActive()
-                val budgetExpired = SystemClock.elapsedRealtime() - startedAt >= maxWallTimeMs
-                if (budgetExpired && !candidate.mandatory) break
-
                 val result = runCatching {
                     Whisper.transcribe(
                         model,
-                        candidate.wavFile.absolutePath,
+                        window.wavFile.absolutePath,
                         WhisperConfig(language = "tr"),
                     )
-                }.getOrNull()
-
-                val replacement = result?.segments.orEmpty().mapNotNull { segment ->
-                    val text = segment.text.trim()
-                    if (text.isBlank()) null else SubtitleCue(
-                        startMs = candidate.startMs + segment.startMs,
-                        endMs = (candidate.startMs + segment.endMs)
-                            .coerceAtLeast(candidate.startMs + segment.startMs + 350L),
-                        sourceText = text,
-                        confidence = 0.98f,
+                }.getOrElse { error ->
+                    throw IllegalStateException(
+                        "تعذر الاستماع إلى مقطع حوار عند ${formatTime(window.startMs)}.",
+                        error,
                     )
                 }
 
-                if (replacement.isNotEmpty()) {
-                    repaired.removeAll { cue ->
-                        cue.startMs < candidate.endMs && cue.endMs > candidate.startMs
+                result.segments.orEmpty().forEach { segment ->
+                    val text = cleanTurkishTranscript(segment.text)
+                    if (text.isNotBlank()) {
+                        val start = (window.startMs + segment.startMs)
+                            .coerceIn(window.startMs, window.endMs)
+                        val end = (window.startMs + segment.endMs)
+                            .coerceIn(start + 250L, window.endMs.coerceAtLeast(start + 250L))
+                        raw += SubtitleCue(
+                            startMs = start,
+                            endMs = end,
+                            sourceText = text,
+                            confidence = 0.99f,
+                        )
                     }
-                    repaired += replacement
                 }
-
-                candidate.wavFile.delete()
-                processed++
-                onProgress(processed, ordered.size)
+                window.wavFile.delete()
+                onProgress(index + 1, ordered.size)
             }
-            repaired.sortedBy { it.startMs }
+            normalizeWhisperTimeline(raw)
         } finally {
             ordered.forEach { it.wavFile.delete() }
             Whisper.releaseModel(model)
         }
     }
+
+    private fun cleanTurkishTranscript(text: String): String = text
+        .replace(Regex("^\\s*[-–—]+\\s*"), "")
+        .replace(Regex("\\s+"), " ")
+        .trim()
+
+    private fun normalizeWhisperTimeline(input: List<SubtitleCue>): List<SubtitleCue> {
+        if (input.isEmpty()) return emptyList()
+        val sorted = input.sortedBy { it.startMs }
+        val result = mutableListOf<SubtitleCue>()
+        for (cue in sorted) {
+            if (cue.sourceText.isBlank()) continue
+            val previous = result.lastOrNull()
+            val sameText = previous != null &&
+                normalizeText(previous.sourceText) == normalizeText(cue.sourceText)
+            val near = previous != null && cue.startMs <= previous.endMs + 650L
+            if (sameText && near) {
+                if (cue.endMs > previous.endMs) {
+                    result[result.lastIndex] = previous.copy(endMs = cue.endMs)
+                }
+            } else {
+                result += cue
+            }
+        }
+        return result
+    }
+
+    private fun normalizeText(text: String): String = text
+        .lowercase()
+        .replace(Regex("[^\\p{L}\\p{N}]+"), "")
+
+    private fun formatTime(ms: Long): String {
+        val seconds = ms.coerceAtLeast(0L) / 1_000L
+        return "%02d:%02d".format(seconds / 60L, seconds % 60L)
+    }
 }
 
 private class WhisperModelManager(private val context: Context) {
     companion object {
-        // The free whisper-android package officially supports the normal file-transcription path.
-        // Use the full multilingual base checkpoint for reliability and accuracy; it is unloaded
-        // before Qwen is loaded, so the extra model size does not stack in RAM with translation.
-        private const val MODEL_NAME = "ggml-base.bin"
+        // Small multilingual Q5_1 is much more capable than base for Turkish while remaining around
+        // 182 MiB. It is released before the translation model is loaded, so RAM does not stack.
+        private const val MODEL_NAME = "ggml-small-q5_1.bin"
         private const val MODEL_URL =
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin?download=true"
-        private const val LEGACY_MODEL_NAME = "ggml-base-q5_1.bin"
-        private const val MIN_VALID_BYTES = 120L * 1024L * 1024L
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin?download=true"
+        private val LEGACY_MODELS = listOf("ggml-base.bin", "ggml-base-q5_1.bin")
+        private const val MIN_VALID_BYTES = 170L * 1024L * 1024L
+        private const val REQUIRED_FREE_BYTES = 260L * 1024L * 1024L
     }
 
     fun isInstalled(): Boolean {
@@ -122,24 +136,32 @@ private class WhisperModelManager(private val context: Context) {
         }
 
         val partial = File(modelDir, "$MODEL_NAME.part")
+        val already = partial.takeIf { it.isFile }?.length() ?: 0L
+        check(modelDir.usableSpace >= (REQUIRED_FREE_BYTES - already).coerceAtLeast(0L)) {
+            "المساحة الحرة غير كافية لتنزيل نموذج الاستماع التركي الدقيق."
+        }
         download(partial)
-        check(partial.length() >= MIN_VALID_BYTES) { "تعذر تنزيل نموذج تحسين الاستماع." }
+        check(partial.length() >= MIN_VALID_BYTES) {
+            "تعذر تنزيل نموذج الاستماع التركي الدقيق كاملًا."
+        }
         if (model.exists()) model.delete()
-        check(partial.renameTo(model)) { "تعذر تثبيت نموذج تحسين الاستماع." }
+        check(partial.renameTo(model)) { "تعذر تثبيت نموذج الاستماع التركي الدقيق." }
         deleteLegacy(modelDir)
         model
     }
 
     private fun deleteLegacy(modelDir: File) {
-        runCatching { File(modelDir, LEGACY_MODEL_NAME).delete() }
-        runCatching { File(modelDir, "$LEGACY_MODEL_NAME.part").delete() }
+        LEGACY_MODELS.forEach { name ->
+            runCatching { File(modelDir, name).delete() }
+            runCatching { File(modelDir, "$name.part").delete() }
+        }
     }
 
     private suspend fun download(target: File) {
         val existing = target.takeIf { it.isFile }?.length() ?: 0L
         val connection = (URL(MODEL_URL).openConnection() as HttpURLConnection).apply {
             connectTimeout = 20_000
-            readTimeout = 45_000
+            readTimeout = 60_000
             instanceFollowRedirects = true
             requestMethod = "GET"
             setRequestProperty("Accept-Encoding", "identity")
@@ -149,13 +171,13 @@ private class WhisperModelManager(private val context: Context) {
         try {
             connection.connect()
             check(connection.responseCode in 200..299) {
-                "فشل تنزيل نموذج تحسين الاستماع (${connection.responseCode})."
+                "فشل تنزيل نموذج الاستماع (${connection.responseCode})."
             }
             val resumed = connection.responseCode == HttpURLConnection.HTTP_PARTIAL && existing > 0L
             if (!resumed && existing > 0L) target.delete()
             FileOutputStream(target, resumed).use { output ->
                 connection.inputStream.use { input ->
-                    val buffer = ByteArray(128 * 1024)
+                    val buffer = ByteArray(192 * 1024)
                     while (true) {
                         currentCoroutineContext().ensureActive()
                         val count = input.read(buffer)
