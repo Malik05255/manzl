@@ -181,38 +181,38 @@ private class SilenceSkippingSpeechProcessor(
 ) {
     private val segment = ByteArrayOutputStream(256 * 1024)
     private val feedBuffer = ByteArray(FEED_CHUNK_BYTES)
-    private var segmentStartMs = 0L
-    private var mediaClockMs = 0L
-    private var trailingQuietMs = 0L
+    private var segmentStartSample = 0L
+    private var mediaClockSamples = 0L
+    private var trailingQuietSamples = 0L
     private var active = false
 
     fun consume(pcm: ByteArray) {
         if (pcm.isEmpty()) return
-        val durationMs = ((pcm.size / 2.0) / 16_000.0 * 1000.0).roundToInt().toLong().coerceAtLeast(1L)
+        val sampleCount = (pcm.size / 2).toLong()
         val speechLike = hasAudibleSignal(pcm)
 
         if (!active) {
             if (speechLike) {
                 active = true
-                segmentStartMs = mediaClockMs
-                trailingQuietMs = 0L
+                segmentStartSample = mediaClockSamples
+                trailingQuietSamples = 0L
                 segment.write(pcm)
             }
         } else {
             segment.write(pcm)
             if (speechLike) {
-                trailingQuietMs = 0L
+                trailingQuietSamples = 0L
             } else {
-                trailingQuietMs += durationMs
+                trailingQuietSamples += sampleCount
             }
 
-            val segmentDurationMs = ((segment.size() / 2.0) / 16_000.0 * 1000.0).toLong()
-            if (trailingQuietMs >= QUIET_END_MS || segmentDurationMs >= MAX_SEGMENT_MS) {
+            val segmentSamples = (segment.size() / 2).toLong()
+            if (trailingQuietSamples >= QUIET_END_SAMPLES || segmentSamples >= MAX_SEGMENT_SAMPLES) {
                 processSegment()
             }
         }
 
-        mediaClockMs += durationMs
+        mediaClockSamples += sampleCount
     }
 
     fun finish() {
@@ -222,21 +222,22 @@ private class SilenceSkippingSpeechProcessor(
     private fun processSegment() {
         val bytes = segment.toByteArray()
         if (bytes.isNotEmpty()) {
+            val baseMs = samplesToMs(segmentStartSample)
             recognizer.reset()
             var offset = 0
             while (offset < bytes.size) {
                 val count = minOf(feedBuffer.size, bytes.size - offset)
                 bytes.copyInto(feedBuffer, destinationOffset = 0, startIndex = offset, endIndex = offset + count)
                 if (recognizer.acceptWaveForm(feedBuffer, count)) {
-                    parseResult(recognizer.result, segmentStartMs)?.let(::addIfUseful)
+                    parseResult(recognizer.result, baseMs)?.let(::addIfUseful)
                 }
                 offset += count
             }
-            parseResult(recognizer.finalResult, segmentStartMs)?.let(::addIfUseful)
+            parseResult(recognizer.finalResult, baseMs)?.let(::addIfUseful)
         }
         segment.reset()
         active = false
-        trailingQuietMs = 0L
+        trailingQuietSamples = 0L
     }
 
     private fun addIfUseful(cue: SubtitleCue) {
@@ -286,10 +287,13 @@ private class SilenceSkippingSpeechProcessor(
         )
     }
 
+    private fun samplesToMs(samples: Long): Long = samples * 1_000L / TARGET_RATE
+
     private companion object {
+        const val TARGET_RATE = 16_000L
         const val MIN_MEAN_ABS_SIGNAL = 95L
-        const val QUIET_END_MS = 650L
-        const val MAX_SEGMENT_MS = 24_000L
+        const val QUIET_END_SAMPLES = 10_400L // 650 ms at 16 kHz
+        const val MAX_SEGMENT_SAMPLES = 384_000L // 24 seconds at 16 kHz
         const val FEED_CHUNK_BYTES = 3_200
     }
 }
