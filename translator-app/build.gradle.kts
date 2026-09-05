@@ -13,6 +13,10 @@ android {
         targetSdk = 36
         versionCode = 1
         versionName = "1.0.0"
+
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
     }
 
     buildTypes {
@@ -55,6 +59,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.runtime.compose.android)
 
     implementation("com.alphacephei:vosk-android:0.3.75")
+    implementation("dev.ffmpegkit-maintained:whisper-android:1.0.0")
     implementation("com.google.mlkit:translate:17.0.3")
 
     implementation("androidx.media3:media3-exoplayer:1.10.1")
