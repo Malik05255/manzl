@@ -1,6 +1,7 @@
 package com.manzl.movietranslator
 
 import android.content.Context
+import android.os.SystemClock
 import dev.ffmpegkit.whisper.Whisper
 import dev.ffmpegkit.whisper.WhisperConfig
 import kotlinx.coroutines.Dispatchers
@@ -28,17 +29,28 @@ class WhisperRepairEngine(private val context: Context) {
     suspend fun repair(
         original: List<SubtitleCue>,
         candidates: List<RepairCandidate>,
+        maxWallTimeMs: Long = Long.MAX_VALUE,
         onProgress: (done: Int, total: Int) -> Unit,
     ): List<SubtitleCue> = withContext(Dispatchers.Default) {
-        if (candidates.isEmpty()) return@withContext original
+        if (candidates.isEmpty() || maxWallTimeMs <= 0L) {
+            candidates.forEach { it.wavFile.delete() }
+            return@withContext original
+        }
 
+        // Worst-confidence clips first. The wall-clock budget makes Whisper a targeted repair tool
+        // instead of allowing it to dominate a two-hour movie's total processing time.
+        val ordered = candidates.sortedBy { it.confidence }
         val modelFile = WhisperModelManager(context).ensureModel()
         val model = Whisper.loadModel(context, modelFile.absolutePath)
         val repaired = original.toMutableList()
+        val startedAt = SystemClock.elapsedRealtime()
 
         try {
-            candidates.forEachIndexed { index, candidate ->
+            var processed = 0
+            for (candidate in ordered) {
                 currentCoroutineContext().ensureActive()
+                if (SystemClock.elapsedRealtime() - startedAt >= maxWallTimeMs) break
+
                 val result = runCatching {
                     Whisper.transcribe(
                         model,
@@ -66,11 +78,12 @@ class WhisperRepairEngine(private val context: Context) {
                 }
 
                 candidate.wavFile.delete()
-                onProgress(index + 1, candidates.size)
+                processed++
+                onProgress(processed, ordered.size)
             }
             repaired.sortedBy { it.startMs }
         } finally {
-            candidates.forEach { it.wavFile.delete() }
+            ordered.forEach { it.wavFile.delete() }
             Whisper.releaseModel(model)
         }
     }
@@ -78,10 +91,12 @@ class WhisperRepairEngine(private val context: Context) {
 
 private class WhisperModelManager(private val context: Context) {
     companion object {
-        private const val MODEL_NAME = "ggml-base.bin"
+        // Q5_1 keeps the multilingual base model but cuts disk/RAM pressure substantially versus
+        // the full base checkpoint. Whisper is only used for uncertain clips, never whole-film ASR.
+        private const val MODEL_NAME = "ggml-base-q5_1.bin"
         private const val MODEL_URL =
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin?download=true"
-        private const val MIN_VALID_BYTES = 100L * 1024L * 1024L
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin?download=true"
+        private const val MIN_VALID_BYTES = 50L * 1024L * 1024L
     }
 
     suspend fun ensureModel(): File = withContext(Dispatchers.IO) {
@@ -104,6 +119,7 @@ private class WhisperModelManager(private val context: Context) {
             readTimeout = 45_000
             instanceFollowRedirects = true
             requestMethod = "GET"
+            setRequestProperty("Accept-Encoding", "identity")
             if (existing > 0L) setRequestProperty("Range", "bytes=$existing-")
         }
 
@@ -113,6 +129,7 @@ private class WhisperModelManager(private val context: Context) {
                 "فشل تنزيل نموذج تحسين الاستماع (${connection.responseCode})."
             }
             val resumed = connection.responseCode == HttpURLConnection.HTTP_PARTIAL && existing > 0L
+            if (!resumed && existing > 0L) target.delete()
             FileOutputStream(target, resumed).use { output ->
                 connection.inputStream.use { input ->
                     val buffer = ByteArray(128 * 1024)
@@ -122,6 +139,7 @@ private class WhisperModelManager(private val context: Context) {
                         if (count <= 0) break
                         output.write(buffer, 0, count)
                     }
+                    output.fd.sync()
                 }
             }
         } finally {
