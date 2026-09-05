@@ -7,18 +7,15 @@ import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
 import android.os.PowerManager
-import com.konovalov.vad.webrtc.VadWebRTC
-import com.konovalov.vad.webrtc.config.FrameSize
-import com.konovalov.vad.webrtc.config.Mode
-import com.konovalov.vad.webrtc.config.SampleRate
+import com.konovalov.vad.silero.VadSilero
+import com.konovalov.vad.silero.config.FrameSize
+import com.konovalov.vad.silero.config.Mode
+import com.konovalov.vad.silero.config.SampleRate
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
-import org.json.JSONObject
-import org.vosk.Model
-import org.vosk.Recognizer
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
@@ -27,44 +24,40 @@ import java.nio.ByteOrder
 import kotlin.math.floor
 import kotlin.math.roundToInt
 
+data class SpeechWindow(
+    val startMs: Long,
+    val endMs: Long,
+    val wavFile: File,
+)
+
 /**
- * Extracts the movie audio and produces Turkish subtitle cues without decoding/re-encoding video.
- *
- * Coverage is more important than trusting one recognizer. WebRTC VAD first separates actual voice
- * activity from music/background audio. Vosk remains the very fast first pass. Any VAD-confirmed
- * speech window that Vosk misses, or transcribes suspiciously sparsely, becomes a mandatory Whisper
- * repair candidate. Windows are intentionally short so one bad ASR result can never erase a long
- * stretch of dialogue.
+ * Extracts actual speech from a movie soundtrack without trusting an ASR model to decide coverage.
+ * Silero VAD is intentionally used instead of an amplitude gate/WebRTC because movie music and
+ * effects were causing the reference clip to be treated as nearly continuous speech.
  */
 class MediaAudioTranscriber(private val context: Context) {
-    suspend fun transcribe(
+    suspend fun extractSpeech(
         uri: Uri,
-        modelDir: File,
         onProgress: (Float) -> Unit,
-    ): TranscriptionResult = withContext(Dispatchers.IO) {
+    ): List<SpeechWindow> = withContext(Dispatchers.IO) {
         val extractor = MediaExtractor()
         var decoderForCleanup: MediaCodec? = null
-        var speechProcessorForCleanup: SilenceSkippingSpeechProcessor? = null
-        val model = Model(modelDir.absolutePath)
-        val recognizer = Recognizer(model, TARGET_SAMPLE_RATE.toFloat()).apply { setWords(true) }
-        val cues = mutableListOf<SubtitleCue>()
-        val candidates = mutableListOf<RepairCandidate>()
+        var processorForCleanup: SileroSpeechProcessor? = null
+        val windows = mutableListOf<SpeechWindow>()
         val thermalGuard = ThermalGuard(context)
 
         try {
             extractor.setDataSource(context, uri, null)
             val trackIndex = chooseBestAudioTrack(extractor)
                 ?: error("لم أجد مسارًا صوتيًا داخل الفيلم.")
-
             extractor.selectTrack(trackIndex)
+
             val inputFormat = extractor.getTrackFormat(trackIndex)
             val mime = inputFormat.getString(MediaFormat.KEY_MIME)
                 ?: error("صيغة الصوت غير معروفة.")
             val durationUs = if (inputFormat.containsKey(MediaFormat.KEY_DURATION)) {
                 inputFormat.getLong(MediaFormat.KEY_DURATION).coerceAtLeast(1L)
-            } else {
-                1L
-            }
+            } else 1L
 
             val decoder = MediaCodec.createDecoderByType(mime).also { decoderForCleanup = it }
             decoder.configure(inputFormat, null, null, 0)
@@ -77,12 +70,8 @@ class MediaAudioTranscriber(private val context: Context) {
             var outputChannels = inputFormat.getIntegerOrDefault(MediaFormat.KEY_CHANNEL_COUNT, 2)
             var pcmEncoding = AudioFormat.ENCODING_PCM_16BIT
             var resampler = StreamingPcmResampler(outputSampleRate, outputChannels, pcmEncoding)
-            val speechProcessor = SilenceSkippingSpeechProcessor(
-                recognizer = recognizer,
-                output = cues,
-                candidates = candidates,
-                cacheDir = context.cacheDir,
-            ).also { speechProcessorForCleanup = it }
+            val processor = SileroSpeechProcessor(context, context.cacheDir, windows)
+                .also { processorForCleanup = it }
             var lastProgress = -1f
 
             while (!outputDone) {
@@ -97,11 +86,7 @@ class MediaAudioTranscriber(private val context: Context) {
                         val sampleSize = extractor.readSampleData(inputBuffer, 0)
                         if (sampleSize < 0) {
                             decoder.queueInputBuffer(
-                                inputIndex,
-                                0,
-                                0,
-                                0L,
-                                MediaCodec.BUFFER_FLAG_END_OF_STREAM,
+                                inputIndex, 0, 0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM
                             )
                             inputDone = true
                         } else {
@@ -121,27 +106,20 @@ class MediaAudioTranscriber(private val context: Context) {
                     MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
                         val outputFormat = decoder.outputFormat
                         outputSampleRate = outputFormat.getIntegerOrDefault(
-                            MediaFormat.KEY_SAMPLE_RATE,
-                            outputSampleRate,
+                            MediaFormat.KEY_SAMPLE_RATE, outputSampleRate
                         )
                         outputChannels = outputFormat.getIntegerOrDefault(
-                            MediaFormat.KEY_CHANNEL_COUNT,
-                            outputChannels,
+                            MediaFormat.KEY_CHANNEL_COUNT, outputChannels
                         )
                         pcmEncoding = outputFormat.getIntegerOrDefault(
-                            MediaFormat.KEY_PCM_ENCODING,
-                            AudioFormat.ENCODING_PCM_16BIT,
+                            MediaFormat.KEY_PCM_ENCODING, AudioFormat.ENCODING_PCM_16BIT
                         )
                         resampler = StreamingPcmResampler(
-                            outputSampleRate,
-                            outputChannels,
-                            pcmEncoding,
+                            outputSampleRate, outputChannels, pcmEncoding
                         )
                     }
-
                     MediaCodec.INFO_TRY_AGAIN_LATER,
                     MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> Unit
-
                     else -> if (outputIndex >= 0) {
                         if (info.size > 0) {
                             val outputBuffer = decoder.getOutputBuffer(outputIndex)
@@ -151,11 +129,10 @@ class MediaAudioTranscriber(private val context: Context) {
                             val decoded = ByteArray(info.size)
                             outputBuffer.get(decoded)
                             val pcm16k = resampler.convert(decoded)
-                            if (pcm16k.isNotEmpty()) speechProcessor.consume(pcm16k)
+                            if (pcm16k.isNotEmpty()) processor.consume(pcm16k)
 
                             val progress = (info.presentationTimeUs.toDouble() / durationUs.toDouble())
-                                .toFloat()
-                                .coerceIn(0f, 1f)
+                                .toFloat().coerceIn(0f, 1f)
                             if (progress - lastProgress >= 0.005f) {
                                 lastProgress = progress
                                 onProgress(progress)
@@ -165,57 +142,21 @@ class MediaAudioTranscriber(private val context: Context) {
                         decoder.releaseOutputBuffer(outputIndex, false)
                     }
                 }
-
                 thermalGuard.yieldIfNeeded()
             }
 
-            speechProcessor.finish()
+            processor.finish()
             onProgress(1f)
-            val selected = selectRepairCandidates(candidates, durationUs / 1_000L)
-            TranscriptionResult(
-                cues = cues.sortedBy { it.startMs },
-                repairCandidates = selected,
-            )
+            windows.sortedBy { it.startMs }
+        } catch (error: Throwable) {
+            windows.forEach { it.wavFile.delete() }
+            throw error
         } finally {
-            runCatching { speechProcessorForCleanup?.close() }
+            runCatching { processorForCleanup?.close() }
             runCatching { decoderForCleanup?.stop() }
             runCatching { decoderForCleanup?.release() }
             runCatching { extractor.release() }
-            runCatching { recognizer.close() }
-            runCatching { model.close() }
         }
-    }
-
-    private fun selectRepairCandidates(
-        all: List<RepairCandidate>,
-        movieDurationMs: Long,
-    ): List<RepairCandidate> {
-        if (all.isEmpty()) return emptyList()
-
-        // Mandatory means probable spoken dialogue is missing/incomplete. Never discard those for a
-        // time target. Only the extra confidence-polish candidates are subject to the small budget.
-        val mandatory = all.filter { it.mandatory }.sortedBy { it.startMs }
-        val optionalBudgetMs = (movieDurationMs * 0.08)
-            .toLong()
-            .coerceIn(12_000L, 7 * 60_000L)
-        var usedMs = 0L
-        val optionalSelected = mutableListOf<RepairCandidate>()
-        for (candidate in all.filterNot { it.mandatory }.sortedBy { it.confidence }) {
-            val duration = (candidate.endMs - candidate.startMs).coerceAtLeast(0L)
-            if (usedMs + duration > optionalBudgetMs && optionalSelected.isNotEmpty()) continue
-            optionalSelected += candidate
-            usedMs += duration
-            if (usedMs >= optionalBudgetMs) break
-        }
-
-        val selected = (mandatory + optionalSelected).distinctBy { it.wavFile.absolutePath }
-        val selectedFiles = selected.mapTo(hashSetOf()) { it.wavFile.absolutePath }
-        all.filterNot { it.wavFile.absolutePath in selectedFiles }.forEach { it.wavFile.delete() }
-        return selected.sortedWith(
-            compareByDescending<RepairCandidate> { it.mandatory }
-                .thenBy { it.confidence }
-                .thenBy { it.startMs }
-        )
     }
 
     private fun chooseBestAudioTrack(extractor: MediaExtractor): Int? {
@@ -231,11 +172,7 @@ class MediaAudioTranscriber(private val context: Context) {
             var score = 0
             if (language == "tr" || language == "tur" || language.startsWith("tr-")) score += 100
             if (format.getIntegerOrDefault(MediaFormat.KEY_IS_DEFAULT, 0) == 1) score += 15
-            if (language.isNotBlank() &&
-                language != "tr" &&
-                language != "tur" &&
-                !language.startsWith("tr-")
-            ) {
+            if (language.isNotBlank() && language != "tr" && language != "tur" && !language.startsWith("tr-")) {
                 score -= 25
             }
             if (channels >= 3) score += 8
@@ -247,91 +184,64 @@ class MediaAudioTranscriber(private val context: Context) {
         }
         return bestIndex
     }
-
-    private companion object {
-        const val TARGET_SAMPLE_RATE = 16_000
-    }
 }
 
-private class SilenceSkippingSpeechProcessor(
-    private val recognizer: Recognizer,
-    private val output: MutableList<SubtitleCue>,
-    private val candidates: MutableList<RepairCandidate>,
+private class SileroSpeechProcessor(
+    context: Context,
     private val cacheDir: File,
+    private val output: MutableList<SpeechWindow>,
 ) : AutoCloseable {
-    private val segment = ByteArrayOutputStream(256 * 1024)
-    private val feedBuffer = ByteArray(FEED_CHUNK_BYTES)
-    private val vad = VadWebRTC(
+    private val vad = VadSilero(
+        context = context,
         sampleRate = SampleRate.SAMPLE_RATE_16K,
-        frameSize = FrameSize.FRAME_SIZE_320,
-        mode = Mode.AGGRESSIVE,
-        speechDurationMs = 40,
-        silenceDurationMs = 160,
+        frameSize = FrameSize.FRAME_SIZE_512,
+        mode = Mode.NORMAL,
+        speechDurationMs = 64,
+        silenceDurationMs = 320,
     )
-
-    private var pcmRemainder = ByteArray(0)
+    private val segment = ByteArrayOutputStream(512 * 1024)
+    private var remainder = ByteArray(0)
     private var preRoll = ByteArray(0)
-    private var segmentStartSample = 0L
     private var mediaClockSamples = 0L
-    private var trailingQuietSamples = 0L
-    private var activeSpeechSamples = 0L
+    private var segmentStartSample = 0L
     private var active = false
     private var sequence = 0
 
     fun consume(pcm: ByteArray) {
         if (pcm.isEmpty()) return
-        val source = if (pcmRemainder.isEmpty()) {
-            pcm
-        } else {
-            ByteArray(pcmRemainder.size + pcm.size).also {
-                pcmRemainder.copyInto(it)
-                pcm.copyInto(it, pcmRemainder.size)
-            }
+        val source = if (remainder.isEmpty()) pcm else ByteArray(remainder.size + pcm.size).also {
+            remainder.copyInto(it)
+            pcm.copyInto(it, remainder.size)
         }
 
         var offset = 0
-        while (offset + VAD_FRAME_BYTES <= source.size) {
-            val frame = source.copyOfRange(offset, offset + VAD_FRAME_BYTES)
+        while (offset + FRAME_BYTES <= source.size) {
+            val frame = source.copyOfRange(offset, offset + FRAME_BYTES)
             consumeFrame(frame, vad.isSpeech(frame))
-            offset += VAD_FRAME_BYTES
+            offset += FRAME_BYTES
         }
-        pcmRemainder = if (offset < source.size) {
-            source.copyOfRange(offset, source.size)
-        } else {
-            ByteArray(0)
-        }
+        remainder = if (offset < source.size) source.copyOfRange(offset, source.size) else ByteArray(0)
     }
 
     fun finish() {
-        if (pcmRemainder.isNotEmpty()) {
-            val actualBytes = pcmRemainder.size and -2
-            if (actualBytes > 0) {
-                val tail = pcmRemainder.copyOf(actualBytes)
-                // Preserve final audio. A sub-20ms tail is too short for WebRTC VAD, so attach it to
-                // an active utterance or keep it as pre-roll without inventing extra speech.
-                if (active) {
-                    segment.write(tail)
-                    mediaClockSamples += (tail.size / 2).toLong()
-                } else {
-                    appendPreRoll(tail)
-                    mediaClockSamples += (tail.size / 2).toLong()
-                }
+        if (remainder.isNotEmpty()) {
+            val even = remainder.size and -2
+            if (even > 0) {
+                val tail = remainder.copyOf(even)
+                if (active) segment.write(tail) else appendPreRoll(tail)
+                mediaClockSamples += (tail.size / 2).toLong()
             }
-            pcmRemainder = ByteArray(0)
+            remainder = ByteArray(0)
         }
-        if (active && segment.size() > 0) processSegment()
+        if (active && segment.size() >= MIN_WINDOW_BYTES) flushWindow()
     }
 
-    private fun consumeFrame(frame: ByteArray, speechLike: Boolean) {
-        val sampleCount = VAD_FRAME_SAMPLES.toLong()
-
+    private fun consumeFrame(frame: ByteArray, speech: Boolean) {
         if (!active) {
-            if (speechLike) {
+            if (speech) {
                 active = true
                 val preSamples = (preRoll.size / 2).toLong()
                 segmentStartSample = (mediaClockSamples - preSamples).coerceAtLeast(0L)
-                trailingQuietSamples = 0L
-                activeSpeechSamples = sampleCount
                 if (preRoll.isNotEmpty()) segment.write(preRoll)
                 segment.write(frame)
                 preRoll = ByteArray(0)
@@ -340,176 +250,51 @@ private class SilenceSkippingSpeechProcessor(
             }
         } else {
             segment.write(frame)
-            if (speechLike) {
-                activeSpeechSamples += sampleCount
-                trailingQuietSamples = 0L
-            } else {
-                trailingQuietSamples += sampleCount
-            }
-
             val segmentSamples = (segment.size() / 2).toLong()
-            if (trailingQuietSamples >= QUIET_END_SAMPLES ||
-                segmentSamples >= MAX_SEGMENT_SAMPLES
-            ) {
-                processSegment()
+            if (!speech || segmentSamples >= MAX_WINDOW_SAMPLES) {
+                // Silero's silenceDurationMs already provides hangover, so false here means a real
+                // pause rather than a one-frame gap. Keep windows long enough for Whisper context.
+                flushWindow()
+                if (!speech) appendPreRoll(frame)
             }
         }
+        mediaClockSamples += FRAME_SAMPLES
+    }
 
-        mediaClockSamples += sampleCount
+    private fun flushWindow() {
+        val bytes = segment.toByteArray()
+        if (bytes.size >= MIN_WINDOW_BYTES) {
+            val startMs = samplesToMs(segmentStartSample)
+            val endMs = startMs + samplesToMs((bytes.size / 2).toLong())
+            val file = File(cacheDir, "speech_${System.currentTimeMillis()}_${sequence++}.wav")
+            writePcm16MonoWav(file, bytes, 16_000)
+            output += SpeechWindow(startMs, endMs, file)
+        }
+        segment.reset()
+        active = false
     }
 
     private fun appendPreRoll(bytes: ByteArray) {
-        if (bytes.isEmpty()) return
-        val combined = if (preRoll.isEmpty()) {
-            bytes
-        } else {
-            ByteArray(preRoll.size + bytes.size).also {
-                preRoll.copyInto(it)
-                bytes.copyInto(it, preRoll.size)
-            }
+        val combined = if (preRoll.isEmpty()) bytes else ByteArray(preRoll.size + bytes.size).also {
+            preRoll.copyInto(it)
+            bytes.copyInto(it, preRoll.size)
         }
-        preRoll = if (combined.size <= PRE_ROLL_BYTES) {
-            combined
-        } else {
-            combined.copyOfRange(combined.size - PRE_ROLL_BYTES, combined.size)
-        }
+        preRoll = if (combined.size <= PRE_ROLL_BYTES) combined
+        else combined.copyOfRange(combined.size - PRE_ROLL_BYTES, combined.size)
     }
 
-    private fun processSegment() {
-        val bytes = segment.toByteArray()
-        if (bytes.isNotEmpty()) {
-            val baseMs = samplesToMs(segmentStartSample)
-            val endMs = baseMs + samplesToMs((bytes.size / 2).toLong())
-            val durationMs = (endMs - baseMs).coerceAtLeast(1L)
-            val speechEvidenceMs = samplesToMs(activeSpeechSamples)
-            val localCues = mutableListOf<SubtitleCue>()
-            var sawPartialSpeech = false
-
-            recognizer.reset()
-            var offset = 0
-            while (offset < bytes.size) {
-                val count = minOf(feedBuffer.size, bytes.size - offset)
-                bytes.copyInto(
-                    feedBuffer,
-                    destinationOffset = 0,
-                    startIndex = offset,
-                    endIndex = offset + count,
-                )
-                if (recognizer.acceptWaveForm(feedBuffer, count)) {
-                    parseResult(recognizer.result, baseMs)?.let { addUnique(localCues, it) }
-                } else if (!sawPartialSpeech) {
-                    sawPartialSpeech = runCatching {
-                        JSONObject(recognizer.partialResult).optString("partial").isNotBlank()
-                    }.getOrDefault(false)
-                }
-                offset += count
-            }
-            parseResult(recognizer.finalResult, baseMs)?.let { addUnique(localCues, it) }
-            localCues.forEach { addUnique(output, it) }
-
-            val averageConfidence = if (localCues.isEmpty()) {
-                0f
-            } else {
-                localCues.map { it.confidence }.average().toFloat()
-            }
-            val recognizedWords = localCues.sumOf { cue ->
-                cue.sourceText.split(Regex("\\s+")).count { it.isNotBlank() }
-            }
-            val speechSeconds = speechEvidenceMs.toDouble().coerceAtLeast(1.0) / 1_000.0
-            val wordsPerSpeechSecond = recognizedWords.toDouble() / speechSeconds
-
-            // This is the coverage guarantee missing from the previous implementation. Because VAD
-            // has already confirmed speech, a blank Vosk window is not allowed to disappear merely
-            // because the window is long. It must be re-heard by Whisper.
-            val blankSpeechHole = localCues.isEmpty() &&
-                (sawPartialSpeech || speechEvidenceMs >= MIN_MANDATORY_SPEECH_EVIDENCE_MS)
-            val sparseTranscript = localCues.isNotEmpty() &&
-                speechEvidenceMs >= COVERAGE_CHECK_MIN_SPEECH_MS &&
-                wordsPerSpeechSecond < MIN_RECOGNIZED_WORDS_PER_SPEECH_SECOND
-            val coverageSuspicious = blankSpeechHole || sparseTranscript
-            val lowConfidence = localCues.isNotEmpty() &&
-                averageConfidence < REPAIR_CONFIDENCE_THRESHOLD
-            val needsRepair = durationMs >= MIN_REPAIR_MS &&
-                (coverageSuspicious || lowConfidence)
-
-            if (needsRepair) {
-                val wav = File(
-                    cacheDir,
-                    "repair_${System.currentTimeMillis()}_${sequence++}.wav",
-                )
-                runCatching { writePcm16MonoWav(wav, bytes, 16_000) }
-                    .onSuccess {
-                        candidates += RepairCandidate(
-                            startMs = baseMs,
-                            endMs = endMs,
-                            confidence = averageConfidence,
-                            wavFile = wav,
-                            mandatory = coverageSuspicious,
-                        )
-                    }
-                    .onFailure { wav.delete() }
-            }
-        }
-
-        segment.reset()
-        active = false
-        trailingQuietSamples = 0L
-        activeSpeechSamples = 0L
-        preRoll = ByteArray(0)
-    }
-
-    private fun addUnique(target: MutableList<SubtitleCue>, cue: SubtitleCue) {
-        if (cue.sourceText.isBlank()) return
-        val previous = target.lastOrNull()
-        if (previous?.sourceText == cue.sourceText && previous.startMs == cue.startMs) return
-        target += cue
-    }
-
-    private fun parseResult(json: String, baseMs: Long): SubtitleCue? {
-        val root = JSONObject(json)
-        val text = root.optString("text").trim()
-        if (text.isBlank()) return null
-        val words = root.optJSONArray("result")
-        if (words == null || words.length() == 0) return null
-
-        val first = words.getJSONObject(0)
-        val last = words.getJSONObject(words.length() - 1)
-        val startMs = baseMs + (first.optDouble("start", 0.0) * 1_000.0).toLong()
-        val endMs = baseMs + (
-            last.optDouble("end", first.optDouble("start", 0.0) + 1.0) * 1_000.0
-        ).toLong()
-        var confidenceSum = 0.0
-        for (i in 0 until words.length()) {
-            confidenceSum += words.getJSONObject(i).optDouble("conf", 1.0)
-        }
-        val confidence = (confidenceSum / words.length()).toFloat().coerceIn(0f, 1f)
-        return SubtitleCue(
-            startMs = startMs,
-            endMs = endMs.coerceAtLeast(startMs + 350L),
-            sourceText = text,
-            confidence = confidence,
-        )
-    }
-
-    private fun samplesToMs(samples: Long): Long = samples * 1_000L / TARGET_RATE
+    private fun samplesToMs(samples: Long): Long = samples * 1_000L / 16_000L
 
     override fun close() {
         runCatching { vad.close() }
     }
 
     private companion object {
-        const val TARGET_RATE = 16_000L
-        const val VAD_FRAME_SAMPLES = 320
-        const val VAD_FRAME_BYTES = VAD_FRAME_SAMPLES * 2
-        const val QUIET_END_SAMPLES = 8_000L // 500 ms; WebRTC VAD already has 160 ms hangover.
-        const val MAX_SEGMENT_SAMPLES = 128_000L // 8 s, down from 24 s.
-        const val FEED_CHUNK_BYTES = 3_200
-        const val PRE_ROLL_BYTES = 9_600 // 300 ms.
-        const val REPAIR_CONFIDENCE_THRESHOLD = 0.84f
-        const val MIN_REPAIR_MS = 400L
-        const val MIN_MANDATORY_SPEECH_EVIDENCE_MS = 60L
-        const val COVERAGE_CHECK_MIN_SPEECH_MS = 800L
-        const val MIN_RECOGNIZED_WORDS_PER_SPEECH_SECOND = 0.65
+        const val FRAME_SAMPLES = 512L
+        const val FRAME_BYTES = 1_024
+        const val PRE_ROLL_BYTES = 10_240 // 320 ms mono PCM16 @ 16 kHz
+        const val MIN_WINDOW_BYTES = 5_120 // 160 ms
+        const val MAX_WINDOW_SAMPLES = 24L * 16_000L
     }
 }
 
@@ -555,22 +340,13 @@ private class StreamingPcmResampler(
         if (data.isEmpty() || sourceRate <= 0 || channels <= 0) return ByteArray(0)
         val bytesPerSample = if (encoding == AudioFormat.ENCODING_PCM_FLOAT) 4 else 2
         val frameBytes = bytesPerSample * channels
-
-        val source = if (remainder.isEmpty()) {
-            data
-        } else {
-            ByteArray(remainder.size + data.size).also {
-                remainder.copyInto(it, 0)
-                data.copyInto(it, remainder.size)
-            }
+        val source = if (remainder.isEmpty()) data else ByteArray(remainder.size + data.size).also {
+            remainder.copyInto(it)
+            data.copyInto(it, remainder.size)
         }
         val frameCount = source.size / frameBytes
         val usedBytes = frameCount * frameBytes
-        remainder = if (usedBytes < source.size) {
-            source.copyOfRange(usedBytes, source.size)
-        } else {
-            ByteArray(0)
-        }
+        remainder = if (usedBytes < source.size) source.copyOfRange(usedBytes, source.size) else ByteArray(0)
         if (frameCount <= 0) return ByteArray(0)
 
         val chunkStart = inputFramesSeen.toDouble()
@@ -579,21 +355,16 @@ private class StreamingPcmResampler(
         val output = ByteArrayOutputStream(
             (frameCount * 16_000.0 / sourceRate * 2.0).roundToInt().coerceAtLeast(32)
         )
-
         if (nextOutputFrameAt < chunkStart) nextOutputFrameAt = chunkStart
         while (nextOutputFrameAt < chunkEnd) {
-            val localFrame = floor(nextOutputFrameAt - chunkStart)
-                .toInt()
-                .coerceIn(0, frameCount - 1)
+            val localFrame = floor(nextOutputFrameAt - chunkStart).toInt().coerceIn(0, frameCount - 1)
             val mono = mixedMonoSample(input, localFrame, frameBytes, bytesPerSample)
-            val pcm = (mono * Short.MAX_VALUE)
-                .roundToInt()
+            val pcm = (mono * Short.MAX_VALUE).roundToInt()
                 .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
             output.write(pcm and 0xff)
             output.write((pcm ushr 8) and 0xff)
             nextOutputFrameAt += sourceFramesPerOutput
         }
-
         inputFramesSeen += frameCount
         return output.toByteArray()
     }
@@ -612,12 +383,9 @@ private class StreamingPcmResampler(
                 input.getShort(offset).toDouble() / Short.MAX_VALUE.toDouble()
             }
         }
-
         if (channels == 1) return sample(0)
         if (channels == 2) return ((sample(0) + sample(1)) * 0.5).coerceIn(-1.0, 1.0)
 
-        // Film mixes usually anchor dialogue in the centre channel. Emphasising it is cheap and
-        // improves ASR without running source separation on the phone.
         val center = sample(2)
         var others = 0.0
         var count = 0
@@ -627,7 +395,7 @@ private class StreamingPcmResampler(
             count++
         }
         val ambient = if (count > 0) others / count else 0.0
-        return (center * 0.72 + ambient * 0.28).coerceIn(-1.0, 1.0)
+        return (center * 0.78 + ambient * 0.22).coerceIn(-1.0, 1.0)
     }
 }
 
