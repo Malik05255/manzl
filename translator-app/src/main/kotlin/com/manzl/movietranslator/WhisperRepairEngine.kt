@@ -26,6 +26,17 @@ data class TranscriptionResult(
 )
 
 class WhisperRepairEngine(private val context: Context) {
+    /**
+     * Provision the quantized repair model before the movie processing clock begins. A failed
+     * download is non-fatal at the service level; in that case the current movie simply skips the
+     * expensive repair pass and preserves the direct-translation time budget.
+     */
+    suspend fun prepareModel(): Boolean = runCatching {
+        WhisperModelManager(context).ensureModel()
+    }.isSuccess
+
+    fun isModelInstalled(): Boolean = WhisperModelManager(context).isInstalled()
+
     suspend fun repair(
         original: List<SubtitleCue>,
         candidates: List<RepairCandidate>,
@@ -97,6 +108,11 @@ private class WhisperModelManager(private val context: Context) {
         private const val MODEL_URL =
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin?download=true"
         private const val MIN_VALID_BYTES = 50L * 1024L * 1024L
+    }
+
+    fun isInstalled(): Boolean {
+        val model = File(File(context.filesDir, "models"), MODEL_NAME)
+        return model.isFile && model.length() >= MIN_VALID_BYTES
     }
 
     suspend fun ensureModel(): File = withContext(Dispatchers.IO) {
