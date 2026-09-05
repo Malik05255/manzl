@@ -15,13 +15,13 @@ class TranslationBatchingPerfTest {
     }
 
     @Test
-    fun normalContextBatches_reduceModelCallsWithoutOversizedPrompts() {
+    fun normalContextBatches_amortizeModelCallsOnShortClips() {
         val input = cues(24)
         val batches = TurkishArabicTranslator.buildContextBatchesForTest(input)
 
-        assertTrue(batches.size < input.size)
-        assertTrue(batches.all { it.size <= 8 })
-        assertTrue(batches.all { batch -> batch.sumOf { it.sourceText.length } <= 900 })
+        assertTrue(batches.size <= 2)
+        assertTrue(batches.all { it.size <= 14 })
+        assertTrue(batches.all { batch -> batch.sumOf { it.sourceText.length } <= 1_500 })
         assertEquals(input.size, batches.sumOf { it.size })
     }
 
@@ -32,8 +32,8 @@ class TranslationBatchingPerfTest {
         val compressed = TurkishArabicTranslator.buildContextBatchesForTest(input, compressed = true)
 
         assertTrue(compressed.size <= normal.size)
-        assertTrue(compressed.all { it.size <= 12 })
-        assertTrue(compressed.all { batch -> batch.sumOf { it.sourceText.length } <= 1_300 })
+        assertTrue(compressed.all { it.size <= 20 })
+        assertTrue(compressed.all { batch -> batch.sumOf { it.sourceText.length } <= 2_100 })
         assertEquals(input.size, compressed.sumOf { it.size })
     }
 
