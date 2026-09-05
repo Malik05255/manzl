@@ -187,22 +187,31 @@ class MovieTranslationService : Service() {
         worker = scope.launch {
             var translator: TurkishArabicTranslator? = null
             try {
-                // One-time model provisioning is deliberately outside the 25-minute processing
-                // budget. Once models are installed, subsequent movies start immediately.
+                // One-time downloads are deliberately outside the movie processing budget. After
+                // first setup, every run can spend its full time allowance on listening/translation.
                 publish(0f, "تجهيز النماذج المحلية…", force = true)
                 val modelManager = VoskModelManager(applicationContext)
                 val modelDir = withContext(Dispatchers.IO) {
                     modelManager.ensureModel { p ->
-                        publish(p * 0.04f, "تجهيز نموذج الاستماع التركي…")
+                        publish(p * 0.03f, "تجهيز نموذج الاستماع التركي…")
                     }
                 }
                 _state.update { it.copy(modelInstalled = true) }
 
-                runCatching {
+                val directProvisioned = runCatching {
                     DirectTranslationModelManager(applicationContext).ensureModel { p ->
-                        publish(0.04f + (p * 0.04f), "تجهيز نموذج الترجمة التركية ← العربية…")
+                        publish(0.03f + (p * 0.03f), "تجهيز نموذج الترجمة التركية ← العربية…")
                     }
-                }
+                }.isSuccess
+
+                val whisperEngine = WhisperRepairEngine(applicationContext)
+                val whisperReady = whisperEngine.prepareModel()
+
+                val fallbackProvisioned = runCatching {
+                    TurkishArabicTranslator(applicationContext).use { provisioner ->
+                        provisioner.prepareFallbackModel()
+                    }
+                }.isSuccess
 
                 val movieDurationMs = withContext(Dispatchers.IO) { readMovieDurationMs(videoUri) }
                 val plan = ProcessingBudget.forMovie(movieDurationMs)
@@ -222,32 +231,52 @@ class MovieTranslationService : Service() {
                 }
 
                 var sourceCues = transcription.cues
+                val boundedCandidates = trimRepairCandidates(
+                    candidates = transcription.repairCandidates,
+                    movieDurationMs = plan.movieDurationMs,
+                )
+
                 val elapsedAfterFastAsr = elapsedBudgetMs()
-                val translationReserve = (plan.targetTotalMs * 0.58).toLong()
+                // Human-like direct translation owns most of the budget. Whisper can only spend
+                // whatever remains after reserving Qwen + final subtitle formatting.
+                val translationReserve = (plan.targetTotalMs * 0.64).toLong()
                 val availableForWhisper = (
                     plan.targetTotalMs - elapsedAfterFastAsr - translationReserve - plan.finalReserveMs
                 ).coerceAtLeast(0L)
                 val whisperWallBudget = min(plan.whisperWallBudgetMs, availableForWhisper)
 
-                if (transcription.repairCandidates.isNotEmpty() && whisperWallBudget >= 20_000L) {
+                if (whisperReady && boundedCandidates.isNotEmpty() && whisperWallBudget >= 12_000L) {
                     publish(0.52f, "تحسين الاستماع في أصعب المقاطع فقط…", force = true)
-                    sourceCues = WhisperRepairEngine(applicationContext).repair(
+                    sourceCues = whisperEngine.repair(
                         original = sourceCues,
-                        candidates = transcription.repairCandidates,
+                        candidates = boundedCandidates,
                         maxWallTimeMs = whisperWallBudget,
                     ) { done, total ->
                         val ratio = done.toFloat() / total.coerceAtLeast(1).toFloat()
                         publish(0.52f + (ratio * 0.12f), "تحسين الاستماع في أصعب المقاطع فقط…")
                     }
                 } else {
-                    transcription.repairCandidates.forEach { it.wavFile.delete() }
-                    publish(0.64f, "حافظت على ميزانية الترجمة — تجاوزت Whisper", force = true)
+                    boundedCandidates.forEach { it.wavFile.delete() }
+                    val reason = if (!whisperReady) {
+                        "تعذر تجهيز Whisper — حافظت على وقت الترجمة المباشرة"
+                    } else {
+                        "حافظت على ميزانية الترجمة — تجاوزت Whisper"
+                    }
+                    publish(0.64f, reason, force = true)
                 }
 
                 translator = TurkishArabicTranslator(applicationContext)
                 publish(0.64f, "تحميل المترجم التركي ← العربي المباشر…", force = true)
-                val directActive = translator.ensureModel { p ->
-                    publish(0.64f + (p * 0.04f), "تحميل المترجم التركي ← العربي المباشر…")
+                val directActive = translator.ensureModel(
+                    onProgress = { p ->
+                        publish(0.64f + (p * 0.04f), "تحميل المترجم التركي ← العربي المباشر…")
+                    },
+                    // Never start a 563 MB network transfer after the processing clock begins.
+                    allowDownload = false,
+                )
+
+                if (!directActive && !fallbackProvisioned && !directProvisioned) {
+                    error("تعذر تجهيز مترجم محلي صالح. أعد المحاولة مع اتصال إنترنت لإكمال تنزيل النماذج.")
                 }
 
                 val translationStage = if (directActive) {
@@ -284,13 +313,17 @@ class MovieTranslationService : Service() {
                     }
                 }
 
-                val totalElapsed = elapsedOperationMs()
                 val processingElapsed = elapsedBudgetMs()
+                val targetNote = if (processingElapsed <= plan.targetTotalMs) {
+                    "ضمن هدف ${formatDuration(plan.targetTotalMs)}"
+                } else {
+                    "تجاوز الهدف بسبب سرعة الجهاز/المحتوى"
+                }
                 _state.update {
                     it.copy(
                         isRunning = false,
                         progress = 1f,
-                        stage = "تمت الترجمة خلال ${formatDuration(processingElapsed)} معالجة فعلية — الفيلم جاهز بالعربية",
+                        stage = "تمت الترجمة خلال ${formatDuration(processingElapsed)} — $targetNote",
                         cues = translated,
                         srtFile = output,
                         error = null,
@@ -323,6 +356,32 @@ class MovieTranslationService : Service() {
                 stopSelf()
             }
         }
+    }
+
+    private fun trimRepairCandidates(
+        candidates: List<RepairCandidate>,
+        movieDurationMs: Long,
+    ): List<RepairCandidate> {
+        if (candidates.isEmpty()) return emptyList()
+
+        // Candidate audio is capped separately from Whisper wall time. This keeps temporary disk I/O
+        // and the repair queue small while still retaining the acoustically worst dialogue.
+        val maxCandidateAudioMs = (movieDurationMs * 0.045)
+            .toLong()
+            .coerceIn(20_000L, 5L * 60_000L)
+        var usedMs = 0L
+        val selected = mutableListOf<RepairCandidate>()
+        for (candidate in candidates.sortedBy { it.confidence }) {
+            val duration = (candidate.endMs - candidate.startMs).coerceAtLeast(0L)
+            if (usedMs + duration > maxCandidateAudioMs && selected.isNotEmpty()) continue
+            selected += candidate
+            usedMs += duration
+            if (usedMs >= maxCandidateAudioMs) break
+        }
+
+        val selectedPaths = selected.mapTo(hashSetOf()) { it.wavFile.absolutePath }
+        candidates.filterNot { it.wavFile.absolutePath in selectedPaths }.forEach { it.wavFile.delete() }
+        return selected.sortedBy { it.startMs }
     }
 
     private fun publish(progress: Float, stage: String, force: Boolean = false) {
