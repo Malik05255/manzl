@@ -12,14 +12,14 @@ import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
-internal data class RepairCandidate(
+data class RepairCandidate(
     val startMs: Long,
     val endMs: Long,
     val confidence: Float,
     val wavFile: File,
 )
 
-internal data class TranscriptionResult(
+data class TranscriptionResult(
     val cues: List<SubtitleCue>,
     val repairCandidates: List<RepairCandidate>,
 )
