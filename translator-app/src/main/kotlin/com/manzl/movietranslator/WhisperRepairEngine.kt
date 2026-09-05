@@ -41,9 +41,6 @@ class WhisperRepairEngine(private val context: Context) {
     ): List<SubtitleCue> = withContext(Dispatchers.Default) {
         if (candidates.isEmpty()) return@withContext original
 
-        // Coverage holes always go first and are never skipped because a wall-clock budget expired.
-        // The budget only limits optional confidence repairs. This prevents spoken dialogue from
-        // disappearing merely to hit a time target.
         val ordered = candidates.sortedWith(
             compareByDescending<RepairCandidate> { it.mandatory }
                 .thenBy { it.confidence }
@@ -101,10 +98,14 @@ class WhisperRepairEngine(private val context: Context) {
 
 private class WhisperModelManager(private val context: Context) {
     companion object {
-        private const val MODEL_NAME = "ggml-base-q5_1.bin"
+        // The free whisper-android package officially supports the normal file-transcription path.
+        // Use the full multilingual base checkpoint for reliability and accuracy; it is unloaded
+        // before Qwen is loaded, so the extra model size does not stack in RAM with translation.
+        private const val MODEL_NAME = "ggml-base.bin"
         private const val MODEL_URL =
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin?download=true"
-        private const val MIN_VALID_BYTES = 50L * 1024L * 1024L
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin?download=true"
+        private const val LEGACY_MODEL_NAME = "ggml-base-q5_1.bin"
+        private const val MIN_VALID_BYTES = 120L * 1024L * 1024L
     }
 
     fun isInstalled(): Boolean {
@@ -115,14 +116,23 @@ private class WhisperModelManager(private val context: Context) {
     suspend fun ensureModel(): File = withContext(Dispatchers.IO) {
         val modelDir = File(context.filesDir, "models").apply { mkdirs() }
         val model = File(modelDir, MODEL_NAME)
-        if (model.isFile && model.length() >= MIN_VALID_BYTES) return@withContext model
+        if (model.isFile && model.length() >= MIN_VALID_BYTES) {
+            deleteLegacy(modelDir)
+            return@withContext model
+        }
 
         val partial = File(modelDir, "$MODEL_NAME.part")
         download(partial)
         check(partial.length() >= MIN_VALID_BYTES) { "تعذر تنزيل نموذج تحسين الاستماع." }
         if (model.exists()) model.delete()
         check(partial.renameTo(model)) { "تعذر تثبيت نموذج تحسين الاستماع." }
+        deleteLegacy(modelDir)
         model
+    }
+
+    private fun deleteLegacy(modelDir: File) {
+        runCatching { File(modelDir, LEGACY_MODEL_NAME).delete() }
+        runCatching { File(modelDir, "$LEGACY_MODEL_NAME.part").delete() }
     }
 
     private suspend fun download(target: File) {
