@@ -13,28 +13,32 @@ import java.net.URL
 /**
  * Manages the local Turkish -> Arabic language model.
  *
- * The previous 0.8B checkpoint was too small for reliable film dialogue. The 2B Q4_0 checkpoint is
- * still practical on modern ARM64 phones, but gives the translator materially more capacity for
- * context, idioms and natural Arabic. It is downloaded once and reused for every movie.
+ * Qwen3.5 2B proved far too slow on the current CPU-only Android llama.cpp AAR on real devices.
+ * Qwen2.5 1.5B Instruct uses the older, mature qwen2 transformer architecture that this runtime
+ * handles efficiently, while still providing multilingual Arabic support and materially more
+ * capacity than the former 0.8B checkpoint.
  */
 class DirectTranslationModelManager(private val context: Context) {
     companion object {
-        private const val MODEL_NAME = "qwen3.5-2b-q4_0.gguf"
+        private const val MODEL_NAME = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
         private const val MODEL_URL =
-            "https://huggingface.co/bartowski/Qwen_Qwen3.5-2B-GGUF/resolve/main/Qwen_Qwen3.5-2B-Q4_0.gguf?download=true"
-        private const val LEGACY_MODEL_NAME = "qwen3.5-0.8b-q4_0.gguf"
+            "https://huggingface.co/bartowski/Qwen2.5-1.5B-Instruct-GGUF/resolve/main/Qwen2.5-1.5B-Instruct-Q4_K_M.gguf?download=true"
 
-        // The selected Q4_0 file is about 1.2 GB. These bounds catch interrupted downloads without
-        // hashing the full checkpoint on every launch.
-        private const val MIN_VALID_BYTES = 1_100L * 1024L * 1024L
-        private const val REQUIRED_FREE_BYTES = 1_500L * 1024L * 1024L
+        private val LEGACY_MODELS = listOf(
+            "qwen3.5-2b-q4_0.gguf",
+            "qwen3.5-0.8b-q4_0.gguf",
+        )
+
+        // Q4_K_M is about 0.99 GB. Keep a conservative lower bound to catch interrupted downloads.
+        private const val MIN_VALID_BYTES = 900L * 1024L * 1024L
+        private const val REQUIRED_FREE_BYTES = 1_250L * 1024L * 1024L
     }
 
     suspend fun ensureModel(onProgress: (Float) -> Unit = {}): File = withContext(Dispatchers.IO) {
         val modelDir = File(context.filesDir, "models").apply { mkdirs() }
         val model = File(modelDir, MODEL_NAME)
         if (isReady(model)) {
-            deleteLegacyModel(modelDir)
+            deleteLegacyModels(modelDir)
             onProgress(1f)
             return@withContext model
         }
@@ -43,19 +47,19 @@ class DirectTranslationModelManager(private val context: Context) {
         val alreadyDownloaded = partial.takeIf { it.isFile }?.length() ?: 0L
         val extraNeeded = (MIN_VALID_BYTES - alreadyDownloaded).coerceAtLeast(0L)
         check(modelDir.usableSpace >= maxOf(extraNeeded, REQUIRED_FREE_BYTES - alreadyDownloaded)) {
-            "المساحة الحرة غير كافية لتنزيل نموذج الترجمة العربية عالي الجودة."
+            "المساحة الحرة غير كافية لتنزيل نموذج الترجمة السريع عالي الجودة."
         }
 
         download(partial, onProgress)
         check(partial.length() >= MIN_VALID_BYTES) {
-            "تعذر تنزيل نموذج الترجمة العربية عالي الجودة كاملًا."
+            "تعذر تنزيل نموذج الترجمة السريع كاملًا."
         }
 
         if (model.exists()) model.delete()
         check(partial.renameTo(model)) {
-            "تعذر تثبيت نموذج الترجمة العربية عالي الجودة."
+            "تعذر تثبيت نموذج الترجمة السريع."
         }
-        deleteLegacyModel(modelDir)
+        deleteLegacyModels(modelDir)
         onProgress(1f)
         model
     }
@@ -64,9 +68,11 @@ class DirectTranslationModelManager(private val context: Context) {
 
     private fun isReady(file: File): Boolean = file.isFile && file.length() >= MIN_VALID_BYTES
 
-    private fun deleteLegacyModel(modelDir: File) {
-        runCatching { File(modelDir, LEGACY_MODEL_NAME).delete() }
-        runCatching { File(modelDir, "$LEGACY_MODEL_NAME.part").delete() }
+    private fun deleteLegacyModels(modelDir: File) {
+        LEGACY_MODELS.forEach { name ->
+            runCatching { File(modelDir, name).delete() }
+            runCatching { File(modelDir, "$name.part").delete() }
+        }
     }
 
     private suspend fun download(target: File, onProgress: (Float) -> Unit) {
