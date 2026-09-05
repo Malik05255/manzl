@@ -1,54 +1,25 @@
 name: Debug build APK
 
 on:
-  pull_request_target:
-    branches:
-      - "main"
-    paths-ignore:
-      - ".gitignore"
-      - "**.md"
-      - "LICENSE"
-      - ".idea/**"
-      - ".github/**"
-      - ".editorconfig"
-      - "images/**"
-      - "metadata/**"
+  pull_request:
+    branches: [ "main" ]
 
 jobs:
-  run:
-    name: Build debug APK
-    runs-on: macos-14
-
+  build:
+    runs-on: ubuntu-latest
     permissions:
-      pull-requests: write
-
+      contents: read
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-java@v5
         with:
-          ref: ${{ github.event.pull_request.head.ref }}
-          repository: ${{ github.event.pull_request.head.repo.full_name }}
-
-      - name: Setup JDK
-        uses: actions/setup-java@v4
-        with:
-          distribution: "oracle"
+          distribution: temurin
           java-version: "17"
-          cache: "gradle"
-
+          cache: gradle
+      - run: chmod +x gradlew
       - name: Build debug APK
-        run: |
-          ./gradlew assembleDebug
-
-      - name: Upload debug APK
-        uses: actions/upload-artifact@v4
-        id: artifact-upload-step
+        run: ./gradlew --no-daemon :translator-app:assembleDebug
+      - uses: actions/upload-artifact@v4
         with:
-          name: debug-${{ github.sha }}
-          path: ${{ github.workspace }}/app/build/outputs/apk/debug/app-debug.apk
-
-      - name: Comment APK Link
-        uses: thollander/actions-comment-pull-request@v2
-        with:
-          comment_tag: apk
-          message: |
-            Build complete! Here's the debug APK: ${{ steps.artifact-upload-step.outputs.artifact-url }}
+          name: movie-translator-debug
+          path: translator-app/build/outputs/apk/debug/translator-app-debug.apk
