@@ -1,6 +1,8 @@
 package com.manzl.movietranslator
 
 import android.content.Context
+import android.os.PowerManager
+import android.os.SystemClock
 import com.google.android.gms.tasks.Task
 import com.google.mlkit.common.model.DownloadConditions
 import com.google.mlkit.nl.translate.TranslateLanguage
@@ -10,6 +12,7 @@ import com.google.mlkit.nl.translate.TranslatorOptions
 import dev.ffmpegkit.llama.Llama
 import dev.ffmpegkit.llama.LlamaConfig
 import dev.ffmpegkit.llama.LlamaModel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -17,19 +20,16 @@ import kotlin.coroutines.resumeWithException
 /**
  * Human-oriented Turkish -> Arabic subtitle translator.
  *
- * The primary path is a compact local Qwen model running with llama.cpp. It translates Turkish
- * directly into Arabic. ML Kit is kept only as a lazy safety fallback if the direct model fails.
- *
- * Performance notes:
- * - Adjacent semantic cues are grouped into moderately larger scene batches to reduce expensive
- *   repeated prompt evaluation on mobile CPUs.
- * - If a large direct batch does not preserve all subtitle markers, it is recursively split and
- *   retried before falling back. This keeps the fast path aggressive without sacrificing safety.
+ * Qwen is the primary direct Turkish -> Arabic path. It runs in non-thinking mode because movie
+ * subtitle translation benefits from semantic/contextual generation but not long reasoning chains.
+ * ML Kit is kept only as an emergency tail/fallback when the local direct model fails or the hard
+ * processing deadline is about to be exceeded.
  */
 class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
     private var directModel: LlamaModel? = null
     private var directFailed = false
     private var fallbackTranslator: Translator? = null
+    private val powerManager = context.getSystemService(PowerManager::class.java)
 
     /** Returns true when the direct Turkish -> Arabic model is active. */
     suspend fun ensureModel(onProgress: (Float) -> Unit = {}): Boolean {
@@ -45,12 +45,12 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
                     modelPath = modelFile.absolutePath,
                     config = LlamaConfig(
                         contextSize = 2_048,
-                        // Snapdragon 7 Gen 3 has four fast cores (1 prime + 3 performance).
-                        // Staying at four avoids spilling inference work onto efficiency cores.
+                        // Snapdragon 7 Gen 3: 1 prime + 3 performance cores. Keep sustained work on
+                        // the fast cluster instead of spreading across efficiency cores.
                         threads = 4,
                         gpuLayers = 0,
-                        temperature = 0f,
-                        topP = 0.9f,
+                        temperature = 0.7f,
+                        topP = 0.8f,
                         topK = 20,
                         seed = 42,
                     ),
@@ -70,27 +70,41 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
 
     suspend fun translate(
         cues: List<SubtitleCue>,
+        deadlineAtElapsedRealtimeMs: Long = Long.MAX_VALUE,
         onProgress: (done: Int, total: Int) -> Unit,
     ): List<SubtitleCue> {
         if (cues.isEmpty()) return emptyList()
 
-        // ASR engines often split one spoken sentence into several tiny fragments. Reconstruct
-        // complete utterances before translation so the Arabic follows intended meaning, not words.
         val semanticCues = mergeSemanticCues(cues)
         val batches = buildContextBatches(semanticCues)
         val result = ArrayList<SubtitleCue>(semanticCues.size)
         var done = 0
 
         for (batch in batches) {
-            val translated = translateBatch(batch)
+            thermalYieldIfNeeded()
+
+            val remainingToDeadline = deadlineAtElapsedRealtimeMs - SystemClock.elapsedRealtime()
+            val translated = if (remainingToDeadline <= EMERGENCY_TAIL_MS) {
+                // Deadline safety valve: preserve the 25-minute user promise instead of allowing
+                // one slow tail to run indefinitely. This path should normally affect only a small
+                // remainder, because Qwen batching and /no_think keep the main path fast.
+                translateFallbackBatch(batch)
+            } else {
+                translateBatch(batch)
+            }
+
             result += translated
             done += batch.size
             onProgress(done, semanticCues.size)
         }
-        return result
+        return result.sortedBy { it.startMs }
     }
 
     private suspend fun translateBatch(batch: List<SubtitleCue>): List<SubtitleCue> {
+        if (batch.size == 1) {
+            fixedHumanPhrase(batch.first())?.let { return listOf(it) }
+        }
+
         val model = directModel
         if (model != null && !directFailed) {
             val direct = runCatching { translateDirectBatch(model, batch) }.getOrNull()
@@ -101,8 +115,8 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
                 return direct
             }
 
-            // Marker formatting occasionally degrades as a batch grows. Split and retry with the
-            // same direct model before using the lower-quality fallback translator.
+            // Larger scene batches reduce repeated prompt evaluation. If marker fidelity degrades,
+            // split recursively and retry with the same direct model before using the fallback.
             if (batch.size > 1) {
                 val middle = batch.size / 2
                 return translateBatch(batch.subList(0, middle)) +
@@ -110,7 +124,6 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
             }
         }
 
-        // Safety fallback is initialized only when actually needed. It is not the normal path.
         return translateFallbackBatch(batch)
     }
 
@@ -119,16 +132,15 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
         batch: List<SubtitleCue>,
     ): List<SubtitleCue>? {
         val prompt = buildString {
-            appendLine("ترجم الأسطر التالية مباشرة إلى عربية طبيعية مختصرة، وحافظ على كل علامة كما هي:")
+            appendLine("/no_think")
+            appendLine("ترجم الحوار التركي التالي مباشرة إلى عربية طبيعية مختصرة مناسبة لفيلم، وحافظ على كل علامة:")
             batch.forEachIndexed { index, cue ->
                 append(marker(index)).append(' ').append(cue.sourceText.trim()).append('\n')
             }
         }
 
-        // Subtitle output should be concise. A tighter generation ceiling prevents pathological
-        // long generations while leaving enough room for natural Arabic and every marker.
         val sourceChars = batch.sumOf { it.sourceText.length }
-        val maxTokens = (sourceChars * 3 / 4 + 96).coerceIn(144, 560)
+        val maxTokens = (sourceChars * 2 / 3 + 88).coerceIn(128, 520)
         val response = Llama.complete(
             model = model,
             prompt = prompt,
@@ -147,6 +159,7 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
         val translator = ensureFallbackModel()
         if (batch.size == 1) {
             val cue = batch.first()
+            fixedHumanPhrase(cue)?.let { return listOf(it) }
             val arabic = cleanArabic(translator.translate(cue.sourceText).await())
             return listOf(cue.copy(translatedText = arabic.ifBlank { cue.sourceText }))
         }
@@ -166,8 +179,10 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
         }
 
         return batch.map { cue ->
-            val arabic = cleanArabic(translator.translate(cue.sourceText).await())
-            cue.copy(translatedText = arabic.ifBlank { cue.sourceText })
+            fixedHumanPhrase(cue) ?: run {
+                val arabic = cleanArabic(translator.translate(cue.sourceText).await())
+                cue.copy(translatedText = arabic.ifBlank { cue.sourceText })
+            }
         }
     }
 
@@ -237,6 +252,23 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
         return arabic.toFloat() / letters.toFloat() >= 0.45f
     }
 
+    private fun fixedHumanPhrase(cue: SubtitleCue): SubtitleCue? {
+        val key = cue.sourceText
+            .lowercase()
+            .trim()
+            .replace(Regex("[.!?…]+$"), "")
+            .replace(Regex("\\s+"), " ")
+        val arabic = COMMON_PHRASES[key] ?: return null
+        return cue.copy(translatedText = arabic)
+    }
+
+    private suspend fun thermalYieldIfNeeded() {
+        when {
+            powerManager.currentThermalStatus >= PowerManager.THERMAL_STATUS_CRITICAL -> delay(500L)
+            powerManager.currentThermalStatus >= PowerManager.THERMAL_STATUS_SEVERE -> delay(120L)
+        }
+    }
+
     override fun close() {
         directModel?.let { runCatching { Llama.releaseModel(it) } }
         directModel = null
@@ -245,12 +277,15 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
     }
 
     companion object {
-        private const val MAX_BATCH_SIZE = 6
-        private const val MAX_BATCH_CHARS = 720
+        // Eight short subtitles per scene call materially reduce prompt re-evaluation on CPU. The
+        // recursive marker check above protects quality if a particular scene is too complex.
+        private const val MAX_BATCH_SIZE = 8
+        private const val MAX_BATCH_CHARS = 900
         private const val MAX_CONTEXT_GAP_MS = 4_500L
         private const val MAX_SEMANTIC_GAP_MS = 900L
         private const val MAX_SEMANTIC_DURATION_MS = 6_500L
         private const val MAX_SEMANTIC_CHARS = 140
+        private const val EMERGENCY_TAIL_MS = 75_000L
 
         private val MARKER_REGEX = Regex("§(\\d+)§")
         private val SENTENCE_END = Regex("[.!?…]\\s*$")
@@ -258,20 +293,44 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
         private val REPEATED_SPACES = Regex("\\s+")
         private val THINK_BLOCK = Regex("<think>.*?</think>", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
 
-        // Keep this deliberately compact: it is evaluated on every local model call.
         private val DIRECT_SYSTEM_PROMPT = """
-            أنت مترجم أفلام من التركية إلى العربية. انقل المعنى والسياق لا الكلمات حرفيًا.
-            اكتب عربية فصحى طبيعية ومختصرة، وافهم العامية والأمثال والتهكم والمشاعر، وحافظ على الأسماء والضمائر.
-            لا تشرح ولا تضف شيئًا. أعد علامات §n§ نفسها وبالترتيب، وبعد كل علامة الترجمة العربية فقط.
+            /no_think
+            أنت مترجم أفلام محترف من التركية إلى العربية. انقل المعنى والسياق لا الكلمات حرفيًا.
+            اكتب عربية فصحى طبيعية ومختصرة تصلح للشاشة، وافهم العامية والأمثال والتهكم والمشاعر.
+            حافظ على الأسماء والعلاقات والضمائر والمعنى، ولا تضف ولا تحذف معنى مهمًا.
+            أعد علامات §n§ نفسها وبالترتيب، وبعد كل علامة الترجمة العربية فقط. لا تشرح.
         """.trimIndent()
+
+        // Exact high-frequency utterances are safer and faster as deterministic human-style Arabic.
+        // Only context-stable phrases belong here; ambiguous Turkish is deliberately left to Qwen.
+        private val COMMON_PHRASES = mapOf(
+            "evet" to "نعم.",
+            "hayır" to "لا.",
+            "tamam" to "حسنًا.",
+            "peki" to "حسنًا.",
+            "teşekkürler" to "شكرًا.",
+            "teşekkür ederim" to "شكرًا لك.",
+            "sağ ol" to "شكرًا لك.",
+            "lütfen" to "من فضلك.",
+            "özür dilerim" to "أنا آسف.",
+            "affedersin" to "عذرًا.",
+            "merhaba" to "مرحبًا.",
+            "günaydın" to "صباح الخير.",
+            "iyi geceler" to "تصبح على خير.",
+            "görüşürüz" to "أراك لاحقًا.",
+            "hadi" to "هيا.",
+            "bilmiyorum" to "لا أعرف.",
+            "anladım" to "فهمت.",
+            "anlamadım" to "لم أفهم.",
+            "bekle" to "انتظر.",
+            "dur" to "توقف.",
+        )
 
         internal fun mergeSemanticCuesForTest(cues: List<SubtitleCue>): List<SubtitleCue> =
             mergeSemanticCues(cues)
 
-        internal fun buildContextBatchesForTest(cues: List<SubtitleCue>): List<List<SubtitleCue>> {
-            val translator = TestBatchBuilder
-            return translator.build(cues)
-        }
+        internal fun buildContextBatchesForTest(cues: List<SubtitleCue>): List<List<SubtitleCue>> =
+            TestBatchBuilder.build(cues)
 
         private object TestBatchBuilder {
             fun build(cues: List<SubtitleCue>): List<List<SubtitleCue>> {
