@@ -27,8 +27,13 @@ class TurkishArabicTranslator : AutoCloseable {
         onProgress: (done: Int, total: Int) -> Unit,
     ): List<SubtitleCue> {
         if (cues.isEmpty()) return emptyList()
-        val result = ArrayList<SubtitleCue>(cues.size)
-        val batches = buildContextBatches(cues)
+
+        // ASR engines often split one spoken sentence into several tiny fragments.
+        // Translating those fragments separately produces literal/unnatural Arabic, so first
+        // reconstruct short semantic dialogue units and translate them as complete utterances.
+        val semanticCues = mergeSemanticCues(cues)
+        val result = ArrayList<SubtitleCue>(semanticCues.size)
+        val batches = buildContextBatches(semanticCues)
         var done = 0
 
         for (batch in batches) {
@@ -39,13 +44,13 @@ class TurkishArabicTranslator : AutoCloseable {
             }
             result += translatedBatch
             done += batch.size
-            onProgress(done, cues.size)
+            onProgress(done, semanticCues.size)
         }
         return result
     }
 
     private suspend fun translateOne(cue: SubtitleCue): SubtitleCue {
-        val arabic = translator.translate(cue.sourceText).await().trim()
+        val arabic = cleanArabic(translator.translate(cue.sourceText).await())
         return cue.copy(translatedText = arabic.ifBlank { cue.sourceText })
     }
 
@@ -58,7 +63,8 @@ class TurkishArabicTranslator : AutoCloseable {
         val translated = translator.translate(payload).await()
         val pieces = parseMarkedTranslation(translated, batch.size) ?: return null
         return batch.mapIndexed { index, cue ->
-            cue.copy(translatedText = pieces[index].trim().ifBlank { cue.sourceText })
+            val naturalArabic = cleanArabic(pieces[index])
+            cue.copy(translatedText = naturalArabic.ifBlank { cue.sourceText })
         }
     }
 
@@ -99,10 +105,60 @@ class TurkishArabicTranslator : AutoCloseable {
 
     override fun close() = translator.close()
 
-    private companion object {
-        const val MAX_BATCH_SIZE = 5
-        const val MAX_CONTEXT_GAP_MS = 3_500L
-        val MARKER_REGEX = Regex("§(\\d+)§")
+    companion object {
+        private const val MAX_BATCH_SIZE = 4
+        private const val MAX_CONTEXT_GAP_MS = 4_500L
+        private const val MAX_SEMANTIC_GAP_MS = 900L
+        private const val MAX_SEMANTIC_DURATION_MS = 6_500L
+        private const val MAX_SEMANTIC_CHARS = 140
+        private val MARKER_REGEX = Regex("§(\\d+)§")
+        private val SENTENCE_END = Regex("[.!?…]\\s*$")
+        private val SPACE_BEFORE_PUNCTUATION = Regex("\\s+([،؛:,.!?؟])")
+        private val REPEATED_SPACES = Regex("\\s+")
+
+        internal fun mergeSemanticCuesForTest(cues: List<SubtitleCue>): List<SubtitleCue> =
+            mergeSemanticCues(cues)
+
+        private fun mergeSemanticCues(cues: List<SubtitleCue>): List<SubtitleCue> {
+            if (cues.isEmpty()) return emptyList()
+            val sorted = cues.sortedBy { it.startMs }
+            val result = mutableListOf<SubtitleCue>()
+            var current = sorted.first()
+
+            for (next in sorted.drop(1)) {
+                val gap = (next.startMs - current.endMs).coerceAtLeast(0L)
+                val combinedDuration = next.endMs - current.startMs
+                val combinedText = "${current.sourceText.trim()} ${next.sourceText.trim()}".trim()
+                val currentHasSentenceEnd = SENTENCE_END.containsMatchIn(current.sourceText)
+                val canMerge = !currentHasSentenceEnd &&
+                    gap <= MAX_SEMANTIC_GAP_MS &&
+                    combinedDuration <= MAX_SEMANTIC_DURATION_MS &&
+                    combinedText.length <= MAX_SEMANTIC_CHARS
+
+                if (canMerge) {
+                    current = SubtitleCue(
+                        startMs = current.startMs,
+                        endMs = next.endMs,
+                        sourceText = combinedText,
+                        translatedText = "",
+                        confidence = minOf(current.confidence, next.confidence),
+                    )
+                } else {
+                    result += current
+                    current = next
+                }
+            }
+            result += current
+            return result
+        }
+
+        private fun cleanArabic(value: String): String = value
+            .trim()
+            .replace(REPEATED_SPACES, " ")
+            .replace(SPACE_BEFORE_PUNCTUATION, "$1")
+            .replace(',', '،')
+            .replace(';', '؛')
+            .replace('?', '؟')
     }
 }
 
