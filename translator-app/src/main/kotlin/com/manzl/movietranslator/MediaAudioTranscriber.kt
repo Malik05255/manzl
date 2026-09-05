@@ -164,9 +164,12 @@ class MediaAudioTranscriber(private val context: Context) {
         movieDurationMs: Long,
     ): List<RepairCandidate> {
         if (all.isEmpty()) return emptyList()
-        val budgetMs = (movieDurationMs * 0.12)
+
+        // Quality-first but still bounded: Whisper is allowed to revisit only the least reliable
+        // dialogue, never the whole movie. A two-hour film is capped at about 16 minutes of repair.
+        val budgetMs = (movieDurationMs * 0.14)
             .toLong()
-            .coerceIn(2 * 60_000L, 15 * 60_000L)
+            .coerceIn(2 * 60_000L, 16 * 60_000L)
         var usedMs = 0L
         val selected = mutableListOf<RepairCandidate>()
         val ordered = all.sortedBy { it.confidence }
@@ -352,7 +355,7 @@ private class SilenceSkippingSpeechProcessor(
         const val QUIET_END_SAMPLES = 10_400L
         const val MAX_SEGMENT_SAMPLES = 384_000L
         const val FEED_CHUNK_BYTES = 3_200
-        const val REPAIR_CONFIDENCE_THRESHOLD = 0.68f
+        const val REPAIR_CONFIDENCE_THRESHOLD = 0.74f
         const val MIN_REPAIR_MS = 700L
     }
 }
@@ -448,6 +451,8 @@ private class StreamingPcmResampler(
         if (channels == 1) return sample(0)
         if (channels == 2) return ((sample(0) + sample(1)) * 0.5).coerceIn(-1.0, 1.0)
 
+        // Film dialogue is commonly concentrated in the centre channel. Give it more weight while
+        // keeping enough ambient mix to retain off-centre speech and non-standard channel layouts.
         val center = sample(2)
         var others = 0.0
         var count = 0
@@ -457,7 +462,7 @@ private class StreamingPcmResampler(
             count++
         }
         val ambient = if (count > 0) others / count else 0.0
-        return (center * 0.62 + ambient * 0.38).coerceIn(-1.0, 1.0)
+        return (center * 0.72 + ambient * 0.28).coerceIn(-1.0, 1.0)
     }
 }
 

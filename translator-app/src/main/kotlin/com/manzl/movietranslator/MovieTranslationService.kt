@@ -187,26 +187,33 @@ class MovieTranslationService : Service() {
 
                 var sourceCues = transcription.cues
                 if (transcription.repairCandidates.isNotEmpty()) {
-                    publish(0.70f, "تحسين المقاطع الصعبة فقط…", force = true)
+                    publish(0.70f, "إعادة سماع المقاطع المشكوك فيها بدقة أعلى…", force = true)
                     sourceCues = WhisperRepairEngine(applicationContext).repair(
                         original = sourceCues,
                         candidates = transcription.repairCandidates,
                     ) { done, total ->
                         val ratio = done.toFloat() / total.coerceAtLeast(1).toFloat()
-                        publish(0.70f + (ratio * 0.12f), "تحسين المقاطع الصعبة فقط…")
+                        publish(0.70f + (ratio * 0.12f), "إعادة سماع المقاطع المشكوك فيها بدقة أعلى…")
                     }
                 } else {
                     publish(0.82f, "الحوار واضح — تجاوزت المراجعة الثقيلة", force = true)
                 }
 
-                publish(0.82f, "تجهيز نموذج الترجمة العربية…", force = true)
-                translator = TurkishArabicTranslator()
-                translator.ensureModel()
+                translator = TurkishArabicTranslator(applicationContext)
+                publish(0.82f, "تجهيز المترجم التركي ← العربي المباشر…", force = true)
+                val directActive = translator.ensureModel { p ->
+                    publish(0.82f + (p * 0.05f), "تجهيز المترجم التركي ← العربي المباشر…")
+                }
 
-                publish(0.84f, "ترجمة الحوار إلى العربية مع سياق المشهد…", force = true)
+                val translationStage = if (directActive) {
+                    "صياغة ترجمة عربية طبيعية مباشرة من التركية…"
+                } else {
+                    "تشغيل المترجم الاحتياطي على الجهاز…"
+                }
+                publish(0.87f, translationStage, force = true)
                 val translated = translator.translate(sourceCues) { done, total ->
                     val ratio = done.toFloat() / total.coerceAtLeast(1).toFloat()
-                    publish(0.84f + (ratio * 0.14f), "ترجمة الحوار إلى العربية مع سياق المشهد…")
+                    publish(0.87f + (ratio * 0.11f), translationStage)
                 }
 
                 publish(0.98f, "تنسيق التوقيت وتجهيز ملف الترجمة…", force = true)

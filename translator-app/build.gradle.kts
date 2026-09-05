@@ -60,6 +60,8 @@ dependencies {
 
     implementation("com.alphacephei:vosk-android:0.3.75")
     implementation("dev.ffmpegkit-maintained:whisper-android:1.0.0")
+    implementation("dev.ffmpegkit-maintained:llama-android:0.1.1")
+    // Kept only as a lazy safety fallback if the direct local model cannot run on a device.
     implementation("com.google.mlkit:translate:17.0.3")
 
     implementation("androidx.media3:media3-exoplayer:1.10.1")
