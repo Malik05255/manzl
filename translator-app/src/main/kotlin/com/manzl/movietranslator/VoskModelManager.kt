@@ -25,7 +25,7 @@ class VoskModelManager(private val context: Context) {
             return modelDir
         }
 
-        val zipFile = File(context.cacheDir, "$MODEL_NAME.zip")
+        val zipFile = File(context.cacheDir, "$MODEL_NAME.zip.part")
         download(zipFile, onProgress)
         if (modelDir.exists()) modelDir.deleteRecursively()
         unzip(zipFile, modelsDir)
@@ -43,24 +43,30 @@ class VoskModelManager(private val context: Context) {
 
     private suspend fun download(target: File, onProgress: (Float) -> Unit) {
         target.parentFile?.mkdirs()
-        if (target.exists()) target.delete()
+        val existingBytes = target.takeIf { it.isFile }?.length()?.coerceAtLeast(0L) ?: 0L
 
         val connection = (URL(MODEL_URL).openConnection() as HttpURLConnection).apply {
             connectTimeout = 20_000
             readTimeout = 30_000
             instanceFollowRedirects = true
             requestMethod = "GET"
+            if (existingBytes > 0L) setRequestProperty("Range", "bytes=$existingBytes-")
         }
         try {
             connection.connect()
             check(connection.responseCode in 200..299) {
                 "فشل تنزيل نموذج اللغة التركية (${connection.responseCode})."
             }
-            val total = connection.contentLengthLong.coerceAtLeast(1L)
+
+            val resumed = connection.responseCode == HttpURLConnection.HTTP_PARTIAL && existingBytes > 0L
+            val startAt = if (resumed) existingBytes else 0L
+            val contentLength = connection.contentLengthLong.coerceAtLeast(1L)
+            val total = if (resumed) startAt + contentLength else contentLength
+
             connection.inputStream.use { input ->
-                FileOutputStream(target).use { output ->
+                FileOutputStream(target, resumed).use { output ->
                     val buffer = ByteArray(64 * 1024)
-                    var downloaded = 0L
+                    var downloaded = startAt
                     while (true) {
                         currentCoroutineContext().ensureActive()
                         val count = input.read(buffer)
