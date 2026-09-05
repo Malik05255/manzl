@@ -163,9 +163,6 @@ class MediaAudioTranscriber(private val context: Context) {
     ): List<RepairCandidate> {
         if (all.isEmpty()) return emptyList()
 
-        // Coverage holes are non-negotiable: keep every mandatory candidate. The optional budget
-        // is only for improving already-present Vosk text, so it can be reduced without deleting
-        // spoken dialogue from the final subtitles.
         val mandatory = all.filter { it.mandatory }.sortedBy { it.startMs }
         val optionalBudgetMs = (movieDurationMs * 0.10)
             .toLong()
@@ -279,6 +276,7 @@ private class SilenceSkippingSpeechProcessor(
             val endMs = baseMs + samplesToMs((bytes.size / 2).toLong())
             val durationMs = (endMs - baseMs).coerceAtLeast(1L)
             val localCues = mutableListOf<SubtitleCue>()
+            var sawPartialSpeech = false
             recognizer.reset()
             var offset = 0
             while (offset < bytes.size) {
@@ -286,6 +284,10 @@ private class SilenceSkippingSpeechProcessor(
                 bytes.copyInto(feedBuffer, destinationOffset = 0, startIndex = offset, endIndex = offset + count)
                 if (recognizer.acceptWaveForm(feedBuffer, count)) {
                     parseResult(recognizer.result, baseMs)?.let { addUnique(localCues, it) }
+                } else if (!sawPartialSpeech) {
+                    sawPartialSpeech = runCatching {
+                        JSONObject(recognizer.partialResult).optString("partial").isNotBlank()
+                    }.getOrDefault(false)
                 }
                 offset += count
             }
@@ -301,10 +303,19 @@ private class SilenceSkippingSpeechProcessor(
                 cue.sourceText.split(Regex("\\s+")).count { it.isNotBlank() }
             }
             val wordsPerSecond = recognizedWords.toDouble() / (durationMs.toDouble() / 1_000.0)
-            val coverageSuspicious = localCues.isEmpty() ||
-                (durationMs >= COVERAGE_CHECK_MIN_MS && wordsPerSecond < MIN_RECOGNIZED_WORDS_PER_SECOND)
+
+            // A blank Vosk result is mandatory only when there is evidence that it was speech
+            // (partial Turkish hypotheses or a short dialogue-like segment). This avoids sending
+            // long music/effects beds through Whisper while still recovering clipped dialogue.
+            val blankSpeechHole = localCues.isEmpty() &&
+                (sawPartialSpeech || durationMs <= MAX_BLANK_MANDATORY_MS)
+            val sparseTranscript = localCues.isNotEmpty() &&
+                durationMs >= COVERAGE_CHECK_MIN_MS &&
+                wordsPerSecond < MIN_RECOGNIZED_WORDS_PER_SECOND
+            val coverageSuspicious = blankSpeechHole || sparseTranscript
+            val optionalBlank = localCues.isEmpty() && durationMs <= MAX_OPTIONAL_BLANK_MS
             val needsRepair = durationMs >= MIN_REPAIR_MS &&
-                (coverageSuspicious || averageConfidence < REPAIR_CONFIDENCE_THRESHOLD)
+                (coverageSuspicious || optionalBlank || averageConfidence < REPAIR_CONFIDENCE_THRESHOLD)
 
             if (needsRepair) {
                 val wav = File(cacheDir, "repair_${System.currentTimeMillis()}_${sequence++}.wav")
@@ -387,6 +398,8 @@ private class SilenceSkippingSpeechProcessor(
         const val MIN_REPAIR_MS = 500L
         const val COVERAGE_CHECK_MIN_MS = 1_600L
         const val MIN_RECOGNIZED_WORDS_PER_SECOND = 0.55
+        const val MAX_BLANK_MANDATORY_MS = 8_000L
+        const val MAX_OPTIONAL_BLANK_MS = 12_000L
     }
 }
 
