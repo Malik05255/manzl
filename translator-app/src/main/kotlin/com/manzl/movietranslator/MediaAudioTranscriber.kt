@@ -6,8 +6,10 @@ import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
+import android.os.PowerManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -29,14 +31,14 @@ class MediaAudioTranscriber(private val context: Context) {
         val extractor = MediaExtractor()
         var decoderForCleanup: MediaCodec? = null
         val model = Model(modelDir.absolutePath)
-        val recognizer = Recognizer(model, 16_000f).apply { setWords(true) }
+        val recognizer = Recognizer(model, TARGET_SAMPLE_RATE.toFloat()).apply { setWords(true) }
         val cues = mutableListOf<SubtitleCue>()
+        val thermalGuard = ThermalGuard(context)
 
         try {
             extractor.setDataSource(context, uri, null)
-            val trackIndex = (0 until extractor.trackCount).firstOrNull { index ->
-                extractor.getTrackFormat(index).getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true
-            } ?: error("لم أجد مسارًا صوتيًا داخل الفيلم.")
+            val trackIndex = chooseBestAudioTrack(extractor)
+                ?: error("لم أجد مسارًا صوتيًا داخل الفيلم.")
 
             extractor.selectTrack(trackIndex)
             val inputFormat = extractor.getTrackFormat(trackIndex)
@@ -57,6 +59,8 @@ class MediaAudioTranscriber(private val context: Context) {
             var outputChannels = inputFormat.getIntegerOrDefault(MediaFormat.KEY_CHANNEL_COUNT, 2)
             var pcmEncoding = AudioFormat.ENCODING_PCM_16BIT
             var resampler = StreamingPcmResampler(outputSampleRate, outputChannels, pcmEncoding)
+            val speechProcessor = SilenceSkippingSpeechProcessor(recognizer, cues)
+            var lastProgress = -1f
 
             while (!outputDone) {
                 currentCoroutineContext().ensureActive()
@@ -112,28 +116,29 @@ class MediaAudioTranscriber(private val context: Context) {
                             val decoded = ByteArray(info.size)
                             outputBuffer.get(decoded)
                             val pcm16k = resampler.convert(decoded)
-                            if (pcm16k.isNotEmpty() && recognizer.acceptWaveForm(pcm16k, pcm16k.size)) {
-                                parseResult(recognizer.result)?.let(cues::add)
+                            if (pcm16k.isNotEmpty()) {
+                                speechProcessor.consume(pcm16k)
                             }
-                            onProgress(
-                                (info.presentationTimeUs.toDouble() / durationUs.toDouble())
-                                    .toFloat()
-                                    .coerceIn(0f, 1f)
-                            )
+
+                            val progress = (info.presentationTimeUs.toDouble() / durationUs.toDouble())
+                                .toFloat()
+                                .coerceIn(0f, 1f)
+                            if (progress - lastProgress >= 0.005f) {
+                                lastProgress = progress
+                                onProgress(progress)
+                            }
                         }
                         outputDone = info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0
                         decoder.releaseOutputBuffer(outputIndex, false)
                     }
                 }
+
+                thermalGuard.yieldIfNeeded()
             }
 
-            parseResult(recognizer.finalResult)?.let { finalCue ->
-                if (cues.lastOrNull()?.sourceText != finalCue.sourceText || cues.lastOrNull()?.startMs != finalCue.startMs) {
-                    cues += finalCue
-                }
-            }
+            speechProcessor.finish()
             onProgress(1f)
-            cues
+            cues.sortedBy { it.startMs }
         } finally {
             runCatching { decoderForCleanup?.stop() }
             runCatching { decoderForCleanup?.release() }
@@ -143,17 +148,148 @@ class MediaAudioTranscriber(private val context: Context) {
         }
     }
 
-    private fun parseResult(json: String): SubtitleCue? {
+    private fun chooseBestAudioTrack(extractor: MediaExtractor): Int? {
+        var bestIndex: Int? = null
+        var bestScore = Int.MIN_VALUE
+        for (index in 0 until extractor.trackCount) {
+            val format = extractor.getTrackFormat(index)
+            val mime = format.getString(MediaFormat.KEY_MIME) ?: continue
+            if (!mime.startsWith("audio/")) continue
+
+            val language = format.getString(MediaFormat.KEY_LANGUAGE)?.lowercase().orEmpty()
+            val channels = format.getIntegerOrDefault(MediaFormat.KEY_CHANNEL_COUNT, 2)
+            var score = 0
+            if (language == "tr" || language == "tur" || language.startsWith("tr-")) score += 100
+            if (channels >= 3) score += 8
+            if (channels == 2) score += 4
+            if (bestIndex == null || score > bestScore) {
+                bestIndex = index
+                bestScore = score
+            }
+        }
+        return bestIndex
+    }
+
+    private companion object {
+        const val TARGET_SAMPLE_RATE = 16_000
+    }
+}
+
+private class SilenceSkippingSpeechProcessor(
+    private val recognizer: Recognizer,
+    private val output: MutableList<SubtitleCue>,
+) {
+    private val segment = ByteArrayOutputStream(256 * 1024)
+    private var segmentStartMs = 0L
+    private var mediaClockMs = 0L
+    private var trailingQuietMs = 0L
+    private var active = false
+
+    fun consume(pcm: ByteArray) {
+        if (pcm.isEmpty()) return
+        val durationMs = ((pcm.size / 2.0) / 16_000.0 * 1000.0).roundToInt().toLong().coerceAtLeast(1L)
+        val speechLike = hasAudibleSignal(pcm)
+
+        if (!active) {
+            if (speechLike) {
+                active = true
+                segmentStartMs = mediaClockMs
+                trailingQuietMs = 0L
+                segment.write(pcm)
+            }
+        } else {
+            segment.write(pcm)
+            if (speechLike) {
+                trailingQuietMs = 0L
+            } else {
+                trailingQuietMs += durationMs
+            }
+
+            val segmentDurationMs = ((segment.size() / 2.0) / 16_000.0 * 1000.0).toLong()
+            if (trailingQuietMs >= QUIET_END_MS || segmentDurationMs >= MAX_SEGMENT_MS) {
+                processSegment()
+            }
+        }
+
+        mediaClockMs += durationMs
+    }
+
+    fun finish() {
+        if (active && segment.size() > 0) processSegment()
+    }
+
+    private fun processSegment() {
+        val bytes = segment.toByteArray()
+        if (bytes.isNotEmpty()) {
+            recognizer.reset()
+            var offset = 0
+            while (offset < bytes.size) {
+                val count = minOf(FEED_CHUNK_BYTES, bytes.size - offset)
+                val chunk = bytes.copyOfRange(offset, offset + count)
+                if (recognizer.acceptWaveForm(chunk, chunk.size)) {
+                    parseResult(recognizer.result, segmentStartMs)?.let(::addIfUseful)
+                }
+                offset += count
+            }
+            parseResult(recognizer.finalResult, segmentStartMs)?.let(::addIfUseful)
+        }
+        segment.reset()
+        active = false
+        trailingQuietMs = 0L
+    }
+
+    private fun addIfUseful(cue: SubtitleCue) {
+        if (cue.sourceText.isBlank()) return
+        val previous = output.lastOrNull()
+        if (previous?.sourceText == cue.sourceText && previous.startMs == cue.startMs) return
+        output += cue
+    }
+
+    private fun hasAudibleSignal(data: ByteArray): Boolean {
+        if (data.size < 2) return false
+        val buffer = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
+        var sum = 0L
+        var samples = 0
+        var index = 0
+        while (index + 1 < data.size) {
+            val value = kotlin.math.abs(buffer.getShort(index).toInt())
+            sum += value
+            samples++
+            index += 16
+        }
+        if (samples == 0) return false
+        return (sum / samples) >= MIN_MEAN_ABS_SIGNAL
+    }
+
+    private fun parseResult(json: String, baseMs: Long): SubtitleCue? {
         val root = JSONObject(json)
         val text = root.optString("text").trim()
         if (text.isBlank()) return null
         val words = root.optJSONArray("result")
         if (words == null || words.length() == 0) return null
+
         val first = words.getJSONObject(0)
         val last = words.getJSONObject(words.length() - 1)
-        val startMs = (first.optDouble("start", 0.0) * 1000.0).toLong()
-        val endMs = (last.optDouble("end", first.optDouble("start", 0.0) + 1.0) * 1000.0).toLong()
-        return SubtitleCue(startMs, endMs.coerceAtLeast(startMs + 350L), text)
+        val startMs = baseMs + (first.optDouble("start", 0.0) * 1000.0).toLong()
+        val endMs = baseMs + (last.optDouble("end", first.optDouble("start", 0.0) + 1.0) * 1000.0).toLong()
+        var confidenceSum = 0.0
+        for (i in 0 until words.length()) {
+            confidenceSum += words.getJSONObject(i).optDouble("conf", 1.0)
+        }
+        val confidence = (confidenceSum / words.length()).toFloat().coerceIn(0f, 1f)
+        return SubtitleCue(
+            startMs = startMs,
+            endMs = endMs.coerceAtLeast(startMs + 350L),
+            sourceText = text,
+            confidence = confidence,
+        )
+    }
+
+    private companion object {
+        const val MIN_MEAN_ABS_SIGNAL = 95L
+        const val QUIET_END_MS = 650L
+        const val MAX_SEGMENT_MS = 24_000L
+        const val FEED_CHUNK_BYTES = 3_200
     }
 }
 
@@ -168,34 +304,34 @@ private class StreamingPcmResampler(
     private var inputFramesSeen = 0L
     private var nextOutputFrameAt = 0.0
     private val sourceFramesPerOutput = sourceRate.toDouble() / 16_000.0
+    private var remainder = ByteArray(0)
 
     fun convert(data: ByteArray): ByteArray {
         if (data.isEmpty() || sourceRate <= 0 || channels <= 0) return ByteArray(0)
         val bytesPerSample = if (encoding == AudioFormat.ENCODING_PCM_FLOAT) 4 else 2
         val frameBytes = bytesPerSample * channels
-        val frameCount = data.size / frameBytes
+
+        val source = if (remainder.isEmpty()) data else ByteArray(remainder.size + data.size).also {
+            remainder.copyInto(it, 0)
+            data.copyInto(it, remainder.size)
+        }
+        val frameCount = source.size / frameBytes
+        val usedBytes = frameCount * frameBytes
+        remainder = if (usedBytes < source.size) source.copyOfRange(usedBytes, source.size) else ByteArray(0)
         if (frameCount <= 0) return ByteArray(0)
 
         val chunkStart = inputFramesSeen.toDouble()
         val chunkEnd = chunkStart + frameCount
-        val input = ByteBuffer.wrap(data).order(ByteOrder.LITTLE_ENDIAN)
+        val input = ByteBuffer.wrap(source, 0, usedBytes).order(ByteOrder.LITTLE_ENDIAN)
         val output = ByteArrayOutputStream((frameCount * 16_000.0 / sourceRate * 2.0).roundToInt().coerceAtLeast(32))
 
         if (nextOutputFrameAt < chunkStart) nextOutputFrameAt = chunkStart
         while (nextOutputFrameAt < chunkEnd) {
             val localFrame = floor(nextOutputFrameAt - chunkStart).toInt().coerceIn(0, frameCount - 1)
-            var sum = 0.0
-            for (channel in 0 until channels) {
-                val offset = localFrame * frameBytes + channel * bytesPerSample
-                val sample = if (encoding == AudioFormat.ENCODING_PCM_FLOAT) {
-                    input.getFloat(offset).toDouble().coerceIn(-1.0, 1.0)
-                } else {
-                    input.getShort(offset).toDouble() / Short.MAX_VALUE.toDouble()
-                }
-                sum += sample
-            }
-            val mono = (sum / channels).coerceIn(-1.0, 1.0)
-            val pcm = (mono * Short.MAX_VALUE).roundToInt().coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
+            val mono = mixedMonoSample(input, localFrame, frameBytes, bytesPerSample)
+            val pcm = (mono * Short.MAX_VALUE)
+                .roundToInt()
+                .coerceIn(Short.MIN_VALUE.toInt(), Short.MAX_VALUE.toInt())
             output.write(pcm and 0xff)
             output.write((pcm ushr 8) and 0xff)
             nextOutputFrameAt += sourceFramesPerOutput
@@ -203,5 +339,52 @@ private class StreamingPcmResampler(
 
         inputFramesSeen += frameCount
         return output.toByteArray()
+    }
+
+    private fun mixedMonoSample(
+        input: ByteBuffer,
+        frame: Int,
+        frameBytes: Int,
+        bytesPerSample: Int,
+    ): Double {
+        fun sample(channel: Int): Double {
+            val offset = frame * frameBytes + channel * bytesPerSample
+            return if (encoding == AudioFormat.ENCODING_PCM_FLOAT) {
+                input.getFloat(offset).toDouble().coerceIn(-1.0, 1.0)
+            } else {
+                input.getShort(offset).toDouble() / Short.MAX_VALUE.toDouble()
+            }
+        }
+
+        if (channels == 1) return sample(0)
+        if (channels == 2) return ((sample(0) + sample(1)) * 0.5).coerceIn(-1.0, 1.0)
+
+        // Most 5.1 movie mixes place dialogue primarily in the center channel (index 2).
+        // Keep the rest of the mix at a lower weight so unusual channel layouts still work.
+        val center = sample(2)
+        var others = 0.0
+        var count = 0
+        for (channel in 0 until channels) {
+            if (channel == 2) continue
+            others += sample(channel)
+            count++
+        }
+        val ambient = if (count > 0) others / count else 0.0
+        return (center * 0.62 + ambient * 0.38).coerceIn(-1.0, 1.0)
+    }
+}
+
+private class ThermalGuard(context: Context) {
+    private val powerManager = context.getSystemService(PowerManager::class.java)
+    private var lastCheckMs = 0L
+
+    suspend fun yieldIfNeeded() {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (now - lastCheckMs < 2_000L) return
+        lastCheckMs = now
+        when {
+            powerManager.currentThermalStatus >= PowerManager.THERMAL_STATUS_CRITICAL -> delay(750L)
+            powerManager.currentThermalStatus >= PowerManager.THERMAL_STATUS_SEVERE -> delay(180L)
+        }
     }
 }
