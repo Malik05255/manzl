@@ -18,6 +18,7 @@ data class RepairCandidate(
     val endMs: Long,
     val confidence: Float,
     val wavFile: File,
+    val mandatory: Boolean = false,
 )
 
 data class TranscriptionResult(
@@ -26,11 +27,6 @@ data class TranscriptionResult(
 )
 
 class WhisperRepairEngine(private val context: Context) {
-    /**
-     * Provision the quantized repair model before the movie processing clock begins. A failed
-     * download is non-fatal at the service level; in that case the current movie simply skips the
-     * expensive repair pass and preserves the direct-translation time budget.
-     */
     suspend fun prepareModel(): Boolean = runCatching {
         WhisperModelManager(context).ensureModel()
     }.isSuccess
@@ -43,14 +39,16 @@ class WhisperRepairEngine(private val context: Context) {
         maxWallTimeMs: Long = Long.MAX_VALUE,
         onProgress: (done: Int, total: Int) -> Unit,
     ): List<SubtitleCue> = withContext(Dispatchers.Default) {
-        if (candidates.isEmpty() || maxWallTimeMs <= 0L) {
-            candidates.forEach { it.wavFile.delete() }
-            return@withContext original
-        }
+        if (candidates.isEmpty()) return@withContext original
 
-        // Worst-confidence clips first. The wall-clock budget makes Whisper a targeted repair tool
-        // instead of allowing it to dominate a two-hour movie's total processing time.
-        val ordered = candidates.sortedBy { it.confidence }
+        // Coverage holes always go first and are never skipped because a wall-clock budget expired.
+        // The budget only limits optional confidence repairs. This prevents spoken dialogue from
+        // disappearing merely to hit a time target.
+        val ordered = candidates.sortedWith(
+            compareByDescending<RepairCandidate> { it.mandatory }
+                .thenBy { it.confidence }
+                .thenBy { it.startMs }
+        )
         val modelFile = WhisperModelManager(context).ensureModel()
         val model = Whisper.loadModel(context, modelFile.absolutePath)
         val repaired = original.toMutableList()
@@ -60,7 +58,8 @@ class WhisperRepairEngine(private val context: Context) {
             var processed = 0
             for (candidate in ordered) {
                 currentCoroutineContext().ensureActive()
-                if (SystemClock.elapsedRealtime() - startedAt >= maxWallTimeMs) break
+                val budgetExpired = SystemClock.elapsedRealtime() - startedAt >= maxWallTimeMs
+                if (budgetExpired && !candidate.mandatory) break
 
                 val result = runCatching {
                     Whisper.transcribe(
@@ -102,8 +101,6 @@ class WhisperRepairEngine(private val context: Context) {
 
 private class WhisperModelManager(private val context: Context) {
     companion object {
-        // Q5_1 keeps the multilingual base model but cuts disk/RAM pressure substantially versus
-        // the full base checkpoint. Whisper is only used for uncertain clips, never whole-film ASR.
         private const val MODEL_NAME = "ggml-base-q5_1.bin"
         private const val MODEL_URL =
             "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin?download=true"
