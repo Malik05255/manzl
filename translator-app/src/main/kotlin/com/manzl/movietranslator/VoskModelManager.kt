@@ -38,8 +38,30 @@ class VoskModelManager(private val context: Context) {
 
     fun isInstalled(): Boolean = isReady(File(File(context.filesDir, "models"), MODEL_NAME))
 
-    private fun isReady(dir: File): Boolean =
-        dir.isDirectory && File(dir, "conf/model.conf").isFile && File(dir, "am/final.mdl").isFile
+    /**
+     * Vosk supports two on-disk layouts. Most recent models use the v2 layout
+     * (am/conf/graph), while the official Turkish small model is still shipped
+     * in the older flat v1 layout. Treat both as valid so a successfully
+     * downloaded Turkish model is not rejected and downloaded again.
+     */
+    private fun isReady(dir: File): Boolean {
+        if (!dir.isDirectory) return false
+
+        val v1AcousticModel = File(dir, "final.mdl").isFile
+        val v1FeatureConfig = File(dir, "mfcc.conf").isFile || File(dir, "fbank.conf").isFile
+        val v1Graph = File(dir, "HCLG.fst").isFile ||
+            (File(dir, "HCLr.fst").isFile && File(dir, "Gr.fst").isFile)
+        val legacyV1Ready = v1AcousticModel && v1FeatureConfig && v1Graph
+
+        val v2AcousticModel = File(dir, "am/final.mdl").isFile
+        val v2ModelConfig = File(dir, "conf/model.conf").isFile
+        val v2FeatureConfig = File(dir, "conf/mfcc.conf").isFile || File(dir, "conf/fbank.conf").isFile
+        val v2Graph = File(dir, "graph/HCLG.fst").isFile ||
+            (File(dir, "graph/HCLr.fst").isFile && File(dir, "graph/Gr.fst").isFile)
+        val modernV2Ready = v2AcousticModel && v2ModelConfig && v2FeatureConfig && v2Graph
+
+        return legacyV1Ready || modernV2Ready
+    }
 
     private suspend fun download(target: File, onProgress: (Float) -> Unit) {
         target.parentFile?.mkdirs()
