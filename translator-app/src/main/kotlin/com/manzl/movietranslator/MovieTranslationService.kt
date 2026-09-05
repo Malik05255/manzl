@@ -162,34 +162,51 @@ class MovieTranslationService : Service() {
 
         acquireWakeLock()
         worker = scope.launch {
-            val translator = TurkishArabicTranslator()
+            var translator: TurkishArabicTranslator? = null
             try {
-                publish(0f, "تجهيز نموذج الاستماع التركي…", force = true)
+                publish(0f, "تجهيز نموذج الاستماع التركي السريع…", force = true)
                 val modelManager = VoskModelManager(applicationContext)
                 val modelDir = withContext(Dispatchers.IO) {
                     modelManager.ensureModel { p ->
-                        publish(p * 0.10f, "تجهيز نموذج الاستماع التركي…")
+                        publish(p * 0.08f, "تجهيز نموذج الاستماع التركي السريع…")
                     }
                 }
                 _state.update { it.copy(modelInstalled = true) }
 
-                publish(0.10f, "تجهيز نموذج الترجمة العربية…", force = true)
-                translator.ensureModel()
-
-                publish(0.15f, "تحليل الحوار التركي بسرعة محسّنة…", force = true)
-                val sourceCues = MediaAudioTranscriber(applicationContext).transcribe(
+                publish(0.08f, "تحليل الحوار التركي بسرعة محسّنة…", force = true)
+                val transcription = MediaAudioTranscriber(applicationContext).transcribe(
                     uri = videoUri,
                     modelDir = modelDir,
-                    onProgress = { p -> publish(0.15f + (p * 0.70f), "تحليل الحوار التركي بسرعة محسّنة…") },
+                    onProgress = { p ->
+                        publish(0.08f + (p * 0.62f), "تحليل الحوار التركي بسرعة محسّنة…")
+                    },
                 )
-                check(sourceCues.isNotEmpty()) {
+                check(transcription.cues.isNotEmpty()) {
                     "لم أستطع استخراج حوار تركي واضح من المسار الصوتي."
                 }
 
-                publish(0.85f, "ترجمة الحوار إلى العربية مع سياق المشهد…", force = true)
+                var sourceCues = transcription.cues
+                if (transcription.repairCandidates.isNotEmpty()) {
+                    publish(0.70f, "تحسين المقاطع الصعبة فقط…", force = true)
+                    sourceCues = WhisperRepairEngine(applicationContext).repair(
+                        original = sourceCues,
+                        candidates = transcription.repairCandidates,
+                    ) { done, total ->
+                        val ratio = done.toFloat() / total.coerceAtLeast(1).toFloat()
+                        publish(0.70f + (ratio * 0.12f), "تحسين المقاطع الصعبة فقط…")
+                    }
+                } else {
+                    publish(0.82f, "الحوار واضح — تجاوزت المراجعة الثقيلة", force = true)
+                }
+
+                publish(0.82f, "تجهيز نموذج الترجمة العربية…", force = true)
+                translator = TurkishArabicTranslator()
+                translator.ensureModel()
+
+                publish(0.84f, "ترجمة الحوار إلى العربية مع سياق المشهد…", force = true)
                 val translated = translator.translate(sourceCues) { done, total ->
                     val ratio = done.toFloat() / total.coerceAtLeast(1).toFloat()
-                    publish(0.85f + (ratio * 0.13f), "ترجمة الحوار إلى العربية مع سياق المشهد…")
+                    publish(0.84f + (ratio * 0.14f), "ترجمة الحوار إلى العربية مع سياق المشهد…")
                 }
 
                 publish(0.98f, "تنسيق التوقيت وتجهيز ملف الترجمة…", force = true)
@@ -230,7 +247,7 @@ class MovieTranslationService : Service() {
                     )
                 }
             } finally {
-                translator.close()
+                translator?.close()
                 releaseWakeLock()
                 runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
                 stopSelf()
