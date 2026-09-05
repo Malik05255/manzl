@@ -423,27 +423,8 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
         .replace("```", "")
         .trim()
 
-    private fun singleArabicCandidate(value: String): String {
-        if (value.isBlank()) return ""
-        var cleaned = sanitizeModelOutput(value)
-            .replace(SINGLE_MARKER_PREFIX, "")
-            .replace(MODEL_PREFACE, "")
-            .replace(LATIN_PARENTHETICAL, " ")
-            .replace(TRAILING_LATIN_EXPLANATION, " ")
-            .trim()
-            .trim('"', '\'', '`', '«', '»', '“', '”')
-
-        if (cleaned.contains('\n')) {
-            cleaned = cleaned.lineSequence()
-                .map { it.trim() }
-                .firstOrNull { line -> line.any { it in '\u0600'..'\u06FF' } }
-                .orEmpty()
-        }
-        cleaned = cleanArabic(cleaned)
-        if (!hasUsefulArabicLenient(cleaned)) return ""
-        if (LATIN_WORD.findAll(cleaned).count() >= 2) return ""
-        return cleaned
-    }
+    private fun singleArabicCandidate(value: String): String =
+        singleArabicCandidateStatic(sanitizeModelOutput(value))
 
     private fun hasUsefulArabic(value: String): Boolean {
         if (value.isBlank()) return false
@@ -471,11 +452,7 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
     private fun contextualFragmentFallback(source: String): String? =
         SHORT_FRAGMENT_FALLBACKS[normalizeTurkishKey(source)]
 
-    private fun normalizeTurkishKey(value: String): String = value
-        .lowercase(TURKISH_LOCALE)
-        .trim()
-        .replace(Regex("[.!?…]+$"), "")
-        .replace(Regex("\\s+"), " ")
+    private fun normalizeTurkishKey(value: String): String = normalizeTurkishKeyStatic(value)
 
     private suspend fun thermalYieldIfNeeded() {
         when {
@@ -572,9 +549,6 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
             "nerede" to "أين؟",
         )
 
-        // Emergency last-mile coverage for very common Turkish pronoun/case fragments. These are
-        // used only after two contextual direct-model attempts fail, so scene-aware translation
-        // always has priority over this conservative lexical fallback.
         private val SHORT_FRAGMENT_FALLBACKS = mapOf(
             "benden" to "مني.",
             "senden" to "منك.",
@@ -726,6 +700,4 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
             .replace(';', '؛')
             .replace('?', '؟')
     }
-
-    private fun singleArabicCandidate(value: String): String = singleArabicCandidateStatic(value)
 }
