@@ -6,20 +6,15 @@ import org.junit.Test
 
 class TranslationBatchingPerfTest {
     @Test
-    fun m2mRuntime_capsThreadsAndSequenceLengthsForMobile() {
+    fun small100Runtime_capsThreadsAndSequenceLengthsForMobile() {
         assertEquals(2, TurkishArabicTranslator.stableThreadCount(4))
         assertEquals(3, TurkishArabicTranslator.stableThreadCount(6))
         assertEquals(4, TurkishArabicTranslator.stableThreadCount(8))
         assertEquals(4, TurkishArabicTranslator.stableThreadCount(12))
 
-        assertTrue(TurkishArabicTranslator.maxInputTokensForTest() <= 192)
-        assertTrue(TurkishArabicTranslator.maxOutputTokensForTest() <= 144)
-    }
-
-    @Test
-    fun m2mLanguageIndices_matchCanonicalHuggingFaceOrdering() {
-        assertEquals(2L, M2M100Tokenizer.ARABIC_LANGUAGE_INDEX)
-        assertEquals(89L, M2M100Tokenizer.TURKISH_LANGUAGE_INDEX)
+        assertTrue(TurkishArabicTranslator.maxInputTokensForTest() <= 160)
+        assertTrue(TurkishArabicTranslator.maxOutputTokensForTest() <= 112)
+        assertEquals(128006L, Small100Tokenizer.EXPECTED_ARABIC_TOKEN_ID)
     }
 
     @Test
