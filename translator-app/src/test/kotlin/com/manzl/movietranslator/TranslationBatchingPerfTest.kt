@@ -1,63 +1,43 @@
 package com.manzl.movietranslator
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TranslationBatchingPerfTest {
-    private fun cues(count: Int): List<SubtitleCue> = (0 until count).map { index ->
-        SubtitleCue(
-            startMs = index * 1_000L,
-            endMs = index * 1_000L + 800L,
-            sourceText = "Bu kısa bir Türkçe film cümlesidir $index.",
-        )
+    @Test
+    fun m2mRuntime_capsThreadsAndSequenceLengthsForMobile() {
+        assertEquals(2, TurkishArabicTranslator.stableThreadCount(4))
+        assertEquals(3, TurkishArabicTranslator.stableThreadCount(6))
+        assertEquals(4, TurkishArabicTranslator.stableThreadCount(8))
+        assertEquals(4, TurkishArabicTranslator.stableThreadCount(12))
+
+        assertTrue(TurkishArabicTranslator.maxInputTokensForTest() <= 192)
+        assertTrue(TurkishArabicTranslator.maxOutputTokensForTest() <= 144)
     }
 
     @Test
-    fun mlKitContextGroups_areSmallAndPreserveEveryCue() {
-        val input = cues(24)
-        val groups = TurkishArabicTranslator.buildContextGroupsForTest(input)
-
-        assertTrue(groups.all { it.size <= TurkishArabicTranslator.maxContextGroupSizeForTest() })
-        assertTrue(groups.all { group -> group.sumOf { it.sourceText.length } <= TurkishArabicTranslator.maxContextCharsForTest() })
-        assertEquals(input.size, groups.sumOf { it.size })
-        assertEquals(input.map { it.sourceText }, groups.flatten().map { it.sourceText })
+    fun m2mLanguageIndices_matchCanonicalHuggingFaceOrdering() {
+        assertEquals(2L, M2M100Tokenizer.ARABIC_LANGUAGE_INDEX)
+        assertEquals(89L, M2M100Tokenizer.TURKISH_LANGUAGE_INDEX)
     }
 
     @Test
-    fun longSilence_startsNewTranslationContext() {
-        val input = listOf(
-            SubtitleCue(0, 800, "Buraya gel."),
-            SubtitleCue(900, 1_700, "Tamam."),
-            SubtitleCue(4_000, 4_800, "Şimdi konuşabiliriz."),
+    fun sentencePlanner_rebuildsFragmentedWhisperSentenceWithoutArabicResplitting() {
+        val cues = listOf(
+            SubtitleCue(0, 700, "Seni burada"),
+            SubtitleCue(760, 1_500, "görmeyi hiç"),
+            SubtitleCue(1_560, 2_500, "beklemiyordum."),
+            SubtitleCue(3_100, 4_100, "Neden geldin?"),
         )
 
-        val groups = TurkishArabicTranslator.buildContextGroupsForTest(input)
-        assertEquals(2, groups.size)
-        assertEquals(2, groups.first().size)
-        assertEquals(1, groups.last().size)
-    }
+        val segments = TurkishArabicTranslator.buildSourceSegmentsForTest(cues)
 
-    @Test
-    fun qualityGate_flagsPrefacesAndNonArabicLeakage() {
-        assertTrue(
-            TurkishArabicTranslator.translationNeedsRepairForTest(
-                source = "Seni burada görmeyi beklemiyordum.",
-                arabic = "بالطبع، الترجمة العربية: لم أتوقع أن أراك هنا.",
-            )
-        )
-        assertTrue(
-            TurkishArabicTranslator.translationNeedsRepairForTest(
-                source = "Bunu neden yaptın?",
-                arabic = "Bunu neden yaptın",
-            )
-        )
-        assertFalse(
-            TurkishArabicTranslator.translationNeedsRepairForTest(
-                source = "Seni burada görmeyi beklemiyordum.",
-                arabic = "لم أتوقع أن أراك هنا.",
-            )
-        )
+        assertEquals(2, segments.size)
+        assertEquals("Seni burada görmeyi hiç beklemiyordum.", segments[0].sourceText)
+        assertEquals(0L, segments[0].startMs)
+        assertEquals(2_500L, segments[0].endMs)
+        assertEquals(3f, segments[0].confidence)
+        assertEquals("Neden geldin?", segments[1].sourceText)
     }
 }
