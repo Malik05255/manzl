@@ -18,7 +18,7 @@ internal data class CloudTranslationResult(
     val providers: String,
 )
 
-class CloudTranslationClient {
+internal class CloudTranslationClient {
     suspend fun translate(
         parts: List<CloudAudioPart>,
         onUploadProgress: (Float) -> Unit = {},
