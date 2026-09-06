@@ -27,9 +27,9 @@ import java.io.File
 import java.util.Locale
 
 /**
- * One-tap cloud path. The video never leaves the phone: only a speech-optimized Opus audio copy is
- * uploaded. Movies up to two hours use one hidden part; movies above two and up to three hours use
- * exactly two hidden parts. The cloud returns one unified Arabic SRT timeline.
+ * One-tap direct-cloud path. The video never leaves the phone: only a speech-optimized Opus audio
+ * copy is uploaded directly to Groq/Gemini. Movies up to two hours use one hidden part; movies
+ * above two and up to three hours use exactly two hidden parts. One unified Arabic SRT is returned.
  */
 class CloudMovieTranslationService : Service() {
     companion object {
@@ -71,6 +71,12 @@ class CloudMovieTranslationService : Service() {
         fun start(context: Context) {
             val current = _state.value
             if (current.videoUri == null || current.isRunning) return
+            if (!SecureApiKeyStore(context.applicationContext).isConfigured()) {
+                _state.update {
+                    it.copy(error = "أضف مفتاحي Groq وGemini من إعدادات التطبيق مرة واحدة فقط.")
+                }
+                return
+            }
             if (current.videoDurationMs > MAX_MOVIE_MS) {
                 _state.update { it.copy(error = "الحد الحالي للفيلم 3 ساعات.") }
                 return
@@ -204,8 +210,8 @@ class CloudMovieTranslationService : Service() {
                     )
                 }
 
-                publish(0.18f, "رفع الصوت فقط…", force = true)
-                val cloud = CloudTranslationClient().translate(
+                publish(0.18f, "إرسال الصوت مباشرة للسحابة…", force = true)
+                val cloud = CloudTranslationClient(applicationContext).translate(
                     parts = parts,
                     onUploadProgress = { uploadProgress ->
                         if (uploadProgress < 0.995f) {
