@@ -7,6 +7,7 @@ import android.media.MediaFormat
 import android.media.MediaMuxer
 import android.net.Uri
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -19,6 +20,7 @@ class CloudAudioExtractor(private val context: Context) {
         val output = File(outputDir, "audio_${System.currentTimeMillis()}.m4a")
         val extractor = MediaExtractor()
         var muxer: MediaMuxer? = null
+        var muxerStarted = false
         try {
             extractor.setDataSource(context, uri, null)
             val trackIndex = (0 until extractor.trackCount).firstOrNull { index ->
@@ -32,9 +34,11 @@ class CloudAudioExtractor(private val context: Context) {
             }
             extractor.selectTrack(trackIndex)
 
-            muxer = MediaMuxer(output.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-            val muxTrack = muxer.addTrack(format)
-            muxer.start()
+            val activeMuxer = MediaMuxer(output.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            muxer = activeMuxer
+            val muxTrack = activeMuxer.addTrack(format)
+            activeMuxer.start()
+            muxerStarted = true
 
             val maxInput = format.getIntegerOrDefault(MediaFormat.KEY_MAX_INPUT_SIZE, 512 * 1024)
                 .coerceIn(64 * 1024, 2 * 1024 * 1024)
@@ -42,7 +46,7 @@ class CloudAudioExtractor(private val context: Context) {
             val info = MediaCodec.BufferInfo()
 
             while (true) {
-                coroutineContext.ensureActive()
+                currentCoroutineContext().ensureActive()
                 buffer.clear()
                 val size = extractor.readSampleData(buffer, 0)
                 if (size < 0) break
@@ -50,7 +54,7 @@ class CloudAudioExtractor(private val context: Context) {
                 info.size = size
                 info.presentationTimeUs = extractor.sampleTime.coerceAtLeast(0L)
                 info.flags = extractor.sampleFlags
-                muxer.writeSampleData(muxTrack, buffer, info)
+                activeMuxer.writeSampleData(muxTrack, buffer, info)
                 extractor.advance()
             }
             check(output.isFile && output.length() > 0L) { "تعذر استخراج الصوت من الفيديو." }
@@ -62,7 +66,7 @@ class CloudAudioExtractor(private val context: Context) {
             output.delete()
             throw error
         } finally {
-            runCatching { muxer?.stop() }
+            if (muxerStarted) runCatching { muxer?.stop() }
             runCatching { muxer?.release() }
             runCatching { extractor.release() }
         }
