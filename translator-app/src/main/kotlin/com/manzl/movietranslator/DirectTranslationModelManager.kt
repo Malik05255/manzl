@@ -72,9 +72,10 @@ class DirectTranslationModelManager(private val context: Context) {
 
     private fun reclaimLegacyModelIfNeeded(modelDir: File) {
         if (modelDir.usableSpace >= MIN_COMFORTABLE_FREE_BYTES) return
+        val legacyDir = modelDir.parentFile ?: return
         LEGACY_HY_MT_FILES.forEach { name ->
-            runCatching { File(modelDir, name).delete() }
-            runCatching { File(modelDir, "$name.part").delete() }
+            runCatching { File(legacyDir, name).delete() }
+            runCatching { File(legacyDir, "$name.part").delete() }
         }
     }
 
