@@ -13,7 +13,7 @@ android {
         targetSdk = 36
         val ciRun = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull()
         versionCode = ciRun ?: 1
-        versionName = if (ciRun != null) "1.1.$ciRun" else "1.1.0"
+        versionName = if (ciRun != null) "1.2.$ciRun" else "1.2.0"
 
         ndk {
             abiFilters += "arm64-v8a"
@@ -45,7 +45,6 @@ android {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
         jniLibs {
-            // FFmpegKit and the temporary local Whisper rollback both package the same C++ runtime.
             pickFirsts += "**/libc++_shared.so"
         }
     }
@@ -63,14 +62,12 @@ dependencies {
     implementation(libs.androidx.compose.viewmodel)
     implementation(libs.androidx.lifecycle.runtime.compose.android)
 
-    // Cloud-first audio path. The audio-only build provides Opus resampling/encoding.
+    implementation("androidx.work:work-runtime-ktx:2.10.1")
+
     implementation("dev.ffmpegkit-maintained:ffmpeg-kit-audio:8.1.7")
-    // ffmpeg-kit-audio 8.1.7's published POM currently omits this runtime dependency even though
-    // FFmpegKitConfig references it. Without it Android crashes with NoClassDefFoundError for
-    // com.arthenica.smartexception.java.Exceptions / FFmpegKitConfig as soon as cloud audio starts.
     implementation("com.arthenica:smart-exception-java:0.2.1")
 
-    // Temporary rollback dependencies; the active user flow is cloud-first.
+    // Rollback engine remains packaged, but the active experience is cloud-first.
     implementation("dev.ffmpegkit-maintained:whisper-android:1.0.0")
     implementation("com.cloudflare.realtimekit.android-vad:silero:2.0.10-cf.4")
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
