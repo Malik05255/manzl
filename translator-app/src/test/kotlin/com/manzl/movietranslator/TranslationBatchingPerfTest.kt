@@ -6,21 +6,37 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class TranslationBatchingPerfTest {
-    @Test
-    fun nllbRuntime_capsThreadsAndSequenceLengthsForMobile() {
-        assertEquals(2, TurkishArabicTranslator.stableThreadCount(4))
-        assertEquals(3, TurkishArabicTranslator.stableThreadCount(6))
-        assertEquals(4, TurkishArabicTranslator.stableThreadCount(8))
-        assertEquals(4, TurkishArabicTranslator.stableThreadCount(12))
-
-        assertTrue(TurkishArabicTranslator.maxInputTokensForTest() <= 128)
-        assertTrue(TurkishArabicTranslator.maxOutputTokensForTest() <= 96)
+    private fun cues(count: Int): List<SubtitleCue> = (0 until count).map { index ->
+        SubtitleCue(
+            startMs = index * 1_000L,
+            endMs = index * 1_000L + 800L,
+            sourceText = "Bu kısa bir Türkçe film cümlesidir $index.",
+        )
     }
 
     @Test
-    fun nllbLanguageIndices_matchCanonicalFairseqOrdering() {
-        assertEquals(10L, NllbTokenizer.ARABIC_LANGUAGE_INDEX)
-        assertEquals(183L, NllbTokenizer.TURKISH_LANGUAGE_INDEX)
+    fun mlKitContextGroups_areSmallAndPreserveEveryCue() {
+        val input = cues(24)
+        val groups = TurkishArabicTranslator.buildContextGroupsForTest(input)
+
+        assertTrue(groups.all { it.size <= TurkishArabicTranslator.maxContextGroupSizeForTest() })
+        assertTrue(groups.all { group -> group.sumOf { it.sourceText.length } <= TurkishArabicTranslator.maxContextCharsForTest() })
+        assertEquals(input.size, groups.sumOf { it.size })
+        assertEquals(input.map { it.sourceText }, groups.flatten().map { it.sourceText })
+    }
+
+    @Test
+    fun longSilence_startsNewTranslationContext() {
+        val input = listOf(
+            SubtitleCue(0, 800, "Buraya gel."),
+            SubtitleCue(900, 1_700, "Tamam."),
+            SubtitleCue(4_000, 4_800, "Şimdi konuşabiliriz."),
+        )
+
+        val groups = TurkishArabicTranslator.buildContextGroupsForTest(input)
+        assertEquals(2, groups.size)
+        assertEquals(2, groups.first().size)
+        assertEquals(1, groups.last().size)
     }
 
     @Test

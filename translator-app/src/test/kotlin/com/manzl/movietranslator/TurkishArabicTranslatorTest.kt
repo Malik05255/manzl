@@ -1,5 +1,6 @@
 package com.manzl.movietranslator
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -26,8 +27,16 @@ class TurkishArabicTranslatorTest {
     }
 
     @Test
-    fun mobileTokenCapsStaySubtitleSized() {
-        assertTrue(TurkishArabicTranslator.maxInputTokensForTest() <= 128)
-        assertTrue(TurkishArabicTranslator.maxOutputTokensForTest() <= 96)
+    fun contextPlanner_preservesTimelineOrder() {
+        val cues = listOf(
+            SubtitleCue(0, 900, "Seni"),
+            SubtitleCue(950, 1_700, "burada beklemiyordum."),
+            SubtitleCue(2_000, 2_900, "Neden geldin?"),
+        )
+
+        val flattened = TurkishArabicTranslator.buildContextGroupsForTest(cues).flatten()
+        assertEquals(cues.map { it.startMs }, flattened.map { it.startMs })
+        assertEquals(cues.map { it.endMs }, flattened.map { it.endMs })
+        assertEquals(cues.map { it.sourceText }, flattened.map { it.sourceText })
     }
 }
