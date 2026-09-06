@@ -20,14 +20,8 @@ internal data class CloudAudioPart(
     val durationMs: Long,
 )
 
-/**
- * Produces tiny speech-optimized Opus files for the cloud path.
- *
- * A movie up to two hours becomes one file. A movie between two and three hours becomes exactly two
- * files: a two-hour first part and the remaining tail. This keeps the Groq part under the free-tier
- * upload limit at 24 kbps while respecting the product requirement of at most two hidden parts.
- */
-class CloudAudioExtractor(private val context: Context) {
+/** Produces speech-optimized Opus for the cloud path without ever uploading the video. */
+internal class CloudAudioExtractor(private val context: Context) {
     suspend fun prepare(
         uri: Uri,
         durationMs: Long,
@@ -47,12 +41,7 @@ class CloudAudioExtractor(private val context: Context) {
             plan.forEachIndexed { index, spec ->
                 coroutineContext.ensureActive()
                 val output = File(outputDir, "cloud_${System.currentTimeMillis()}_${index + 1}.ogg")
-                transcodePart(
-                    input = safInput,
-                    output = output,
-                    offsetMs = spec.first,
-                    durationMs = spec.second,
-                )
+                transcodePart(safInput, output, spec.first, spec.second)
                 check(output.isFile && output.length() > 0L) { "تعذر تجهيز الصوت للسحابة." }
                 check(output.length() <= MAX_PART_BYTES) {
                     "الصوت المضغوط أكبر من حد الرفع المجاني. جرّب الملف مرة أخرى بعد تحديث التطبيق."
@@ -87,13 +76,8 @@ class CloudAudioExtractor(private val context: Context) {
         var sessionId: Long? = null
         val session = FFmpegKit.executeAsync(command) { completed ->
             if (!continuation.isActive) return@executeAsync
-            if (ReturnCode.isSuccess(completed.returnCode)) {
-                continuation.resume(Unit)
-            } else {
-                continuation.resumeWithException(
-                    IllegalStateException("تعذر ضغط صوت الفيلم للمسار السحابي.")
-                )
-            }
+            if (ReturnCode.isSuccess(completed.returnCode)) continuation.resume(Unit)
+            else continuation.resumeWithException(IllegalStateException("تعذر ضغط صوت الفيلم للمسار السحابي."))
         }
         sessionId = session.sessionId
         continuation.invokeOnCancellation {
@@ -113,10 +97,7 @@ class CloudAudioExtractor(private val context: Context) {
             return if (durationMs <= TWO_HOURS_MS) {
                 listOf(0L to durationMs)
             } else {
-                listOf(
-                    0L to TWO_HOURS_MS,
-                    TWO_HOURS_MS to (durationMs - TWO_HOURS_MS),
-                )
+                listOf(0L to TWO_HOURS_MS, TWO_HOURS_MS to (durationMs - TWO_HOURS_MS))
             }
         }
 
