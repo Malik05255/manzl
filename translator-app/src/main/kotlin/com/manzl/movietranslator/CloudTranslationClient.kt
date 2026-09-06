@@ -11,6 +11,8 @@ import java.io.BufferedOutputStream
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.util.UUID
 
 internal data class CloudTranslationResult(
@@ -63,7 +65,11 @@ internal class CloudTranslationClient(context: Context) {
             submitted.provider.takeIf { it.isNotBlank() }?.let(providers::add)
         }
 
-        CloudSubmission(segments, pending, providers.distinct())
+        CloudSubmission(
+            segments = segments,
+            pendingAsr = pending,
+            providers = providers.distinct(),
+        )
     }
 
     suspend fun advance(job: BackgroundCloudJob): CloudAdvance = withContext(Dispatchers.IO) {
@@ -73,6 +79,7 @@ internal class CloudTranslationClient(context: Context) {
             val completedSegments = current.segments.toMutableList()
             val remaining = mutableListOf<PendingAsr>()
             val providers = current.providers.toMutableList()
+
             for (pending in current.pendingAsr) {
                 currentCoroutineContext().ensureActive()
                 val root = postJson(
@@ -92,8 +99,11 @@ internal class CloudTranslationClient(context: Context) {
                     else -> remaining += pending
                 }
             }
+
             val done = current.pendingAsr.size - remaining.size
-            val ratio = if (current.pendingAsr.isEmpty()) 1f else done.toFloat() / current.pendingAsr.size.toFloat()
+            val ratio = if (current.pendingAsr.isEmpty()) 1f
+            else done.toFloat() / current.pendingAsr.size.toFloat()
+
             current = current.copy(
                 segments = completedSegments,
                 pendingAsr = remaining,
@@ -111,8 +121,11 @@ internal class CloudTranslationClient(context: Context) {
         if (current.draft.isEmpty() && current.translationJobId == null) {
             val started = startTranslation(ordered)
             if (started.optString("status") == "completed") {
-                val draft = parseTranslation(started)
-                current = current.copy(draft = draft, stage = "اكتملت الترجمة الأولية", progress = 0.82f)
+                current = current.copy(
+                    draft = parseTranslation(started),
+                    stage = "اكتملت الترجمة الأولية",
+                    progress = 0.82f,
+                )
             } else {
                 current = current.copy(
                     translationJobId = started.getString("job_id"),
@@ -133,7 +146,9 @@ internal class CloudTranslationClient(context: Context) {
                     progress = 0.82f,
                 )
                 "failed", "cancelled" -> error(root.optString("message", "فشلت الترجمة السحابية."))
-                else -> return@withContext CloudAdvance(current.copy(stage = "صياغة الترجمة العربية", progress = 0.72f))
+                else -> return@withContext CloudAdvance(
+                    current.copy(stage = "صياغة الترجمة العربية", progress = 0.72f)
+                )
             }
         }
 
@@ -144,7 +159,11 @@ internal class CloudTranslationClient(context: Context) {
         if (current.reviewed.isEmpty() && current.reviewJobId == null) {
             val started = startReview(ordered, current.draft)
             if (started.optString("status") == "completed") {
-                current = current.copy(reviewed = parseTranslation(started), stage = "اكتملت مراجعة الدقة", progress = 0.95f)
+                current = current.copy(
+                    reviewed = parseTranslation(started),
+                    stage = "اكتملت مراجعة الدقة",
+                    progress = 0.95f,
+                )
             } else {
                 current = current.copy(
                     reviewJobId = started.getString("job_id"),
@@ -165,7 +184,9 @@ internal class CloudTranslationClient(context: Context) {
                     progress = 0.95f,
                 )
                 "failed", "cancelled" -> error(root.optString("message", "فشلت مراجعة الترجمة."))
-                else -> return@withContext CloudAdvance(current.copy(stage = "مراجعة المعنى والدقة", progress = 0.89f))
+                else -> return@withContext CloudAdvance(
+                    current.copy(stage = "مراجعة المعنى والدقة", progress = 0.89f)
+                )
             }
         }
 
@@ -179,6 +200,7 @@ internal class CloudTranslationClient(context: Context) {
                 confidence = 1f,
             )
         }
+
         val totalMs = (System.currentTimeMillis() - current.startedAtEpochMs).coerceAtLeast(0L)
         CloudAdvance(
             current.copy(stage = "حفظ الترجمة", progress = 0.97f),
@@ -188,7 +210,7 @@ internal class CloudTranslationClient(context: Context) {
                 translationMs = 0L,
                 totalMs = totalMs,
                 providers = current.providers.joinToString(" + ").ifBlank { "Whisper + Gemini" } + " → مراجعة دقة",
-            )
+            ),
         )
     }
 
@@ -198,7 +220,11 @@ internal class CloudTranslationClient(context: Context) {
         val provider: String,
     )
 
-    private fun submitPart(part: CloudAudioPart, index: Int, onBytes: (Long) -> Unit): PartSubmission {
+    private fun submitPart(
+        part: CloudAudioPart,
+        index: Int,
+        onBytes: (Long) -> Unit,
+    ): PartSubmission {
         val boundary = "----Manzl${UUID.randomUUID()}"
         val provider = if (index == 0) "groq" else "gemini"
         val connection = openConnection(135_000).apply {
@@ -207,6 +233,7 @@ internal class CloudTranslationClient(context: Context) {
             setChunkedStreamingMode(256 * 1024)
             setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
         }
+
         try {
             connection.outputStream.use { raw ->
                 val output = BufferedOutputStream(raw, 256 * 1024)
@@ -215,6 +242,7 @@ internal class CloudTranslationClient(context: Context) {
                     text("--$boundary\r\n")
                     text("Content-Disposition: form-data; name=\"$name\"\r\n\r\n$value\r\n")
                 }
+
                 field("mode", "asr")
                 field("device_hash", deviceHash)
                 field("provider", provider)
@@ -223,6 +251,7 @@ internal class CloudTranslationClient(context: Context) {
                 text("--$boundary\r\n")
                 text("Content-Disposition: form-data; name=\"audio\"; filename=\"part_${index + 1}.ogg\"\r\n")
                 text("Content-Type: audio/ogg\r\n\r\n")
+
                 var sent = 0L
                 part.file.inputStream().buffered(256 * 1024).use { input ->
                     val buffer = ByteArray(256 * 1024)
@@ -237,6 +266,7 @@ internal class CloudTranslationClient(context: Context) {
                 text("\r\n--$boundary--\r\n")
                 output.flush()
             }
+
             val root = readJson(connection)
             val parsedProvider = parseProvider(root).ifBlank { provider }
             return if (root.optString("status", "completed") == "in_progress") {
@@ -246,10 +276,18 @@ internal class CloudTranslationClient(context: Context) {
                     provider = parsedProvider,
                 )
             } else {
-                PartSubmission(parseAsrSegments(root), null, parsedProvider)
+                PartSubmission(
+                    segments = parseAsrSegments(root),
+                    pending = null,
+                    provider = parsedProvider,
+                )
             }
+        } catch (error: SocketTimeoutException) {
+            throw CloudTransientException("خدمة الترجمة تأخرت في الاستجابة. ستتم إعادة المحاولة تلقائيًا.", error)
+        } catch (error: UnknownHostException) {
+            throw CloudTransientException("تعذر الوصول إلى خدمة الترجمة. تحقق من اتصال الإنترنت.", error)
         } catch (error: IOException) {
-            throw CloudTransientException("تعذر الاتصال بالشبكة أثناء رفع الصوت.", error)
+            throw CloudTransientException("تعذر الاتصال بخدمة الترجمة أثناء رفع الصوت.", error)
         } finally {
             connection.disconnect()
         }
@@ -258,21 +296,41 @@ internal class CloudTranslationClient(context: Context) {
     private fun startTranslation(segments: List<StoredSegment>): JSONObject {
         val array = JSONArray()
         segments.forEach { s ->
-            array.put(JSONObject().put("id", s.id).put("start_ms", s.startMs).put("end_ms", s.endMs).put("tr", s.text))
+            array.put(
+                JSONObject()
+                    .put("id", s.id)
+                    .put("start_ms", s.startMs)
+                    .put("end_ms", s.endMs)
+                    .put("tr", s.text)
+            )
         }
         return postJson(
-            JSONObject().put("mode", "translate_start").put("device_hash", deviceHash).put("segments", array),
+            JSONObject()
+                .put("mode", "translate_start")
+                .put("device_hash", deviceHash)
+                .put("segments", array),
             40_000,
         )
     }
 
-    private fun startReview(segments: List<StoredSegment>, draft: Map<Int, String>): JSONObject {
+    private fun startReview(
+        segments: List<StoredSegment>,
+        draft: Map<Int, String>,
+    ): JSONObject {
         val source = JSONArray()
         segments.forEach { s ->
-            source.put(JSONObject().put("id", s.id).put("start_ms", s.startMs).put("end_ms", s.endMs).put("tr", s.text))
+            source.put(
+                JSONObject()
+                    .put("id", s.id)
+                    .put("start_ms", s.startMs)
+                    .put("end_ms", s.endMs)
+                    .put("tr", s.text)
+            )
         }
         val draftArray = JSONArray()
-        draft.toSortedMap().forEach { (id, ar) -> draftArray.put(JSONObject().put("id", id).put("ar", ar)) }
+        draft.toSortedMap().forEach { (id, ar) ->
+            draftArray.put(JSONObject().put("id", id).put("ar", ar))
+        }
         return postJson(
             JSONObject()
                 .put("mode", "review_start")
@@ -284,7 +342,11 @@ internal class CloudTranslationClient(context: Context) {
     }
 
     private fun pollTranslation(jobId: String, kind: String): JSONObject = postJson(
-        JSONObject().put("mode", "poll").put("kind", kind).put("device_hash", deviceHash).put("job_id", jobId),
+        JSONObject()
+            .put("mode", "poll")
+            .put("kind", kind)
+            .put("device_hash", deviceHash)
+            .put("job_id", jobId),
         25_000,
     )
 
@@ -334,10 +396,16 @@ internal class CloudTranslationClient(context: Context) {
             setRequestProperty("Content-Type", "application/json; charset=utf-8")
         }
         try {
-            connection.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
+            connection.outputStream.use {
+                it.write(payload.toString().toByteArray(Charsets.UTF_8))
+            }
             return readJson(connection)
+        } catch (error: SocketTimeoutException) {
+            throw CloudTransientException("خدمة الترجمة تأخرت في الاستجابة. ستتم إعادة المحاولة تلقائيًا.", error)
+        } catch (error: UnknownHostException) {
+            throw CloudTransientException("تعذر الوصول إلى خدمة الترجمة. تحقق من اتصال الإنترنت.", error)
         } catch (error: IOException) {
-            throw CloudTransientException("الاتصال بالمنصة متوقف مؤقتًا.", error)
+            throw CloudTransientException("الاتصال بخدمة الترجمة متوقف مؤقتًا.", error)
         } finally {
             connection.disconnect()
         }
@@ -357,19 +425,22 @@ internal class CloudTranslationClient(context: Context) {
         val body = (if (status in 200..299) connection.inputStream else connection.errorStream)
             ?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
         val root = runCatching { JSONObject(body) }.getOrElse { JSONObject() }
+
         if (status !in 200..299) {
             val message = root.optString("message").takeIf { it.isNotBlank() }
                 ?: root.optString("error").takeIf { it.isNotBlank() }
                 ?: "فشل الاتصال بخدمة الترجمة ($status)."
-            if (status == 408 || status == 429 || status >= 500) throw CloudTransientException(message)
+            if (status == 408 || status == 429 || status >= 500) {
+                throw CloudTransientException(message)
+            }
             error(message)
         }
         return root
     }
 
     companion object {
-        internal const val ENDPOINT = "https://lbgcjmsqqhrpceijdqng.supabase.co/functions/v1/movie-translate"
-        internal const val PUBLISHABLE_KEY = "sb_publishable_TllPSeKhRJx_IegHMxkZmA_Q9FLBUR_"
-        internal const val ANON_JWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxiZ2NqbXNxcWhycGNlaWpkcW5nIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgyMDM1MDEsImV4cCI6MjEwMzc3OTUwMX0.sl2j-iBmb_swQlZ-qlTZ5c5nDIXrO2w6tRHYeNAoF5o"
+        internal const val ENDPOINT = "https://abavsspydbpkudhswmzp.supabase.co/functions/v1/movie-translate"
+        internal const val PUBLISHABLE_KEY = "sb_publishable_iuZnOH7ye1WITm-xc44TiQ_CNb2d2qB"
+        internal const val ANON_JWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFiYXZzc3B5ZGJwa3VkaHN3bXpwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgzNjAzODIsImV4cCI6MjEwMzkzNjM4Mn0.uBG_5xHNo760PUq2bZLeUqURo9cqIICTeiHpMh-kYxE"
     }
 }
