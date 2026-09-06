@@ -24,8 +24,35 @@ jobs:
       - uses: actions/setup-java@v5
         with:
           java-version: "17"
-          distribution: "temurin"
+          distribution: temurin
           cache: gradle
+
+      # Main-branch APKs keep one signing identity across CI runs. This allows future APKs to update
+      # in place and keeps Android's app-scoped device identity stable across uninstall/reinstall.
+      - name: Restore stable app signing identity
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: manzl-android-debug-keystore-v1
+
+      - name: Create stable app signing identity on first run
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        shell: bash
+        run: |
+          mkdir -p "$HOME/.android"
+          if [ ! -f "$HOME/.android/debug.keystore" ]; then
+            keytool -genkeypair \
+              -keystore "$HOME/.android/debug.keystore" \
+              -storepass android \
+              -alias androiddebugkey \
+              -keypass android \
+              -keyalg RSA \
+              -keysize 3072 \
+              -validity 10000 \
+              -dname "CN=Manzl Movie Translator,OU=Personal Android,O=Manzl,L=Riyadh,ST=Riyadh,C=SA"
+          fi
+
       - name: Grant execute permission
         run: chmod +x gradlew
       - name: Build standalone app
