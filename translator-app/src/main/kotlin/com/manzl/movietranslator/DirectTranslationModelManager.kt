@@ -10,12 +10,7 @@ import java.io.FileOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 
-/**
- * Downloads the compact int8 SMaLL-100 translation runtime.
- *
- * SMaLL-100 is distilled from M2M-100 but has only three decoder layers. The Android runtime needs
- * two ONNX graphs plus the original SentencePiece/vocab files used by the local Kotlin tokenizer.
- */
+/** Downloads the int8 SMaLL-100 runtime plus its validated cross-platform tokenizer. */
 class DirectTranslationModelManager(private val context: Context) {
     suspend fun ensureModel(onProgress: (Float) -> Unit = {}): File = withContext(Dispatchers.IO) {
         val modelDir = File(context.filesDir, MODEL_DIR).apply { mkdirs() }
@@ -79,17 +74,11 @@ class DirectTranslationModelManager(private val context: Context) {
             File(context.filesDir, "Translation/HY-MT"),
         )
         obsolete.forEach { file ->
-            runCatching {
-                if (file.isDirectory) file.deleteRecursively() else file.delete()
-            }
+            runCatching { if (file.isDirectory) file.deleteRecursively() else file.delete() }
         }
     }
 
-    private suspend fun download(
-        spec: ModelFile,
-        target: File,
-        onBytes: (Long) -> Unit,
-    ) {
+    private suspend fun download(spec: ModelFile, target: File, onBytes: (Long) -> Unit) {
         target.parentFile?.mkdirs()
         val existing = target.takeIf { it.isFile }?.length() ?: 0L
         val connection = (URL(spec.url).openConnection() as HttpURLConnection).apply {
@@ -146,32 +135,32 @@ class DirectTranslationModelManager(private val context: Context) {
 
         private val MODEL_FILES = listOf(
             ModelFile(
-                name = "encoder_model.onnx",
-                displayName = "SMaLL-100 encoder",
-                url = "$BASE/onnx/encoder_model.onnx?download=true",
-                expectedBytes = 287_000_000L,
-                minBytes = 250L * 1024L * 1024L,
+                "encoder_model.onnx",
+                "SMaLL-100 encoder",
+                "$BASE/onnx/encoder_model.onnx?download=true",
+                287_000_000L,
+                250L * 1024L * 1024L,
             ),
             ModelFile(
-                name = "decoder_model_merged.onnx",
-                displayName = "SMaLL-100 cached decoder",
-                url = "$BASE/onnx/decoder_model_merged.onnx?download=true",
-                expectedBytes = 322_000_000L,
-                minBytes = 285L * 1024L * 1024L,
+                "decoder_model_merged.onnx",
+                "SMaLL-100 cached decoder",
+                "$BASE/onnx/decoder_model_merged.onnx?download=true",
+                322_000_000L,
+                285L * 1024L * 1024L,
             ),
             ModelFile(
-                name = "sentencepiece.bpe.model",
-                displayName = "SMaLL-100 SentencePiece",
-                url = "$BASE/sentencepiece.bpe.model?download=true",
-                expectedBytes = 2_420_000L,
-                minBytes = 2L * 1024L * 1024L,
+                "tokenizer.json",
+                "SMaLL-100 tokenizer",
+                "$BASE/tokenizer.json?download=true",
+                5_810_000L,
+                5L * 1024L * 1024L,
             ),
             ModelFile(
-                name = "vocab.json",
-                displayName = "SMaLL-100 vocabulary",
-                url = "$BASE/vocab.json?download=true",
-                expectedBytes = 3_710_000L,
-                minBytes = 3L * 1024L * 1024L,
+                "lang_tokens.json",
+                "SMaLL-100 language map",
+                "$BASE/lang_tokens.json?download=true",
+                2_010L,
+                1_000L,
             ),
         )
 
