@@ -57,7 +57,12 @@ internal class CloudLibraryClient(private val context: Context) {
         }
     }
 
-    suspend fun upsertPath(movieKey: String, movieName: String, videoUri: Uri, durationMs: Long) = withContext(Dispatchers.IO) {
+    suspend fun upsertPath(
+        movieKey: String,
+        movieName: String,
+        videoUri: Uri,
+        durationMs: Long,
+    ) = withContext(Dispatchers.IO) {
         post(
             JSONObject()
                 .put("mode", "library_upsert_path")
@@ -121,7 +126,12 @@ internal class CloudLibraryClient(private val context: Context) {
     }
 
     suspend fun deleteTranslation(movieKey: String) = withContext(Dispatchers.IO) {
-        post(JSONObject().put("mode", "library_delete_translation").put("device_hash", deviceHash).put("movie_key", movieKey))
+        post(
+            JSONObject()
+                .put("mode", "library_delete_translation")
+                .put("device_hash", deviceHash)
+                .put("movie_key", movieKey)
+        )
         Unit
     }
 
@@ -147,7 +157,9 @@ internal class CloudLibraryClient(private val context: Context) {
     fun prepareSubtitleFile(movie: CloudMovieItem): java.io.File? {
         val text = movie.srtText?.takeIf { it.isNotBlank() } ?: return null
         val dir = java.io.File(context.cacheDir, "cloud_library_subtitles").apply { mkdirs() }
-        return java.io.File(dir, "${movie.movieKey}_ar.srt").apply { writeText(text, Charsets.UTF_8) }
+        return java.io.File(dir, "${movie.movieKey}_ar.srt").apply {
+            writeText(text, Charsets.UTF_8)
+        }
     }
 
     private fun isReadable(value: String): Boolean = runCatching {
@@ -166,7 +178,9 @@ internal class CloudLibraryClient(private val context: Context) {
             setRequestProperty("Content-Type", "application/json; charset=utf-8")
         }
         return try {
-            connection.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
+            connection.outputStream.use {
+                it.write(payload.toString().toByteArray(Charsets.UTF_8))
+            }
             val status = connection.responseCode
             val body = (if (status in 200..299) connection.inputStream else connection.errorStream)
                 ?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
@@ -184,11 +198,12 @@ internal class CloudLibraryClient(private val context: Context) {
     }
 
     companion object {
-        private const val ENDPOINT = "https://lbgcjmsqqhrpceijdqng.supabase.co/functions/v1/movie-library"
+        private const val ENDPOINT = "https://abavsspydbpkudhswmzp.supabase.co/functions/v1/movie-library"
 
         fun movieKey(name: String, durationMs: Long): String {
             val normalized = name.trim().lowercase() + "|" + durationMs
-            val digest = MessageDigest.getInstance("SHA-256").digest(normalized.toByteArray(Charsets.UTF_8))
+            val digest = MessageDigest.getInstance("SHA-256")
+                .digest(normalized.toByteArray(Charsets.UTF_8))
             return digest.joinToString("") { "%02x".format(it) }.take(32)
         }
     }
