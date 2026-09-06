@@ -48,7 +48,7 @@ internal class CloudCompletionWorker(
         CloudMovieTranslationService.updateBackgroundProgress(applicationContext, advance.job)
         val cloud = advance.result
         if (cloud == null) {
-            schedule(applicationContext, 2_500L)
+            schedule(applicationContext, advance.nextDelayMs)
             return Result.success()
         }
 
