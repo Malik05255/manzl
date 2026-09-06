@@ -11,11 +11,10 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * Manages the quantized M2M100-418M files used for direct Turkish -> Arabic translation.
+ * Downloads the compact int8 SMaLL-100 translation runtime.
  *
- * M2M100 translates non-English language pairs directly instead of routing Turkish through English.
- * The selected ONNX export uses an encoder + decoder + cached decoder so autoregressive generation
- * can reuse KV state on every token.
+ * SMaLL-100 is distilled from M2M-100 but has only three decoder layers. The Android runtime needs
+ * two ONNX graphs plus the original SentencePiece/vocab files used by the local Kotlin tokenizer.
  */
 class DirectTranslationModelManager(private val context: Context) {
     suspend fun ensureModel(onProgress: (Float) -> Unit = {}): File = withContext(Dispatchers.IO) {
@@ -33,7 +32,7 @@ class DirectTranslationModelManager(private val context: Context) {
             else (spec.expectedBytes - partial.length()).coerceAtLeast(0L)
         }
         check(modelDir.usableSpace >= missingBytes + DOWNLOAD_HEADROOM_BYTES) {
-            "المساحة الحرة غير كافية لتنزيل مترجم M2M100 المباشر."
+            "المساحة الحرة غير كافية لتنزيل مترجم SMaLL-100 السريع."
         }
 
         val totalExpected = MODEL_FILES.sumOf { it.expectedBytes }.toDouble()
@@ -52,15 +51,13 @@ class DirectTranslationModelManager(private val context: Context) {
                 val weighted = completedExpected + currentBytes.coerceAtMost(spec.expectedBytes)
                 onProgress((weighted / totalExpected).toFloat().coerceIn(0f, 0.99f))
             }
-            check(partial.length() >= spec.minBytes) {
-                "تعذر تنزيل ${spec.displayName} كاملًا."
-            }
+            check(partial.length() >= spec.minBytes) { "تعذر تنزيل ${spec.displayName} كاملًا." }
             if (final.exists()) final.delete()
             check(partial.renameTo(final)) { "تعذر تثبيت ${spec.displayName}." }
             completedExpected += spec.expectedBytes
         }
 
-        check(isReady(modelDir)) { "ملفات مترجم M2M100 غير مكتملة." }
+        check(isReady(modelDir)) { "ملفات مترجم SMaLL-100 غير مكتملة." }
         onProgress(1f)
         modelDir
     }
@@ -74,6 +71,7 @@ class DirectTranslationModelManager(private val context: Context) {
     private fun reclaimObsoleteModels() {
         val modelsDir = File(context.filesDir, "models")
         val obsolete = listOf(
+            File(modelsDir, "m2m100-418m-tr-ar"),
             File(modelsDir, "nllb-200-distilled-600m"),
             File(modelsDir, "Hy-MT2-1.8B-Q4_K_M.gguf"),
             File(modelsDir, "Hy-MT2-1.8B-Q4_K_M.gguf.part"),
@@ -143,47 +141,40 @@ class DirectTranslationModelManager(private val context: Context) {
     )
 
     companion object {
-        internal const val MODEL_DIR = "models/m2m100-418m-tr-ar"
-        private const val BASE = "https://huggingface.co/Xenova/m2m100_418M/resolve/main"
+        internal const val MODEL_DIR = "models/small100-tr-ar"
+        private const val BASE = "https://huggingface.co/casawolice/small100-onnx/resolve/main"
 
         private val MODEL_FILES = listOf(
             ModelFile(
-                name = "encoder_model_quantized.onnx",
-                displayName = "M2M100 encoder",
-                url = "$BASE/onnx/encoder_model_quantized.onnx?download=true",
-                expectedBytes = 288_000_000L,
+                name = "encoder_model.onnx",
+                displayName = "SMaLL-100 encoder",
+                url = "$BASE/onnx/encoder_model.onnx?download=true",
+                expectedBytes = 287_000_000L,
                 minBytes = 250L * 1024L * 1024L,
             ),
             ModelFile(
-                name = "decoder_model_quantized.onnx",
-                displayName = "M2M100 decoder",
-                url = "$BASE/onnx/decoder_model_quantized.onnx?download=true",
-                expectedBytes = 339_000_000L,
-                minBytes = 300L * 1024L * 1024L,
-            ),
-            ModelFile(
-                name = "decoder_with_past_model_quantized.onnx",
-                displayName = "M2M100 cached decoder",
-                url = "$BASE/onnx/decoder_with_past_model_quantized.onnx?download=true",
-                expectedBytes = 314_000_000L,
-                minBytes = 275L * 1024L * 1024L,
+                name = "decoder_model_merged.onnx",
+                displayName = "SMaLL-100 cached decoder",
+                url = "$BASE/onnx/decoder_model_merged.onnx?download=true",
+                expectedBytes = 322_000_000L,
+                minBytes = 285L * 1024L * 1024L,
             ),
             ModelFile(
                 name = "sentencepiece.bpe.model",
-                displayName = "M2M100 SentencePiece",
+                displayName = "SMaLL-100 SentencePiece",
                 url = "$BASE/sentencepiece.bpe.model?download=true",
                 expectedBytes = 2_420_000L,
                 minBytes = 2L * 1024L * 1024L,
             ),
             ModelFile(
                 name = "vocab.json",
-                displayName = "M2M100 vocabulary",
+                displayName = "SMaLL-100 vocabulary",
                 url = "$BASE/vocab.json?download=true",
                 expectedBytes = 3_710_000L,
                 minBytes = 3L * 1024L * 1024L,
             ),
         )
 
-        private const val DOWNLOAD_HEADROOM_BYTES = 160L * 1024L * 1024L
+        private const val DOWNLOAD_HEADROOM_BYTES = 128L * 1024L * 1024L
     }
 }
