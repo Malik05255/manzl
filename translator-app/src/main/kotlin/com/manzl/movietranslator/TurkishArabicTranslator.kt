@@ -13,13 +13,15 @@ import java.util.Locale
  * Turkish -> Arabic subtitle translation using a translation-specialized model.
  *
  * Coverage rule: one source cue must produce one target cue. We never merge away Whisper cues and
- * never accept a batch with missing markers. Missing lines are retried individually with nearby
- * dialogue context, so speed optimizations cannot silently remove spoken dialogue.
+ * never accept a batch with missing markers. The mobile profile deliberately keeps the llama.cpp
+ * context and prompt batches bounded because long CPU inference can otherwise create large native
+ * memory/thermal spikes on Android.
  */
 class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
     private var model: LlamaModel? = null
     private var failed = false
     private val powerManager = context.getSystemService(PowerManager::class.java)
+    private val translationThreads = stableThreadCount(Runtime.getRuntime().availableProcessors())
 
     suspend fun ensureModel(
         onProgress: (Float) -> Unit = {},
@@ -38,8 +40,8 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
             model = Llama.loadModel(
                 modelPath = file.absolutePath,
                 config = LlamaConfig(
-                    contextSize = 1_536,
-                    threads = 4,
+                    contextSize = MOBILE_CONTEXT_SIZE,
+                    threads = translationThreads,
                     gpuLayers = 0,
                     temperature = 0.70f,
                     topP = 0.60f,
@@ -77,6 +79,11 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
             result += translated
             cursor += batch.size
             onProgress(cursor, source.size)
+
+            // Give Android a scheduling point between native llama.cpp generations. This is short
+            // enough to be imperceptible but prevents a long film from becoming one uninterrupted
+            // CPU burst on thermally constrained phones.
+            delay(BETWEEN_BATCH_DELAY_MS)
         }
         return result
     }
@@ -118,22 +125,25 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
         before: List<SubtitleCue>,
         after: List<SubtitleCue>,
     ): List<String?> {
+        thermalYieldIfNeeded()
         val prompt = buildString {
             if (before.isNotEmpty() || after.isNotEmpty()) {
                 appendLine("[Background Information]")
-                before.forEach { append("Previous Turkish: ").append(it.sourceText.take(120)).append('\n') }
-                after.forEach { append("Following Turkish: ").append(it.sourceText.take(120)).append('\n') }
+                before.forEach { append("Previous: ").append(it.sourceText.take(CONTEXT_CHARS)).append('\n') }
+                after.forEach { append("Following: ").append(it.sourceText.take(CONTEXT_CHARS)).append('\n') }
                 appendLine()
             }
+            // Hy-MT2's published delimiter prompt is intentionally kept compact here. The previous
+            // longer instruction duplicated constraints and increased prompt/compute memory.
             appendLine("Please accurately translate the following Turkish film subtitles into Arabic.")
-            appendLine("Use natural human Modern Standard Arabic: preserve meaning, tone, idioms, names and every reply rather than translating word-for-word.")
-            appendLine("You must retain the exact same number of delimiters. Do not omit, escape or translate the §number§ delimiters. Output only the translated lines with their delimiters, without explanation:")
+            appendLine("Use natural Modern Standard Arabic suitable for film subtitles.")
+            appendLine("Retain the exact same §number§ delimiters. Output only the translated lines:")
             batch.forEachIndexed { index, cue ->
                 append(marker(index)).append(' ').append(cue.sourceText.trim()).append('\n')
             }
         }
         val chars = batch.sumOf { it.sourceText.length }
-        val maxTokens = (chars / 2 + batch.size * 10 + 24).coerceIn(48, 260)
+        val maxTokens = maxBatchTokens(chars, batch.size)
         val completion = Llama.complete(
             model = activeModel,
             prompt = prompt,
@@ -160,17 +170,6 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
             if (isUsefulArabic(candidate)) return cue.copy(translatedText = candidate)
         }
 
-        // Final recovery gives the model the target plus one neighbor as a tiny structured pair.
-        val neighbor = after.firstOrNull() ?: before.lastOrNull()
-        if (neighbor != null) {
-            val pair = listOf(cue, neighbor)
-            val pairResult = runCatching {
-                translateMarked(activeModel, pair, before.takeLast(1), after.take(1))
-            }.getOrNull()
-            val recovered = pairResult?.firstOrNull()?.let(::cleanArabicCandidate).orEmpty()
-            if (isUsefulArabic(recovered)) return cue.copy(translatedText = recovered)
-        }
-
         // Never delete the cue. Keeping the Turkish source is preferable to silently losing speech;
         // the output can then be visibly diagnosed rather than pretending coverage is complete.
         return cue.copy(translatedText = cue.sourceText.trim())
@@ -183,24 +182,23 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
         after: List<SubtitleCue>,
         attempt: Int,
     ): String {
+        thermalYieldIfNeeded()
         val prompt = buildString {
             if (before.isNotEmpty() || after.isNotEmpty()) {
                 appendLine("[Background Information]")
                 before.takeLast(CONTEXT_BEFORE).forEach {
-                    append("Previous Turkish: ").append(it.sourceText.take(120)).append('\n')
+                    append("Previous: ").append(it.sourceText.take(CONTEXT_CHARS)).append('\n')
                 }
                 after.take(CONTEXT_AFTER).forEach {
-                    append("Following Turkish: ").append(it.sourceText.take(120)).append('\n')
+                    append("Following: ").append(it.sourceText.take(CONTEXT_CHARS)).append('\n')
                 }
                 appendLine()
             }
-            appendLine("Translate the following Turkish film subtitle into Arabic. Note that you should only output the translated result without any additional explanation:")
+            appendLine("Translate the following Turkish film subtitle into Arabic. Output only the translation:")
             appendLine(cue.sourceText.trim())
-            if (attempt > 0) {
-                appendLine("Use natural Arabic meaning in this dialogue context, not a literal word-for-word rendering.")
-            }
+            if (attempt > 0) appendLine("Use natural meaning in the dialogue context, not word-for-word translation.")
         }
-        val maxTokens = (cue.sourceText.length / 2 + 24).coerceIn(20, 72)
+        val maxTokens = (cue.sourceText.length / 2 + 20).coerceIn(20, SINGLE_MAX_TOKENS)
         val completion = Llama.complete(
             model = activeModel,
             prompt = prompt,
@@ -277,8 +275,9 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
 
     private suspend fun thermalYieldIfNeeded() {
         when {
-            powerManager.currentThermalStatus >= PowerManager.THERMAL_STATUS_CRITICAL -> delay(500L)
-            powerManager.currentThermalStatus >= PowerManager.THERMAL_STATUS_SEVERE -> delay(120L)
+            powerManager.currentThermalStatus >= PowerManager.THERMAL_STATUS_CRITICAL -> delay(1_500L)
+            powerManager.currentThermalStatus >= PowerManager.THERMAL_STATUS_SEVERE -> delay(500L)
+            powerManager.currentThermalStatus >= PowerManager.THERMAL_STATUS_MODERATE -> delay(150L)
         }
     }
 
@@ -288,13 +287,20 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
     }
 
     companion object {
-        private const val NORMAL_BATCH_SIZE = 8
-        private const val NORMAL_BATCH_CHARS = 800
-        private const val COMPACT_BATCH_SIZE = 10
-        private const val COMPACT_BATCH_CHARS = 1_000
+        // llama-android keeps one native context for the lifetime of the model. 1024 is ample for
+        // the tightly bounded subtitle prompts below while cutting KV/context memory versus 1536.
+        private const val MOBILE_CONTEXT_SIZE = 1_024
+        private const val NORMAL_BATCH_SIZE = 4
+        private const val NORMAL_BATCH_CHARS = 360
+        private const val COMPACT_BATCH_SIZE = 5
+        private const val COMPACT_BATCH_CHARS = 420
         private const val MAX_BATCH_GAP_MS = 6_000L
-        private const val CONTEXT_BEFORE = 2
-        private const val CONTEXT_AFTER = 2
+        private const val CONTEXT_BEFORE = 1
+        private const val CONTEXT_AFTER = 1
+        private const val CONTEXT_CHARS = 80
+        private const val BATCH_MAX_TOKENS = 200
+        private const val SINGLE_MAX_TOKENS = 64
+        private const val BETWEEN_BATCH_DELAY_MS = 40L
         private val MARKER_REGEX = Regex("§\\s*(\\d+)\\s*§")
         private val TURKISH_LOCALE = Locale.forLanguageTag("tr")
 
@@ -315,6 +321,14 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
             .lowercase(TURKISH_LOCALE).trim()
             .replace(Regex("[.!?…]+$"), "")
             .replace(Regex("\\s+"), " ")
+
+        private fun maxBatchTokens(chars: Int, count: Int): Int =
+            (chars / 2 + count * 8 + 20).coerceIn(40, BATCH_MAX_TOKENS)
+
+        internal fun stableThreadCount(cores: Int): Int = if (cores >= 8) 3 else 2
+
+        internal fun maxBatchTokensForTest(chars: Int, count: Int): Int =
+            maxBatchTokens(chars, count)
 
         internal fun buildContextBatchesForTest(
             cues: List<SubtitleCue>,
