@@ -8,8 +8,6 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.media.MediaMetadataRetriever
-import android.net.ConnectivityManager
-import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.IBinder
 import kotlinx.coroutines.CancellationException
@@ -57,7 +55,7 @@ class CloudMovieTranslationService : Service() {
                 videoName = displayName,
                 movieKey = movieKey,
                 videoDurationMs = durationMs,
-                stage = if (durationMs > MAX_MOVIE_MS) "الفيلم أطول من الحد الحالي" else "جاهز للتنفيذ",
+                stage = if (durationMs > MAX_MOVIE_MS) "الفيلم أطول من الحد الحالي" else "جاهز للترجمة",
                 partCount = partCount,
             )
         }
@@ -75,7 +73,7 @@ class CloudMovieTranslationService : Service() {
                 it.copy(
                     isRunning = true,
                     progress = 0f,
-                    stage = "بدء المهمة",
+                    stage = "بدء الترجمة",
                     error = null,
                     cues = emptyList(),
                     srtFile = null,
@@ -236,7 +234,7 @@ class CloudMovieTranslationService : Service() {
                 val bytes = parts.sumOf { it.file.length() }
                 _state.update { it.copy(uploadedBytes = bytes, partCount = parts.size, videoDurationMs = durationMs) }
 
-                val submission = submitWithAutomaticNetworkResume(parts)
+                val submission = submitWithAutomaticResume(parts)
                 val movieKey = snapshot.movieKey.ifBlank { CloudLibraryClient.movieKey(snapshot.videoName, durationMs) }
                 val job = BackgroundCloudJob(
                     movieKey = movieKey,
@@ -248,15 +246,13 @@ class CloudMovieTranslationService : Service() {
                     segments = submission.segments,
                     pendingAsr = submission.pendingAsr,
                     providers = submission.providers,
-                    stage = if (submission.pendingAsr.isEmpty()) "الصوت وصل • بدء الترجمة على المنصة" else "الصوت وصل • تحليل الحوار على المنصة",
+                    stage = if (submission.pendingAsr.isEmpty()) "الصوت وصل • بدء الترجمة" else "الصوت وصل • تحليل الحوار",
                     progress = if (submission.pendingAsr.isEmpty()) 0.62f else 0.45f,
                 )
                 CloudJobStore(applicationContext).save(job)
                 updateBackgroundProgress(applicationContext, job)
                 CloudCompletionWorker.schedule(applicationContext, 250L)
 
-                // The phone's heavy foreground task ends here. Everything after the upload is
-                // short network work scheduled by WorkManager and can survive leaving the app.
                 stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             } catch (cancelled: CancellationException) {
@@ -273,36 +269,46 @@ class CloudMovieTranslationService : Service() {
         }
     }
 
-    private suspend fun submitWithAutomaticNetworkResume(parts: List<CloudAudioPart>): CloudSubmission {
+    private suspend fun submitWithAutomaticResume(parts: List<CloudAudioPart>): CloudSubmission {
+        var retryAttempt = 0
         while (scope.isActive) {
             waitUntilConnected()
             try {
                 return CloudTranslationClient(applicationContext).submitForBackground(parts) { progress ->
                     maxUploadProgress = maxOf(maxUploadProgress, progress.coerceIn(0f, 1f))
-                    publish(0.15f + maxUploadProgress * 0.30f, "رفع الصوت للمنصة")
+                    publish(0.15f + maxUploadProgress * 0.30f, "رفع الصوت بأمان")
                 }
             } catch (transient: CloudTransientException) {
-                publish((0.15f + maxUploadProgress * 0.30f).coerceAtMost(0.44f), "بانتظار الشبكة… سيتم الاستكمال تلقائيًا", true)
-                waitUntilConnected()
-                delay(750L)
+                retryAttempt += 1
+                val online = CloudConnectivity.isOnline(applicationContext)
+                publish(
+                    (0.15f + maxUploadProgress * 0.30f).coerceAtMost(0.44f),
+                    CloudConnectivity.retryMessage(applicationContext, transient),
+                    true,
+                )
+                if (!online) waitUntilConnected()
+                delay(retryDelayMs(retryAttempt))
             }
         }
         throw CancellationException()
     }
 
     private suspend fun waitUntilConnected() {
-        while (scope.isActive && !hasNetwork()) {
-            publish((0.15f + maxUploadProgress * 0.30f).coerceAtMost(0.44f), "لا توجد شبكة • التقدم متوقف مؤقتًا", true)
+        while (scope.isActive && !CloudConnectivity.isOnline(applicationContext)) {
+            publish(
+                (0.15f + maxUploadProgress * 0.30f).coerceAtMost(0.44f),
+                "الاتصال بالإنترنت غير متاح • سنستكمل تلقائيًا عند عودته",
+                true,
+            )
             delay(1_500L)
         }
     }
 
-    private fun hasNetwork(): Boolean {
-        val manager = getSystemService(ConnectivityManager::class.java)
-        val network = manager.activeNetwork ?: return false
-        val caps = manager.getNetworkCapabilities(network) ?: return false
-        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
-            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    private fun retryDelayMs(attempt: Int): Long = when {
+        attempt <= 1 -> 1_500L
+        attempt == 2 -> 3_000L
+        attempt == 3 -> 5_000L
+        else -> 10_000L
     }
 
     private fun readDuration(uri: Uri): Long {
