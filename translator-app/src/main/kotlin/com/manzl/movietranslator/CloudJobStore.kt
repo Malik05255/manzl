@@ -29,9 +29,13 @@ internal data class BackgroundCloudJob(
     val pendingAsr: List<PendingAsr>,
     val providers: List<String>,
     val translationJobId: String? = null,
+    val translationAttempts: Int = 0,
     val draft: Map<Int, String> = emptyMap(),
+    // Kept for backward compatibility with jobs saved by older APKs.
     val reviewJobId: String? = null,
+    // Smart mode stores only corrected lines here; unchanged lines remain in draft.
     val reviewed: Map<Int, String> = emptyMap(),
+    val reviewCursor: Int = 0,
     val stage: String = "تم رفع الصوت للمنصة",
     val progress: Float = 0.45f,
 )
@@ -66,7 +70,7 @@ internal class CloudJobStore(context: Context) {
             progress = job.progress,
             stage = job.stage,
             uploadedBytes = job.uploadedBytes,
-            partCount = if (job.durationMs > 2L * 60L * 60_000L) 2 else 1,
+            partCount = runCatching { CloudAudioExtractor.planParts(job.durationMs).size }.getOrDefault(0),
         )
     }
 }
@@ -88,9 +92,11 @@ private fun BackgroundCloudJob.toJson(): JSONObject = JSONObject()
     })
     .put("providers", JSONArray(providers))
     .put("translation_job_id", translationJobId ?: JSONObject.NULL)
+    .put("translation_attempts", translationAttempts)
     .put("draft", mapToArray(draft))
     .put("review_job_id", reviewJobId ?: JSONObject.NULL)
     .put("reviewed", mapToArray(reviewed))
+    .put("review_cursor", reviewCursor)
     .put("stage", stage)
     .put("progress", progress.toDouble())
 
@@ -132,9 +138,11 @@ private fun JSONObject.toBackgroundJob(): BackgroundCloudJob {
         pendingAsr = pending,
         providers = providers,
         translationJobId = optString("translation_job_id").takeIf { it.isNotBlank() && it != "null" },
+        translationAttempts = optInt("translation_attempts", 0).coerceAtLeast(0),
         draft = arrayToMap(optJSONArray("draft") ?: JSONArray()),
         reviewJobId = optString("review_job_id").takeIf { it.isNotBlank() && it != "null" },
         reviewed = arrayToMap(optJSONArray("reviewed") ?: JSONArray()),
+        reviewCursor = optInt("review_cursor", 0).coerceAtLeast(0),
         stage = optString("stage", "المنصة تكمل الترجمة"),
         progress = optDouble("progress", 0.45).toFloat().coerceIn(0f, 1f),
     )
