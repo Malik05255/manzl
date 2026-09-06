@@ -27,9 +27,9 @@ import java.io.File
 import java.util.Locale
 
 /**
- * One-tap direct-cloud path. The video never leaves the phone: only a speech-optimized Opus audio
- * copy is uploaded directly to Groq/Gemini. Movies up to two hours use one hidden part; movies
- * above two and up to three hours use exactly two hidden parts. One unified Arabic SRT is returned.
+ * One-tap cloud path. The video never leaves the phone: only a speech-optimized Opus audio copy is
+ * uploaded to the private gateway. Movies up to two hours use one hidden part; movies above two and
+ * up to three hours use exactly two hidden parts. One unified, reviewed Arabic SRT is returned.
  */
 class CloudMovieTranslationService : Service() {
     companion object {
@@ -71,12 +71,6 @@ class CloudMovieTranslationService : Service() {
         fun start(context: Context) {
             val current = _state.value
             if (current.videoUri == null || current.isRunning) return
-            if (!SecureApiKeyStore(context.applicationContext).isConfigured()) {
-                _state.update {
-                    it.copy(error = "أضف مفتاحي Groq وGemini من إعدادات التطبيق مرة واحدة فقط.")
-                }
-                return
-            }
             if (current.videoDurationMs > MAX_MOVIE_MS) {
                 _state.update { it.copy(error = "الحد الحالي للفيلم 3 ساعات.") }
                 return
@@ -210,7 +204,7 @@ class CloudMovieTranslationService : Service() {
                     )
                 }
 
-                publish(0.18f, "إرسال الصوت مباشرة للسحابة…", force = true)
+                publish(0.18f, "إرسال الصوت للسحابة الخاصة…", force = true)
                 val cloud = CloudTranslationClient(applicationContext).translate(
                     parts = parts,
                     onUploadProgress = { uploadProgress ->
@@ -225,7 +219,7 @@ class CloudMovieTranslationService : Service() {
                     },
                 )
 
-                publish(0.91f, "تنسيق الترجمة العربية والتوقيت…", force = true)
+                publish(0.97f, "تنسيق الترجمة العربية والتوقيت…", force = true)
                 val output = withContext(Dispatchers.IO) {
                     val dir = File(filesDir, "subtitles").apply { mkdirs() }
                     val safeBase = snapshot.videoName
@@ -243,7 +237,7 @@ class CloudMovieTranslationService : Service() {
                 val details = buildString {
                     append(providerText)
                     if (cloud.asrMs > 0L) append(" • استماع ${formatDuration(cloud.asrMs)}")
-                    if (cloud.translationMs > 0L) append(" • ترجمة ${formatDuration(cloud.translationMs)}")
+                    if (cloud.translationMs > 0L) append(" • ترجمة ومراجعة ${formatDuration(cloud.translationMs)}")
                 }
                 _state.update {
                     it.copy(
