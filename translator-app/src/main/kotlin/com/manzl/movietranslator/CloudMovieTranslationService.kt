@@ -205,13 +205,19 @@ class CloudMovieTranslationService : Service() {
                 }
 
                 publish(0.18f, "رفع الصوت فقط…", force = true)
-                val cloud = CloudTranslationClient().translate(parts) { uploadProgress ->
-                    if (uploadProgress < 0.995f) {
-                        publish(0.18f + uploadProgress * 0.30f, "رفع الصوت فقط…")
-                    } else {
-                        publish(0.50f, "Whisper يستمع للحوار التركي بدقة…", force = true)
-                    }
-                }
+                val cloud = CloudTranslationClient().translate(
+                    parts = parts,
+                    onUploadProgress = { uploadProgress ->
+                        if (uploadProgress < 0.995f) {
+                            publish(0.18f + uploadProgress * 0.30f, "رفع الصوت فقط…")
+                        } else {
+                            publish(0.50f, "السحابة تتعرف على الحوار التركي…", force = true)
+                        }
+                    },
+                    onStage = { stage, progress ->
+                        publish(progress, stage, force = true)
+                    },
+                )
 
                 publish(0.91f, "تنسيق الترجمة العربية والتوقيت…", force = true)
                 val output = withContext(Dispatchers.IO) {
