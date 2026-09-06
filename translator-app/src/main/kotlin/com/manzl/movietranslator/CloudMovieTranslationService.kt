@@ -8,9 +8,10 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.media.MediaMetadataRetriever
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.net.Uri
 import android.os.IBinder
-import android.os.SystemClock
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -22,10 +23,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.util.Locale
 
 class CloudMovieTranslationService : Service() {
     companion object {
@@ -33,7 +34,6 @@ class CloudMovieTranslationService : Service() {
         private const val ACTION_CANCEL = "com.manzl.movietranslator.cloud.CANCEL"
         private const val CHANNEL_ID = "cloud_movie_translation"
         private const val NOTIFICATION_ID = 4201
-        private const val COMPLETE_NOTIFICATION_ID = 4202
         private const val TWO_HOURS_MS = 2L * 60L * 60_000L
         private const val MAX_MOVIE_MS = 3L * 60L * 60_000L
 
@@ -69,11 +69,13 @@ class CloudMovieTranslationService : Service() {
                 _state.update { it.copy(error = "الحد الحالي للفيلم 3 ساعات.") }
                 return
             }
+            CloudCompletionWorker.cancelAll(context)
+            CloudJobStore(context.applicationContext).clear()
             _state.update {
                 it.copy(
                     isRunning = true,
                     progress = 0f,
-                    stage = "بدء المهمة…",
+                    stage = "بدء المهمة",
                     error = null,
                     cues = emptyList(),
                     srtFile = null,
@@ -89,22 +91,84 @@ class CloudMovieTranslationService : Service() {
                 )
             }.onFailure { error ->
                 _state.update {
-                    it.copy(
-                        isRunning = false,
-                        stage = "تعذر بدء الترجمة",
-                        error = error.message ?: "تعذر تشغيل خدمة الترجمة.",
-                    )
+                    it.copy(isRunning = false, stage = "تعذر بدء الترجمة", error = error.message ?: "تعذر تشغيل خدمة الترجمة.")
                 }
             }
         }
 
         fun cancel(context: Context) {
+            CloudCompletionWorker.cancelAll(context)
+            CloudJobStore(context.applicationContext).clear()
             activeService?.cancelWork() ?: runCatching {
                 context.applicationContext.startService(
                     Intent(context.applicationContext, CloudMovieTranslationService::class.java)
                         .setAction(ACTION_CANCEL)
                 )
             }
+            _state.update { it.copy(isRunning = false, stage = "تم إيقاف الترجمة", error = null) }
+        }
+
+        fun restorePending(context: Context) {
+            val restored = CloudJobStore(context.applicationContext).restoreUiState() ?: return
+            if (!_state.value.isRunning && _state.value.srtFile == null) _state.value = restored
+        }
+
+        internal fun restoreBackgroundState(context: Context, job: BackgroundCloudJob) {
+            val current = _state.value
+            if (current.movieKey == job.movieKey && current.isRunning) return
+            _state.value = TranslatorUiState(
+                videoUri = runCatching { Uri.parse(job.videoUri) }.getOrNull(),
+                videoName = job.movieName,
+                movieKey = job.movieKey,
+                videoDurationMs = job.durationMs,
+                isRunning = true,
+                progress = job.progress,
+                stage = job.stage,
+                uploadedBytes = job.uploadedBytes,
+                partCount = if (job.durationMs > TWO_HOURS_MS) 2 else 1,
+            )
+        }
+
+        internal fun updateBackgroundProgress(context: Context, job: BackgroundCloudJob) {
+            restoreBackgroundState(context, job)
+            _state.update {
+                it.copy(
+                    isRunning = true,
+                    progress = job.progress.coerceIn(0f, 1f),
+                    stage = job.stage,
+                    error = null,
+                    uploadedBytes = job.uploadedBytes,
+                )
+            }
+        }
+
+        internal fun completeBackground(
+            context: Context,
+            job: BackgroundCloudJob,
+            cloud: CloudTranslationResult,
+            output: File,
+            elapsed: Long,
+        ) {
+            _state.value = TranslatorUiState(
+                videoUri = runCatching { Uri.parse(job.videoUri) }.getOrNull(),
+                videoName = job.movieName,
+                movieKey = job.movieKey,
+                videoDurationMs = job.durationMs,
+                isRunning = false,
+                progress = 1f,
+                stage = "اكتملت الترجمة",
+                cues = cloud.cues,
+                srtFile = output,
+                uploadedBytes = job.uploadedBytes,
+                processingMs = elapsed,
+                cloudMetrics = cloud.providers,
+                partCount = if (job.durationMs > TWO_HOURS_MS) 2 else 1,
+            )
+        }
+
+        internal fun failBackground(context: Context, message: String) {
+            restorePending(context)
+            _state.update { it.copy(isRunning = false, stage = "تعذر إكمال الترجمة", error = message) }
         }
 
         fun clearError() = _state.update { it.copy(error = null) }
@@ -124,8 +188,8 @@ class CloudMovieTranslationService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var worker: Job? = null
-    private var startedAt = 0L
     private var lastNotificationPercent = -1
+    private var maxUploadProgress = 0f
 
     override fun onCreate() {
         super.onCreate()
@@ -139,13 +203,8 @@ class CloudMovieTranslationService : Service() {
         when (intent?.action) {
             ACTION_CANCEL -> cancelWork()
             ACTION_START, null -> if (worker?.isActive != true) {
-                runCatching {
-                    startForeground(NOTIFICATION_ID, notification("تجهيز الصوت…", 2, true))
-                    beginTranslation()
-                }.onFailure { error ->
-                    _state.update { it.copy(isRunning = false, error = error.message ?: "تعذر بدء الترجمة.") }
-                    stopSelf()
-                }
+                startForeground(NOTIFICATION_ID, notification("تجهيز الصوت", 1, true))
+                beginUploadHandoff()
             }
         }
         return START_NOT_STICKY
@@ -153,136 +212,113 @@ class CloudMovieTranslationService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun beginTranslation() {
+    private fun beginUploadHandoff() {
         val snapshot = _state.value
         val uri = snapshot.videoUri ?: return
-        startedAt = SystemClock.elapsedRealtime()
+        val startedAt = System.currentTimeMillis()
         lastNotificationPercent = -1
+        maxUploadProgress = 0f
 
         worker = scope.launch {
             var parts: List<CloudAudioPart> = emptyList()
             try {
                 val durationMs = snapshot.videoDurationMs.takeIf { it > 0L }
-                    ?: withContext(Dispatchers.IO) {
-                        val retriever = MediaMetadataRetriever()
-                        try {
-                            retriever.setDataSource(applicationContext, uri)
-                            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
-                        } finally {
-                            retriever.release()
-                        }
-                    }
+                    ?: withContext(Dispatchers.IO) { readDuration(uri) }
                 check(durationMs in 1..MAX_MOVIE_MS) { "يدعم التطبيق أفلامًا حتى 3 ساعات حاليًا." }
 
-                publish(0.02f, "استخراج الصوت من الفيلم", force = true)
-                parts = CloudAudioExtractor(applicationContext).prepare(
-                    uri = uri,
-                    durationMs = durationMs,
-                ) { done, total ->
-                    if (total > 1) {
-                        val ratio = done.toFloat() / total.coerceAtLeast(1).toFloat()
-                        publish(0.02f + ratio * 0.10f, "تجهيز جزء الصوت $done من $total")
-                    }
+                publish(0.02f, "استخراج الصوت من الفيلم", true)
+                parts = CloudAudioExtractor(applicationContext).prepare(uri, durationMs) { done, total ->
+                    val ratio = done.toFloat() / total.coerceAtLeast(1).toFloat()
+                    publish(0.02f + ratio * 0.13f, "تجهيز الصوت")
                 }
-                publish(0.15f, "تم تجهيز الصوت", force = true)
+                publish(0.15f, "تم تجهيز الصوت", true)
 
                 val bytes = parts.sumOf { it.file.length() }
-                _state.update {
-                    it.copy(uploadedBytes = bytes, partCount = parts.size, videoDurationMs = durationMs)
-                }
+                _state.update { it.copy(uploadedBytes = bytes, partCount = parts.size, videoDurationMs = durationMs) }
 
-                val cloud = CloudTranslationClient(applicationContext).translate(
-                    parts = parts,
-                    onUploadProgress = { uploadProgress ->
-                        publish(0.15f + uploadProgress.coerceIn(0f, 1f) * 0.30f, "رفع الصوت للمنصة")
-                    },
-                    onStage = { stage, progress -> publish(progress, stage, force = true) },
+                val submission = submitWithAutomaticNetworkResume(parts)
+                val movieKey = snapshot.movieKey.ifBlank { CloudLibraryClient.movieKey(snapshot.videoName, durationMs) }
+                val job = BackgroundCloudJob(
+                    movieKey = movieKey,
+                    movieName = snapshot.videoName,
+                    videoUri = uri.toString(),
+                    durationMs = durationMs,
+                    uploadedBytes = bytes,
+                    startedAtEpochMs = startedAt,
+                    segments = submission.segments,
+                    pendingAsr = submission.pendingAsr,
+                    providers = submission.providers,
+                    stage = if (submission.pendingAsr.isEmpty()) "الصوت وصل • بدء الترجمة على المنصة" else "الصوت وصل • تحليل الحوار على المنصة",
+                    progress = if (submission.pendingAsr.isEmpty()) 0.62f else 0.45f,
                 )
+                CloudJobStore(applicationContext).save(job)
+                updateBackgroundProgress(applicationContext, job)
+                CloudCompletionWorker.schedule(applicationContext, 250L)
 
-                publish(0.97f, "حفظ الترجمة", force = true)
-                val output = withContext(Dispatchers.IO) {
-                    val dir = File(filesDir, "subtitles").apply { mkdirs() }
-                    val safeBase = snapshot.videoName
-                        .substringBeforeLast('.', snapshot.videoName)
-                        .replace(Regex("[^\\p{L}\\p{N}._-]+"), "_")
-                        .take(80)
-                        .ifBlank { "movie" }
-                    File(dir, "${safeBase}_ar.srt").apply {
-                        writeText(SrtFormatter.format(cloud.cues), Charsets.UTF_8)
-                    }
-                }
-
-                val elapsed = SystemClock.elapsedRealtime() - startedAt
-                val movieKey = snapshot.movieKey.ifBlank {
-                    CloudLibraryClient.movieKey(snapshot.videoName, durationMs)
-                }
-                val srtText = withContext(Dispatchers.IO) { output.readText(Charsets.UTF_8) }
-
-                // Keep the cloud library in sync. Retry briefly because the translation itself is
-                // already complete and should not be lost to a transient network failure.
-                var synced = false
-                repeat(2) { attempt ->
-                    if (!synced) {
-                        synced = runCatching {
-                            CloudLibraryClient(applicationContext).saveTranslation(
-                                movieKey = movieKey,
-                                movieName = snapshot.videoName,
-                                videoUri = uri,
-                                durationMs = durationMs,
-                                srtText = srtText,
-                                cueCount = cloud.cues.size,
-                                processingMs = elapsed,
-                            )
-                        }.isSuccess
-                        if (!synced && attempt == 0) delay(700L)
-                    }
-                }
-
-                val providerText = cloud.providers.ifBlank { "Whisper Large V3 + Gemini" }
-                val details = buildString {
-                    append(providerText)
-                    if (cloud.asrMs > 0L) append(" • استماع ${formatDuration(cloud.asrMs)}")
-                    if (cloud.translationMs > 0L) append(" • ترجمة ومراجعة ${formatDuration(cloud.translationMs)}")
-                    if (!synced) append(" • الترجمة محفوظة محليًا")
-                }
-                _state.update {
-                    it.copy(
-                        isRunning = false,
-                        progress = 1f,
-                        stage = "اكتملت الترجمة",
-                        movieKey = movieKey,
-                        cues = cloud.cues,
-                        srtFile = output,
-                        uploadedBytes = bytes,
-                        processingMs = elapsed,
-                        cloudMetrics = details,
-                        error = null,
-                    )
-                }
-                postCompletionNotification(snapshot.videoName, elapsed)
+                // The phone's heavy foreground task ends here. Everything after the upload is
+                // short network work scheduled by WorkManager and can survive leaving the app.
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
             } catch (cancelled: CancellationException) {
                 _state.update { it.copy(isRunning = false, stage = "تم إيقاف الترجمة", error = null) }
                 throw cancelled
             } catch (error: Throwable) {
                 _state.update {
-                    it.copy(
-                        isRunning = false,
-                        stage = "تعذر إكمال الترجمة",
-                        error = error.message ?: "حدث خطأ في الترجمة السحابية.",
-                    )
+                    it.copy(isRunning = false, stage = "تعذر إكمال رفع الصوت", error = error.message ?: "حدث خطأ أثناء رفع الصوت.")
                 }
             } finally {
                 parts.forEach { runCatching { it.file.delete() } }
                 runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
-                stopSelf()
             }
+        }
+    }
+
+    private suspend fun submitWithAutomaticNetworkResume(parts: List<CloudAudioPart>): CloudSubmission {
+        while (scope.isActive) {
+            waitUntilConnected()
+            try {
+                return CloudTranslationClient(applicationContext).submitForBackground(parts) { progress ->
+                    maxUploadProgress = maxOf(maxUploadProgress, progress.coerceIn(0f, 1f))
+                    publish(0.15f + maxUploadProgress * 0.30f, "رفع الصوت للمنصة")
+                }
+            } catch (transient: CloudTransientException) {
+                publish((0.15f + maxUploadProgress * 0.30f).coerceAtMost(0.44f), "بانتظار الشبكة… سيتم الاستكمال تلقائيًا", true)
+                waitUntilConnected()
+                delay(750L)
+            }
+        }
+        throw CancellationException()
+    }
+
+    private suspend fun waitUntilConnected() {
+        while (scope.isActive && !hasNetwork()) {
+            publish((0.15f + maxUploadProgress * 0.30f).coerceAtMost(0.44f), "لا توجد شبكة • التقدم متوقف مؤقتًا", true)
+            delay(1_500L)
+        }
+    }
+
+    private fun hasNetwork(): Boolean {
+        val manager = getSystemService(ConnectivityManager::class.java)
+        val network = manager.activeNetwork ?: return false
+        val caps = manager.getNetworkCapabilities(network) ?: return false
+        return caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    }
+
+    private fun readDuration(uri: Uri): Long {
+        val retriever = MediaMetadataRetriever()
+        return try {
+            retriever.setDataSource(applicationContext, uri)
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull() ?: 0L
+        } finally {
+            retriever.release()
         }
     }
 
     private fun publish(progress: Float, stage: String, force: Boolean = false) {
         val bounded = progress.coerceIn(0f, 1f)
-        _state.update { it.copy(isRunning = true, progress = bounded, stage = stage) }
-        val percent = (bounded * 100f).toInt().coerceIn(0, 100)
+        _state.update { it.copy(isRunning = true, progress = maxOf(it.progress, bounded), stage = stage) }
+        val percent = (maxOf(_state.value.progress, bounded) * 100f).toInt().coerceIn(0, 100)
         if (force || percent - lastNotificationPercent >= 4) {
             lastNotificationPercent = percent
             runCatching {
@@ -297,15 +333,10 @@ class CloudMovieTranslationService : Service() {
     private fun cancelWork() {
         worker?.cancel()
         worker = null
-    }
-
-    private fun postCompletionNotification(name: String, elapsed: Long) {
-        runCatching {
-            getSystemService(NotificationManager::class.java).notify(
-                COMPLETE_NOTIFICATION_ID,
-                notification("جاهز: $name • ${formatDuration(elapsed)}", 100, false),
-            )
-        }
+        CloudCompletionWorker.cancelAll(applicationContext)
+        CloudJobStore(applicationContext).clear()
+        runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+        stopSelf()
     }
 
     private fun notification(text: String, progress: Int, indeterminate: Boolean): Notification {
@@ -321,21 +352,10 @@ class CloudMovieTranslationService : Service() {
             .setContentTitle("مترجم الأفلام")
             .setContentText(text)
             .setContentIntent(pending)
-            .setOnlyAlertOnce(progress < 100)
-            .setOngoing(progress < 100)
-            .setAutoCancel(progress >= 100)
+            .setOnlyAlertOnce(true)
+            .setOngoing(true)
             .setProgress(100, progress.coerceIn(0, 100), indeterminate)
             .build()
-    }
-
-    private fun formatDuration(ms: Long): String {
-        val seconds = (ms.coerceAtLeast(0L) + 500L) / 1000L
-        return if (seconds < 60L) "$seconds ث" else String.format(
-            Locale.US,
-            "%d:%02d د",
-            seconds / 60L,
-            seconds % 60L,
-        )
     }
 
     override fun onDestroy() {
