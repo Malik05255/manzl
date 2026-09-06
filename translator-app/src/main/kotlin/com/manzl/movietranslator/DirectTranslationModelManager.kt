@@ -1,69 +1,83 @@
 package com.manzl.movietranslator
 
 import android.content.Context
-import com.google.android.gms.tasks.Tasks
-import com.google.mlkit.common.model.DownloadConditions
-import com.google.mlkit.nl.translate.TranslateLanguage
-import com.google.mlkit.nl.translate.Translation
-import com.google.mlkit.nl.translate.TranslatorOptions
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.io.FileOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
 
 /**
- * Compatibility facade for the lightweight ML Kit Turkish -> Arabic translation models.
+ * Manages the quantized M2M100-418M files used for direct Turkish -> Arabic translation.
  *
- * Older builds downloaded ~1.3 GB of NLLB ONNX files through this class. The new path uses
- * ML Kit's small on-device language packs instead. The class name is kept so the service/UI do
- * not need a migration just to prepare the translation engine.
+ * M2M100 translates non-English language pairs directly instead of routing Turkish through English.
+ * The selected ONNX export uses an encoder + decoder + cached decoder so autoregressive generation
+ * can reuse KV state on every token.
  */
 class DirectTranslationModelManager(private val context: Context) {
     suspend fun ensureModel(onProgress: (Float) -> Unit = {}): File = withContext(Dispatchers.IO) {
-        removeLegacyHeavyModels()
-        onProgress(0.05f)
-
-        val options = TranslatorOptions.Builder()
-            .setSourceLanguage(TranslateLanguage.TURKISH)
-            .setTargetLanguage(TranslateLanguage.ARABIC)
-            .build()
-        val client = Translation.getClient(options)
-
-        try {
-            currentCoroutineContext().ensureActive()
-            // Intentionally do not require Wi-Fi: the language packs are small and the app must be
-            // able to finish first-time setup on mobile data as well.
-            val conditions = DownloadConditions.Builder().build()
-            Tasks.await(client.downloadModelIfNeeded(conditions))
-            currentCoroutineContext().ensureActive()
-
-            val marker = markerFile()
-            marker.parentFile?.mkdirs()
-            marker.writeText(MARKER_VERSION)
+        val modelDir = File(context.filesDir, MODEL_DIR).apply { mkdirs() }
+        if (isReady(modelDir)) {
             onProgress(1f)
-            marker
-        } finally {
-            client.close()
+            return@withContext modelDir
         }
+
+        reclaimObsoleteModels()
+        val missingBytes = MODEL_FILES.sumOf { spec ->
+            val final = File(modelDir, spec.name)
+            val partial = File(modelDir, "${spec.name}.part")
+            if (final.length() >= spec.minBytes) 0L
+            else (spec.expectedBytes - partial.length()).coerceAtLeast(0L)
+        }
+        check(modelDir.usableSpace >= missingBytes + DOWNLOAD_HEADROOM_BYTES) {
+            "المساحة الحرة غير كافية لتنزيل مترجم M2M100 المباشر."
+        }
+
+        val totalExpected = MODEL_FILES.sumOf { it.expectedBytes }.toDouble()
+        var completedExpected = 0L
+        MODEL_FILES.forEach { spec ->
+            currentCoroutineContext().ensureActive()
+            val final = File(modelDir, spec.name)
+            if (final.length() >= spec.minBytes) {
+                completedExpected += spec.expectedBytes
+                onProgress((completedExpected / totalExpected).toFloat().coerceIn(0f, 0.99f))
+                return@forEach
+            }
+
+            val partial = File(modelDir, "${spec.name}.part")
+            download(spec, partial) { currentBytes ->
+                val weighted = completedExpected + currentBytes.coerceAtMost(spec.expectedBytes)
+                onProgress((weighted / totalExpected).toFloat().coerceIn(0f, 0.99f))
+            }
+            check(partial.length() >= spec.minBytes) {
+                "تعذر تنزيل ${spec.displayName} كاملًا."
+            }
+            if (final.exists()) final.delete()
+            check(partial.renameTo(final)) { "تعذر تثبيت ${spec.displayName}." }
+            completedExpected += spec.expectedBytes
+        }
+
+        check(isReady(modelDir)) { "ملفات مترجم M2M100 غير مكتملة." }
+        onProgress(1f)
+        modelDir
     }
 
-    /**
-     * Fast UI hint only. The translator still asks ML Kit to verify/download its packs when setup
-     * runs, so a stale marker cannot permanently break translation.
-     */
-    fun isInstalled(): Boolean = markerFile().let { file ->
-        file.isFile && runCatching { file.readText().trim() == MARKER_VERSION }.getOrDefault(false)
+    fun isInstalled(): Boolean = isReady(File(context.filesDir, MODEL_DIR))
+
+    private fun isReady(dir: File): Boolean = MODEL_FILES.all { spec ->
+        File(dir, spec.name).length() >= spec.minBytes
     }
 
-    private fun markerFile(): File = File(File(context.filesDir, "models"), MARKER_NAME)
-
-    private fun removeLegacyHeavyModels() {
-        val models = File(context.filesDir, "models")
+    private fun reclaimObsoleteModels() {
+        val modelsDir = File(context.filesDir, "models")
         val obsolete = listOf(
-            File(models, "nllb-200-distilled-600m"),
-            File(models, "Hy-MT2-1.8B-Q4_K_M.gguf"),
-            File(models, "Hy-MT2-1.8B-Q4_K_M.gguf.part"),
+            File(modelsDir, "nllb-200-distilled-600m"),
+            File(modelsDir, "Hy-MT2-1.8B-Q4_K_M.gguf"),
+            File(modelsDir, "Hy-MT2-1.8B-Q4_K_M.gguf.part"),
+            File(modelsDir, "mlkit-tr-ar.ready"),
             File(context.filesDir, "Translation/HY-MT"),
         )
         obsolete.forEach { file ->
@@ -73,8 +87,103 @@ class DirectTranslationModelManager(private val context: Context) {
         }
     }
 
+    private suspend fun download(
+        spec: ModelFile,
+        target: File,
+        onBytes: (Long) -> Unit,
+    ) {
+        target.parentFile?.mkdirs()
+        val existing = target.takeIf { it.isFile }?.length() ?: 0L
+        val connection = (URL(spec.url).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 30_000
+            readTimeout = 120_000
+            instanceFollowRedirects = true
+            requestMethod = "GET"
+            setRequestProperty("Accept-Encoding", "identity")
+            setRequestProperty("User-Agent", "Manzl-MovieTranslator/1.0")
+            if (existing > 0L) setRequestProperty("Range", "bytes=$existing-")
+        }
+
+        try {
+            connection.connect()
+            check(connection.responseCode in 200..299) {
+                "فشل تنزيل ${spec.displayName} (${connection.responseCode})."
+            }
+            val resumed = connection.responseCode == HttpURLConnection.HTTP_PARTIAL && existing > 0L
+            val startAt = if (resumed) existing else 0L
+            if (!resumed && existing > 0L) target.delete()
+            onBytes(startAt)
+
+            FileOutputStream(target, resumed).use { output ->
+                connection.inputStream.use { input ->
+                    val buffer = ByteArray(512 * 1024)
+                    var downloaded = startAt
+                    while (true) {
+                        currentCoroutineContext().ensureActive()
+                        val count = input.read(buffer)
+                        if (count <= 0) break
+                        output.write(buffer, 0, count)
+                        downloaded += count
+                        onBytes(downloaded)
+                    }
+                    output.fd.sync()
+                }
+            }
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private data class ModelFile(
+        val name: String,
+        val displayName: String,
+        val url: String,
+        val expectedBytes: Long,
+        val minBytes: Long,
+    )
+
     companion object {
-        private const val MARKER_NAME = "mlkit-tr-ar.ready"
-        private const val MARKER_VERSION = "mlkit-translate-17.0.3-v1"
+        internal const val MODEL_DIR = "models/m2m100-418m-tr-ar"
+        private const val BASE = "https://huggingface.co/Xenova/m2m100_418M/resolve/main"
+
+        private val MODEL_FILES = listOf(
+            ModelFile(
+                name = "encoder_model_quantized.onnx",
+                displayName = "M2M100 encoder",
+                url = "$BASE/onnx/encoder_model_quantized.onnx?download=true",
+                expectedBytes = 288_000_000L,
+                minBytes = 250L * 1024L * 1024L,
+            ),
+            ModelFile(
+                name = "decoder_model_quantized.onnx",
+                displayName = "M2M100 decoder",
+                url = "$BASE/onnx/decoder_model_quantized.onnx?download=true",
+                expectedBytes = 339_000_000L,
+                minBytes = 300L * 1024L * 1024L,
+            ),
+            ModelFile(
+                name = "decoder_with_past_model_quantized.onnx",
+                displayName = "M2M100 cached decoder",
+                url = "$BASE/onnx/decoder_with_past_model_quantized.onnx?download=true",
+                expectedBytes = 314_000_000L,
+                minBytes = 275L * 1024L * 1024L,
+            ),
+            ModelFile(
+                name = "sentencepiece.bpe.model",
+                displayName = "M2M100 SentencePiece",
+                url = "$BASE/sentencepiece.bpe.model?download=true",
+                expectedBytes = 2_420_000L,
+                minBytes = 2L * 1024L * 1024L,
+            ),
+            ModelFile(
+                name = "vocab.json",
+                displayName = "M2M100 vocabulary",
+                url = "$BASE/vocab.json?download=true",
+                expectedBytes = 3_710_000L,
+                minBytes = 3L * 1024L * 1024L,
+            ),
+        )
+
+        private const val DOWNLOAD_HEADROOM_BYTES = 160L * 1024L * 1024L
     }
 }
