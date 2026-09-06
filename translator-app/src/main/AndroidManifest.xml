@@ -23,6 +23,12 @@
         </activity>
 
         <service
+            android:name=".CloudMovieTranslationService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync"
+            android:stopWithTask="false" />
+
+        <service
             android:name=".MovieTranslationService"
             android:exported="false"
             android:foregroundServiceType="dataSync"
