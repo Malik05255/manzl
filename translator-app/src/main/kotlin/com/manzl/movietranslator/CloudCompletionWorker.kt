@@ -37,11 +37,9 @@ internal class CloudCompletionWorker(
             schedule(applicationContext, 3_000L)
             return Result.success()
         } catch (error: Throwable) {
-            CloudMovieTranslationService.failBackground(
-                applicationContext,
-                error.message ?: "تعذر إكمال الترجمة السحابية.",
-            )
-            return Result.failure(Data.Builder().putString("error", error.message).build())
+            val friendly = CloudConnectivity.userFacingFailure(applicationContext, error)
+            CloudMovieTranslationService.failBackground(applicationContext, friendly)
+            return Result.failure(Data.Builder().putString("error", friendly).build())
         }
 
         store.save(advance.job)

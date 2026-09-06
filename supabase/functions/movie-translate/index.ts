@@ -7,8 +7,11 @@ const GEMINI_MODEL = "gemini-3.8-flash";
 const GROQ_ASR_MODEL = "whisper-large-v3";
 const GROQ_ASR_TURBO = "whisper-large-v3-turbo";
 const GROQ_REVIEW_MODEL = "openai/gpt-oss-120b";
+const GROQ_TRANSLATE_MODEL = "openai/gpt-oss-120b";
 const MAX_PART_BYTES = 24 * 1024 * 1024;
 const API_REVISION = "2026-05-20";
+const GROQ_DIRECT_MAX_SEGMENTS = 700;
+const GROQ_DIRECT_MAX_CHARS = 60_000;
 
 type Segment = { id: number; start_ms: number; end_ms: number; tr: string };
 type Subtitle = { id: number; ar: string };
@@ -34,15 +37,15 @@ Deno.serve(async (req: Request) => {
   } catch (error) {
     console.error("movie-translate", error);
     return json({
-      error: "internal_error",
-      message: error instanceof Error ? error.message : String(error),
-    }, 500);
+      error: "provider_temporarily_unavailable",
+      message: "إحدى خدمات الترجمة تحت ضغط مؤقت. ستتم إعادة المحاولة تلقائيًا.",
+    }, 503);
   }
 });
 
 async function handleAsr(form: FormData): Promise<Response> {
   const groqKey = Deno.env.get("GROQ_API_KEY");
-  if (!groqKey) return json({ error: "groq_key_missing", message: "GROQ_API_KEY is not configured." }, 503);
+  if (!groqKey) return json({ error: "groq_key_missing", message: "خدمة فهم الحوار غير مفعلة." }, 503);
 
   const audio = form.get("audio");
   if (!(audio instanceof File)) return json({ error: "audio_required" }, 400);
@@ -70,7 +73,7 @@ async function handleAsr(form: FormData): Promise<Response> {
 
   return json({
     error: "asr_temporarily_unavailable",
-    message: "خدمة فهم الحوار غير متاحة مؤقتًا.",
+    message: "خدمة فهم الحوار تحت ضغط مؤقت. ستتم إعادة المحاولة تلقائيًا.",
   }, 503);
 }
 
@@ -95,28 +98,56 @@ async function handleTranslateStart(body: any): Promise<Response> {
     }
   }
 
+  // For short and medium dialogue sets, Groq is a fast fallback that avoids
+  // creating a fragile long-running Gemini background interaction.
+  const groqKey = Deno.env.get("GROQ_API_KEY");
+  if (groqKey && canUseGroqDirect(segments)) {
+    try {
+      const subtitles = await translateWithGroq(segments, groqKey);
+      if (subtitles.length === segments.length) {
+        return json({
+          status: "completed",
+          subtitles,
+          metrics: { provider: `${GROQ_TRANSLATE_MODEL} • translate` },
+        });
+      }
+    } catch (error) {
+      console.warn("Groq direct translation fallback", error instanceof Error ? error.message : String(error));
+    }
+  }
+
   const geminiKey = Deno.env.get("GEMINI_API_KEY");
   if (!geminiKey) {
     return json({
       error: "translation_provider_missing",
-      message: "أضف AZURE_TRANSLATOR_KEY و AZURE_TRANSLATOR_REGION لتفعيل المسار الذكي.",
+      message: "خدمة الترجمة الأساسية غير متاحة مؤقتًا. ستتم إعادة المحاولة تلقائيًا.",
     }, 503);
   }
 
-  const interaction = await startGeminiTranslation(segments, geminiKey);
-  if (!interaction?.id) throw new Error("gemini_background_id_missing");
-  if (String(interaction.status || "") === "completed") {
+  try {
+    const interaction = await startGeminiTranslation(segments, geminiKey);
+    if (!interaction?.id) throw new Error("gemini_background_id_missing");
+    if (String(interaction.status || "") === "completed") {
+      const subtitles = parseGeminiSubtitles(interaction);
+      if (subtitles.length !== segments.length) throw new Error("gemini_result_mismatch");
+      return json({
+        status: "completed",
+        subtitles,
+        metrics: { provider: GEMINI_MODEL },
+      });
+    }
     return json({
-      status: "completed",
-      subtitles: parseGeminiSubtitles(interaction),
-      metrics: { provider: GEMINI_MODEL },
+      status: "in_progress",
+      job_id: String(interaction.id),
+      provider: GEMINI_MODEL,
     });
+  } catch (error) {
+    console.warn("Gemini start unavailable", error instanceof Error ? error.message : String(error));
+    return json({
+      error: "translation_temporarily_unavailable",
+      message: "خدمة الترجمة تحت ضغط مؤقت. ستتم إعادة المحاولة تلقائيًا.",
+    }, 503);
   }
-  return json({
-    status: "in_progress",
-    job_id: String(interaction.id),
-    provider: GEMINI_MODEL,
-  });
 }
 
 async function handleReviewChunk(body: any): Promise<Response> {
@@ -155,17 +186,18 @@ async function handlePoll(body: any): Promise<Response> {
   if (kind !== "translate" || !jobId) return json({ error: "poll_request_invalid" }, 400);
 
   const geminiKey = Deno.env.get("GEMINI_API_KEY");
-  if (!geminiKey) return json({ status: "failed", message: "Gemini fallback is not configured." });
+  if (!geminiKey) return json({ status: "failed", message: "تعذر استخدام المسار الاحتياطي حاليًا." });
 
   try {
     const interaction = await getGeminiInteraction(jobId, geminiKey);
     const status = String(interaction?.status || "completed");
-    if (status === "queued" || status === "in_progress") return json({ status: "in_progress", provider: GEMINI_MODEL });
+    if (status === "queued" || status === "in_progress") {
+      return json({ status: "in_progress", provider: GEMINI_MODEL, retry_after_ms: 4_000 });
+    }
     if (status !== "completed") {
-      // Deliberately return HTTP 200. The Android smart client discards this dead job and starts a new one.
       return json({
         status: status || "failed",
-        message: `Gemini interaction ended with status: ${status}`,
+        message: "تعذر إكمال المسار الاحتياطي. سيبدأ التطبيق محاولة جديدة تلقائيًا.",
         provider: GEMINI_MODEL,
       });
     }
@@ -175,9 +207,23 @@ async function handlePoll(body: any): Promise<Response> {
       metrics: { provider: GEMINI_MODEL },
     });
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.warn("Gemini poll temporary failure", message);
+
+    // 429/5xx/high-demand responses are temporary. Do NOT kill the saved job;
+    // the same interaction may become readable a few seconds later.
+    if (isTransientProviderError(message)) {
+      return json({
+        status: "in_progress",
+        provider: `${GEMINI_MODEL} • waiting`,
+        retry_after_ms: 8_000,
+        message: "الخدمة تحت ضغط مؤقت. تتم إعادة المحاولة تلقائيًا.",
+      });
+    }
+
     return json({
       status: "failed",
-      message: error instanceof Error ? error.message : String(error),
+      message: "تعذر إكمال المسار الاحتياطي. سيبدأ التطبيق محاولة جديدة تلقائيًا.",
       provider: GEMINI_MODEL,
     });
   }
@@ -234,6 +280,53 @@ async function translateAzure(segments: Segment[], key: string, region: string):
       output.push({ id: item.id, ar });
     });
   }
+  return output.sort((a, b) => a.id - b.id);
+}
+
+async function translateWithGroq(segments: Segment[], apiKey: string): Promise<Subtitle[]> {
+  const output: Subtitle[] = [];
+  const batches = makeBatches(segments, 70, 7_500);
+
+  for (const batch of batches) {
+    const prompt = `ترجم حوار الفيلم التركي التالي إلى العربية الفصحى الطبيعية المناسبة للترجمة السينمائية. حافظ على كل id مرة واحدة وبنفس الترتيب. لا تحذف ولا تدمج ولا تضف شرحًا. أعد JSON فقط بالشكل {"subtitles":[{"id":1,"ar":"..."}]}.\n\n${JSON.stringify(batch.map(({ id, tr }) => ({ id, tr })))}`;
+    const response = await timedFetch(GROQ_CHAT_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: GROQ_TRANSLATE_MODEL,
+        messages: [
+          { role: "system", content: "You are a professional Turkish-to-Arabic subtitle translator. Output valid JSON only." },
+          { role: "user", content: prompt },
+        ],
+        temperature: 0.1,
+        reasoning_effort: "low",
+        response_format: { type: "json_object" },
+        max_completion_tokens: 7000,
+      }),
+    }, 38_000, "groq_translate_timeout");
+    const text = await response.text();
+    if (!response.ok) throw new Error(`groq_translate_${response.status}:${text.slice(0, 600)}`);
+    const root = JSON.parse(text);
+    const content = root?.choices?.[0]?.message?.content;
+    if (typeof content !== "string" || !content.trim()) throw new Error("groq_translate_empty");
+    const parsed = JSON.parse(content);
+    const source = Array.isArray(parsed?.subtitles) ? parsed.subtitles : [];
+    const map = new Map<number, string>();
+    source.forEach((item: any) => {
+      const id = Number(item?.id);
+      const ar = cleanArabic(String(item?.ar || ""));
+      if (batch.some((s) => s.id === id) && ar) map.set(id, ar);
+    });
+    for (const item of batch) {
+      const ar = map.get(item.id);
+      if (!ar) throw new Error(`groq_translate_missing_${item.id}`);
+      output.push({ id: item.id, ar });
+    }
+  }
+
   return output.sort((a, b) => a.id - b.id);
 }
 
@@ -378,6 +471,25 @@ function makeBatches(segments: Segment[], maxItems: number, maxChars: number): S
   }
   if (current.length) output.push(current);
   return output;
+}
+
+function canUseGroqDirect(segments: Segment[]): boolean {
+  if (segments.length > GROQ_DIRECT_MAX_SEGMENTS) return false;
+  const chars = segments.reduce((sum, segment) => sum + segment.tr.length, 0);
+  return chars <= GROQ_DIRECT_MAX_CHARS;
+}
+
+function isTransientProviderError(message: string): boolean {
+  const lower = message.toLowerCase();
+  return lower.includes("gemini_poll_429") ||
+    lower.includes("gemini_poll_500") ||
+    lower.includes("gemini_poll_502") ||
+    lower.includes("gemini_poll_503") ||
+    lower.includes("gemini_poll_504") ||
+    lower.includes("high demand") ||
+    lower.includes("overload") ||
+    lower.includes("temporar") ||
+    lower.includes("timeout");
 }
 
 function subtitleSchema() {
