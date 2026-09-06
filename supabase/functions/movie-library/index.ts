@@ -65,17 +65,10 @@ async function upsertPath(deviceHash: string, body: any): Promise<Response> {
   const durationMs = Math.max(0, Math.round(Number(body?.duration_ms || 0)));
   if (!movieKey || !movieName || !videoUri) return json({ error: "movie_input_invalid" }, 400);
   const client = db();
-  const { data: existing, error: findError } = await client
-    .from("movie_translator_library")
-    .select("id")
-    .eq("device_hash", deviceHash)
-    .eq("movie_key", movieKey)
-    .maybeSingle();
+  const { data: existing, error: findError } = await client.from("movie_translator_library").select("id").eq("device_hash", deviceHash).eq("movie_key", movieKey).maybeSingle();
   if (findError) throw findError;
   const row = { device_hash: deviceHash, movie_key: movieKey, movie_name: movieName, video_uri: videoUri, duration_ms: durationMs, updated_at: new Date().toISOString() };
-  const op = existing
-    ? client.from("movie_translator_library").update(row).eq("id", existing.id)
-    : client.from("movie_translator_library").insert(row);
+  const op = existing ? client.from("movie_translator_library").update(row).eq("id", existing.id) : client.from("movie_translator_library").insert(row);
   const { error } = await op;
   if (error) throw error;
   return json({ ok: true });
@@ -91,27 +84,10 @@ async function saveTranslation(deviceHash: string, body: any): Promise<Response>
   const processingMs = Math.max(0, Math.round(Number(body?.processing_ms || 0)));
   if (!movieKey || !movieName || !srtText || srtText.length > 4_000_000) return json({ error: "translation_input_invalid" }, 400);
   const client = db();
-  const { data: existing, error: findError } = await client
-    .from("movie_translator_library")
-    .select("id")
-    .eq("device_hash", deviceHash)
-    .eq("movie_key", movieKey)
-    .maybeSingle();
+  const { data: existing, error: findError } = await client.from("movie_translator_library").select("id").eq("device_hash", deviceHash).eq("movie_key", movieKey).maybeSingle();
   if (findError) throw findError;
-  const row = {
-    device_hash: deviceHash,
-    movie_key: movieKey,
-    movie_name: movieName,
-    video_uri: videoUri || null,
-    duration_ms: durationMs,
-    srt_text: srtText,
-    cue_count: cueCount,
-    processing_ms: processingMs,
-    updated_at: new Date().toISOString(),
-  };
-  const op = existing
-    ? client.from("movie_translator_library").update(row).eq("id", existing.id)
-    : client.from("movie_translator_library").insert(row);
+  const row = { device_hash: deviceHash, movie_key: movieKey, movie_name: movieName, video_uri: videoUri || null, duration_ms: durationMs, srt_text: srtText, cue_count: cueCount, processing_ms: processingMs, updated_at: new Date().toISOString() };
+  const op = existing ? client.from("movie_translator_library").update(row).eq("id", existing.id) : client.from("movie_translator_library").insert(row);
   const { error } = await op;
   if (error) throw error;
   return json({ ok: true });
@@ -120,11 +96,9 @@ async function saveTranslation(deviceHash: string, body: any): Promise<Response>
 async function deleteTranslation(deviceHash: string, body: any): Promise<Response> {
   const movieKey = cleanKey(body?.movie_key);
   if (!movieKey) return json({ error: "movie_key_invalid" }, 400);
-  const { error } = await db()
-    .from("movie_translator_library")
+  const { error } = await db().from("movie_translator_library")
     .update({ srt_text: null, cue_count: 0, processing_ms: 0, updated_at: new Date().toISOString() })
-    .eq("device_hash", deviceHash)
-    .eq("movie_key", movieKey);
+    .eq("device_hash", deviceHash).eq("movie_key", movieKey);
   if (error) throw error;
   return json({ ok: true });
 }
@@ -135,11 +109,9 @@ async function recordUsage(deviceHash: string, body: any): Promise<Response> {
   const geminiSeconds = clampInt(body?.gemini_audio_seconds, 0, 86400);
   const geminiRequests = clampInt(body?.gemini_requests, 0, 1000);
   const client = db();
-  const { data: existing, error: findError } = await client
-    .from("movie_translator_usage")
+  const { data: existing, error: findError } = await client.from("movie_translator_usage")
     .select("usage_day,groq_audio_seconds,gemini_audio_seconds,gemini_requests")
-    .eq("device_hash", deviceHash)
-    .maybeSingle();
+    .eq("device_hash", deviceHash).maybeSingle();
   if (findError) throw findError;
   const sameDay = existing?.usage_day === today;
   const row = {
@@ -157,43 +129,29 @@ async function recordUsage(deviceHash: string, body: any): Promise<Response> {
 
 async function platformStatus(deviceHash: string): Promise<Response> {
   const today = new Date().toISOString().slice(0, 10);
-  const { data, error } = await db()
-    .from("movie_translator_usage")
+  const { data, error } = await db().from("movie_translator_usage")
     .select("usage_day,groq_audio_seconds,gemini_audio_seconds,gemini_requests")
-    .eq("device_hash", deviceHash)
-    .maybeSingle();
+    .eq("device_hash", deviceHash).maybeSingle();
   if (error) throw error;
+
   const sameDay = data?.usage_day === today;
   const groqUsed = sameDay ? Number(data?.groq_audio_seconds || 0) : 0;
   const geminiAudioUsed = sameDay ? Number(data?.gemini_audio_seconds || 0) : 0;
   const geminiRequestsUsed = sameDay ? Number(data?.gemini_requests || 0) : 0;
-
-  const GROQ_SOFT_SECONDS = 21600;
-  const GEMINI_SOFT_AUDIO_SECONDS = 21600;
-  const GEMINI_SOFT_REQUESTS = 100;
-  const groqRemaining = percentRemaining(groqUsed, GROQ_SOFT_SECONDS);
-  const geminiAudioRemaining = percentRemaining(geminiAudioUsed, GEMINI_SOFT_AUDIO_SECONDS);
-  const geminiReqRemaining = percentRemaining(geminiRequestsUsed, GEMINI_SOFT_REQUESTS);
   const resetAt = nextUtcMidnightMs();
+  const platforms: any[] = [];
 
-  return json({
-    platforms: [
-      {
-        id: "groq",
-        title: "Groq • Whisper Large V3",
-        remaining_percent: groqRemaining,
-        reset_at_ms: resetAt,
-        detail: "تقدير استخدام التطبيق اليوم • الحد الفعلي يعتمد على حساب Groq",
-      },
-      {
-        id: "gemini",
-        title: "Google Gemini",
-        remaining_percent: Math.min(geminiAudioRemaining, geminiReqRemaining),
-        reset_at_ms: resetAt,
-        detail: "ترجمة + مراجعة + احتياط صوتي • تقدير داخل التطبيق",
-      },
-    ],
-  });
+  if (Deno.env.get("GROQ_API_KEY")) {
+    platforms.push({ id: "groq", title: "Groq • Whisper", remaining_percent: percentRemaining(groqUsed, 21600), reset_at_ms: resetAt, detail: "Large V3 + Turbo fallback" });
+    platforms.push({ id: "groq_review", title: "Groq • Smart Review", remaining_percent: 100, reset_at_ms: resetAt, detail: "GPT-OSS 120B • مراجعة انتقائية فقط" });
+  }
+  if (Deno.env.get("AZURE_TRANSLATOR_KEY") && Deno.env.get("AZURE_TRANSLATOR_REGION")) {
+    platforms.push({ id: "azure", title: "Azure Translator", remaining_percent: 100, reset_at_ms: 0, detail: "مفعّل • الرصيد الفعلي يُدار من Azure" });
+  }
+  if (Deno.env.get("GEMINI_API_KEY")) {
+    platforms.push({ id: "gemini", title: "Google Gemini", remaining_percent: Math.min(percentRemaining(geminiAudioUsed, 21600), percentRemaining(geminiRequestsUsed, 100)), reset_at_ms: resetAt, detail: "احتياطي للترجمة عند تعذر Azure" });
+  }
+  return json({ platforms });
 }
 
 function cleanKey(value: unknown): string {
@@ -206,23 +164,15 @@ function clampInt(value: unknown, min: number, max: number): number {
   return Number.isFinite(n) ? Math.max(min, Math.min(max, n)) : min;
 }
 function percentRemaining(used: number, limit: number): number {
-  if (limit <= 0) return 100;
-  return Math.max(0, Math.min(100, Math.round((1 - used / limit) * 100)));
+  return limit <= 0 ? 100 : Math.max(0, Math.min(100, Math.round((1 - used / limit) * 100)));
 }
 function nextUtcMidnightMs(): number {
   const now = new Date();
   return Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1, 0, 0, 0, 0);
 }
 function json(body: unknown, status = 200) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { ...corsHeaders(), "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" },
-  });
+  return new Response(JSON.stringify(body), { status, headers: { ...corsHeaders(), "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store" } });
 }
 function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Headers": "authorization, apikey, content-type",
-    "Access-Control-Allow-Methods": "POST, OPTIONS",
-  };
+  return { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Headers": "authorization, apikey, content-type", "Access-Control-Allow-Methods": "POST, OPTIONS" };
 }
