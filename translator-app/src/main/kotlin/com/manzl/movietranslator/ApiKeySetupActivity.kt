@@ -1,6 +1,9 @@
 package com.manzl.movietranslator
 
+import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -51,6 +54,7 @@ class ApiKeySetupActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        requestTranslationNotificationsIfNeeded()
         val forceSettings = intent?.action == Intent.ACTION_APPLICATION_PREFERENCES
 
         setContent {
@@ -60,6 +64,14 @@ class ApiKeySetupActivity : ComponentActivity() {
                     onReady = ::openTranslator,
                 )
             }
+        }
+    }
+
+    private fun requestTranslationNotificationsIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 701)
         }
     }
 
@@ -94,8 +106,6 @@ private fun ApiKeySetupActivity.CloudKeyGate(
                 return@runCatching
             }
 
-            // Migration path from the previous app version: if keys are still in Android Keystore,
-            // upload them once to the private gateway and remove the local copies.
             if (store.isConfigured()) {
                 gateway.register(deviceHash, store.requireGroqKey(), store.requireGeminiKey())
                 store.clear()
