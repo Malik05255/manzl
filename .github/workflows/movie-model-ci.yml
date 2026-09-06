@@ -1,0 +1,27 @@
+name: Movie model pipeline CI
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - 'training/**'
+      - '.github/workflows/movie-model-ci.yml'
+  pull_request:
+    branches: [main, dev]
+    paths:
+      - 'training/**'
+      - '.github/workflows/movie-model-ci.yml'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+      - name: Compile training scripts
+        run: python -m py_compile training/*.py
+      - name: Run corpus preparation tests
+        working-directory: training
+        run: python -m unittest -v test_prepare_opensubtitles.py
