@@ -11,8 +11,9 @@ android {
         applicationId = "com.manzl.movietranslator"
         minSdk = 29
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0.0"
+        val ciRun = System.getenv("GITHUB_RUN_NUMBER")?.toIntOrNull()
+        versionCode = ciRun ?: 1
+        versionName = if (ciRun != null) "1.1.$ciRun" else "1.1.0"
 
         ndk {
             abiFilters += "arm64-v8a"
