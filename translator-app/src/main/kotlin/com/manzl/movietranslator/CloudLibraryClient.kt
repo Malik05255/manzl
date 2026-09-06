@@ -10,7 +10,7 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.security.MessageDigest
 
-internal data class CloudMovieItem(
+data class CloudMovieItem(
     val movieKey: String,
     val movieName: String,
     val videoUri: String?,
@@ -22,7 +22,7 @@ internal data class CloudMovieItem(
     val localAvailable: Boolean = false,
 )
 
-internal data class PlatformQuota(
+data class PlatformQuota(
     val id: String,
     val title: String,
     val remainingPercent: Int,
