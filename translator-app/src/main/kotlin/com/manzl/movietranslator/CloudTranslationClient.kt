@@ -45,6 +45,12 @@ private data class GeminiUploadedFile(
     val mimeType: String,
 )
 
+private class CloudHttpException(
+    val provider: String,
+    val statusCode: Int,
+    message: String,
+) : IllegalStateException(message)
+
 /**
  * Personal-app cloud client.
  *
@@ -128,7 +134,7 @@ internal class CloudTranslationClient(context: Context) {
             asrMs = asrMs,
             translationMs = translationMs,
             totalMs = System.currentTimeMillis() - totalStarted,
-            providers = asrResults.joinToString(" + ") { it.provider } + " → Gemini 3.8 Flash",
+            providers = asrResults.joinToString(" + ") { it.provider } + " → Gemini Flash",
         )
     }
 
@@ -217,7 +223,8 @@ internal class CloudTranslationClient(context: Context) {
                     ?: error("Gemini لم يُرجع رقم مهمة الاستماع.")
                 pollGeminiInteraction(id, apiKey, "الاستماع", onStage, 0.52f, 0.66f)
             }
-            return AsrResult(parseGeminiAsr(completed, part.offsetMs), "$GEMINI_MODEL-audio")
+            val usedModel = completed.optString("model").ifBlank { GEMINI_MODEL }
+            return AsrResult(parseGeminiAsr(completed, part.offsetMs), "$usedModel-audio")
         } finally {
             deleteGeminiFile(uploaded.name, apiKey)
         }
@@ -291,7 +298,7 @@ internal class CloudTranslationClient(context: Context) {
         return parseTranslation(completed)
     }
 
-    private fun createGeminiAsrInteraction(uploaded: GeminiUploadedFile, apiKey: String): JSONObject {
+    private suspend fun createGeminiAsrInteraction(uploaded: GeminiUploadedFile, apiKey: String): JSONObject {
         val schema = JSONObject()
             .put("type", "object")
             .put("properties", JSONObject().put(
@@ -337,7 +344,37 @@ internal class CloudTranslationClient(context: Context) {
         return createGeminiInteraction(body, apiKey)
     }
 
-    private fun createGeminiInteraction(body: JSONObject, apiKey: String): JSONObject {
+    /**
+     * Gemini occasionally returns 429/5xx/high-demand responses even for a valid key. Those are
+     * transient capacity failures, not user errors. Retry the strongest model once, then fail over
+     * to the next supported Flash models so a temporary hotspot does not throw away the whole job.
+     */
+    private suspend fun createGeminiInteraction(body: JSONObject, apiKey: String): JSONObject {
+        var lastTransient: CloudHttpException? = null
+
+        for ((modelIndex, model) in GEMINI_MODELS.withIndex()) {
+            val attempts = if (modelIndex == 0) 2 else 1
+            for (attempt in 0 until attempts) {
+                currentCoroutineContext().ensureActive()
+                val payload = JSONObject(body.toString()).put("model", model)
+                try {
+                    return createGeminiInteractionOnce(payload, apiKey)
+                } catch (error: CloudHttpException) {
+                    if (!isTransientGeminiError(error)) throw error
+                    lastTransient = error
+                    if (attempt + 1 < attempts) delay(1_200L)
+                }
+            }
+        }
+
+        val last = lastTransient
+        if (last != null && isCapacityMessage(last.message.orEmpty())) {
+            error("نماذج Gemini مزدحمة مؤقتًا. جرّب مرة أخرى بعد ثوانٍ؛ التطبيق سيبدّل بين النماذج تلقائيًا.")
+        }
+        throw last ?: IllegalStateException("تعذر بدء مهمة Gemini الآن.")
+    }
+
+    private fun createGeminiInteractionOnce(body: JSONObject, apiKey: String): JSONObject {
         val connection = open(GEMINI_INTERACTIONS_URL, 40_000).apply {
             requestMethod = "POST"
             doOutput = true
@@ -361,19 +398,26 @@ internal class CloudTranslationClient(context: Context) {
         fromProgress: Float,
         toProgress: Float,
     ): JSONObject {
-        repeat(MAX_POLL_ATTEMPTS) { attempt ->
+        for (attempt in 0 until MAX_POLL_ATTEMPTS) {
             currentCoroutineContext().ensureActive()
             val encodedId = URLEncoder.encode(id, Charsets.UTF_8.name()).replace("+", "%20")
-            val connection = open("$GEMINI_INTERACTIONS_URL/$encodedId", 25_000).apply {
-                setRequestProperty("x-goog-api-key", apiKey)
-                setRequestProperty("Api-Revision", API_REVISION)
-                setRequestProperty("Accept", "application/json")
-            }
             val root = try {
-                readJson(connection, "Gemini")
-            } finally {
-                connection.disconnect()
+                val connection = open("$GEMINI_INTERACTIONS_URL/$encodedId", 25_000).apply {
+                    setRequestProperty("x-goog-api-key", apiKey)
+                    setRequestProperty("Api-Revision", API_REVISION)
+                    setRequestProperty("Accept", "application/json")
+                }
+                try {
+                    readJson(connection, "Gemini")
+                } finally {
+                    connection.disconnect()
+                }
+            } catch (error: CloudHttpException) {
+                if (!isTransientGeminiError(error)) throw error
+                delay(1_000L)
+                continue
             }
+
             when (root.optString("status", "completed")) {
                 "completed" -> return root
                 "failed", "cancelled" -> error("فشلت مهمة Gemini في مرحلة $stageName.")
@@ -562,9 +606,30 @@ internal class CloudTranslationClient(context: Context) {
                 ?.takeIf { it.isNotBlank() }
                 ?: parsed?.optString("message")?.takeIf { it.isNotBlank() }
                 ?: parsed?.optString("error")?.takeIf { it.isNotBlank() }
-            error(serverMessage ?: "فشل اتصال $provider ($status).")
+            throw CloudHttpException(
+                provider = provider,
+                statusCode = status,
+                message = serverMessage ?: "فشل اتصال $provider ($status).",
+            )
         }
         return if (body.isBlank()) JSONObject() else JSONObject(body)
+    }
+
+    private fun isTransientGeminiError(error: CloudHttpException): Boolean =
+        error.provider == "Gemini" && (
+            error.statusCode == 408 ||
+                error.statusCode == 429 ||
+                error.statusCode in 500..504 ||
+                isCapacityMessage(error.message.orEmpty())
+            )
+
+    private fun isCapacityMessage(message: String): Boolean {
+        val normalized = message.lowercase()
+        return "high demand" in normalized ||
+            "overloaded" in normalized ||
+            "temporarily unavailable" in normalized ||
+            "try again later" in normalized ||
+            "resource exhausted" in normalized
     }
 
     private fun cleanTurkish(value: String): String =
@@ -582,6 +647,11 @@ internal class CloudTranslationClient(context: Context) {
         private const val GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
         private const val GROQ_MODEL = "whisper-large-v3"
         private const val GEMINI_MODEL = "gemini-3.8-flash"
+        private val GEMINI_MODELS = listOf(
+            "gemini-3.8-flash",
+            "gemini-3.7-flash",
+            "gemini-3.6-flash",
+        )
         private const val GEMINI_INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
         private const val GEMINI_UPLOAD_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files"
         private const val GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
