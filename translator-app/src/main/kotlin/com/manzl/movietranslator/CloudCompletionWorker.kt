@@ -5,7 +5,6 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
-import android.content.Intent
 import android.net.Uri
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
@@ -67,9 +66,10 @@ internal class CloudCompletionWorker(
         }
         val srtText = withContext(Dispatchers.IO) { output.readText(Charsets.UTF_8) }
         val elapsed = (System.currentTimeMillis() - advance.job.startedAtEpochMs).coerceAtLeast(0L)
+        val library = CloudLibraryClient(applicationContext)
 
         try {
-            CloudLibraryClient(applicationContext).saveTranslation(
+            library.saveTranslation(
                 movieKey = advance.job.movieKey,
                 movieName = advance.job.movieName,
                 videoUri = uri,
@@ -78,6 +78,7 @@ internal class CloudCompletionWorker(
                 cueCount = cloud.cues.size,
                 processingMs = elapsed,
             )
+            runCatching { library.recordUsage(advance.job.durationMs, cloud.providers) }
         } catch (error: Throwable) {
             val waiting = advance.job.copy(stage = "الترجمة جاهزة • بانتظار الشبكة لحفظها", progress = 0.98f)
             store.save(waiting)
