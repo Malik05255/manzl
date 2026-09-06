@@ -2,20 +2,16 @@ package com.manzl.movietranslator
 
 import android.content.Context
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.currentCoroutineContext
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedOutputStream
+import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.util.UUID
-import java.util.concurrent.atomic.AtomicLong
 
 internal data class CloudTranslationResult(
     val cues: List<SubtitleCue>,
@@ -25,76 +21,155 @@ internal data class CloudTranslationResult(
     val providers: String,
 )
 
-private data class RemoteSegment(
-    val id: Int,
-    val startMs: Long,
-    val endMs: Long,
-    val text: String,
+internal data class CloudSubmission(
+    val segments: List<StoredSegment>,
+    val pendingAsr: List<PendingAsr>,
+    val providers: List<String>,
 )
 
-private data class AsrResult(
-    val segments: List<RemoteSegment>,
-    val provider: String,
+internal data class CloudAdvance(
+    val job: BackgroundCloudJob,
+    val result: CloudTranslationResult? = null,
 )
+
+internal class CloudTransientException(message: String, cause: Throwable? = null) : IOException(message, cause)
 
 internal class CloudTranslationClient(context: Context) {
     private val deviceHash = CloudIdentity.deviceHash(context.applicationContext)
 
-    suspend fun translate(
+    suspend fun submitForBackground(
         parts: List<CloudAudioPart>,
         onUploadProgress: (Float) -> Unit = {},
-        onStage: (String, Float) -> Unit = { _, _ -> },
-    ): CloudTranslationResult = withContext(Dispatchers.IO) {
+    ): CloudSubmission = withContext(Dispatchers.IO) {
         require(parts.size in 1..2)
-        parts.forEach { require(it.file.isFile && it.file.length() > 0L) }
+        val totalBytes = parts.sumOf { it.file.length() }.coerceAtLeast(1L)
+        var completedBytes = 0L
+        val segments = mutableListOf<StoredSegment>()
+        val pending = mutableListOf<PendingAsr>()
+        val providers = mutableListOf<String>()
 
-        val totalStarted = System.currentTimeMillis()
-        val totalFileBytes = parts.sumOf { it.file.length() }.coerceAtLeast(1L)
-        val uploadedBytes = AtomicLong(0L)
+        parts.forEachIndexed { index, part ->
+            currentCoroutineContext().ensureActive()
+            require(part.file.isFile && part.file.length() > 0L)
+            val baseBytes = completedBytes
+            val submitted = submitPart(part, index) { partBytes ->
+                val overall = (baseBytes + partBytes).toDouble() / totalBytes.toDouble()
+                onUploadProgress(overall.toFloat().coerceIn(0f, 1f))
+            }
+            completedBytes += part.file.length()
+            onUploadProgress((completedBytes.toDouble() / totalBytes.toDouble()).toFloat().coerceIn(0f, 1f))
+            segments += submitted.segments
+            submitted.pending?.let(pending::add)
+            submitted.provider.takeIf { it.isNotBlank() }?.let(providers::add)
+        }
 
-        onStage("رفع الصوت للمنصة…", 0.15f)
-        val asrStarted = System.currentTimeMillis()
-        val asrResults = coroutineScope {
-            parts.mapIndexed { index, part ->
-                async(Dispatchers.IO) {
-                    transcribePart(
-                        part = part,
-                        index = index,
-                        totalFileBytes = totalFileBytes,
-                        uploadedBytes = uploadedBytes,
-                        onUploadProgress = onUploadProgress,
-                        onStage = onStage,
-                    )
+        CloudSubmission(segments, pending, providers.distinct())
+    }
+
+    suspend fun advance(job: BackgroundCloudJob): CloudAdvance = withContext(Dispatchers.IO) {
+        var current = job
+
+        if (current.pendingAsr.isNotEmpty()) {
+            val completedSegments = current.segments.toMutableList()
+            val remaining = mutableListOf<PendingAsr>()
+            val providers = current.providers.toMutableList()
+            for (pending in current.pendingAsr) {
+                currentCoroutineContext().ensureActive()
+                val root = postJson(
+                    JSONObject()
+                        .put("mode", "poll")
+                        .put("kind", "asr")
+                        .put("device_hash", deviceHash)
+                        .put("job_id", pending.jobId),
+                    25_000,
+                )
+                when (root.optString("status")) {
+                    "completed" -> {
+                        completedSegments += parseAsrSegments(root)
+                        parseProvider(root).takeIf { it.isNotBlank() }?.let(providers::add)
+                    }
+                    "failed", "cancelled" -> error(root.optString("message", "فشل التعرف على الحوار."))
+                    else -> remaining += pending
                 }
-            }.awaitAll()
+            }
+            val done = current.pendingAsr.size - remaining.size
+            val ratio = if (current.pendingAsr.isEmpty()) 1f else done.toFloat() / current.pendingAsr.size.toFloat()
+            current = current.copy(
+                segments = completedSegments,
+                pendingAsr = remaining,
+                providers = providers.distinct(),
+                stage = if (remaining.isEmpty()) "اكتمل فهم الحوار التركي" else "تحليل الحوار التركي على المنصة",
+                progress = if (remaining.isEmpty()) 0.62f else 0.46f + ratio * 0.14f,
+            )
+            if (remaining.isNotEmpty()) return@withContext CloudAdvance(current)
         }
-        val asrMs = System.currentTimeMillis() - asrStarted
 
-        val ordered = asrResults
-            .flatMap { it.segments }
-            .sortedBy { it.startMs }
-            .mapIndexed { index, segment -> segment.copy(id = index) }
-        check(ordered.isNotEmpty()) { "لم تتعرف السحابة على حوار تركي في هذا المقطع." }
-        onStage("تم التقاط الحوار التركي", 0.62f)
+        val ordered = normalizeSegments(current.segments)
+        check(ordered.isNotEmpty()) { "لم تتعرف المنصة على حوار تركي واضح." }
+        if (ordered != current.segments) current = current.copy(segments = ordered)
 
-        onStage("صياغة الترجمة العربية…", 0.64f)
-        val translationStarted = System.currentTimeMillis()
-        val firstPass = translateWholeTranscript(ordered, onStage)
-        val firstMap = firstPass.associate { it.first to it.second }
-        check(firstMap.size == ordered.size) {
-            "الترجمة السحابية لم تُرجع جميع أسطر الحوار (${firstMap.size}/${ordered.size})."
+        if (current.draft.isEmpty() && current.translationJobId == null) {
+            val started = startTranslation(ordered)
+            if (started.optString("status") == "completed") {
+                val draft = parseTranslation(started)
+                current = current.copy(draft = draft, stage = "اكتملت الترجمة الأولية", progress = 0.82f)
+            } else {
+                current = current.copy(
+                    translationJobId = started.getString("job_id"),
+                    stage = "صياغة الترجمة العربية",
+                    progress = 0.64f,
+                )
+                return@withContext CloudAdvance(current)
+            }
         }
-        onStage("اكتملت الترجمة الأولية", 0.82f)
 
-        onStage("مراجعة المعنى والدقة…", 0.84f)
-        val reviewed = runCatching {
-            reviewWholeTranslation(ordered, firstPass, onStage)
-        }.getOrNull()
-        val reviewedMap = reviewed?.associate { it.first to it.second }.orEmpty()
-        val finalMap = if (reviewedMap.size == ordered.size) reviewedMap else firstMap
-        onStage("اكتملت مراجعة الدقة", 0.95f)
-        val translationMs = System.currentTimeMillis() - translationStarted
+        if (current.translationJobId != null) {
+            val root = pollTranslation(current.translationJobId, "translate")
+            when (root.optString("status")) {
+                "completed" -> current = current.copy(
+                    translationJobId = null,
+                    draft = parseTranslation(root),
+                    stage = "اكتملت الترجمة الأولية",
+                    progress = 0.82f,
+                )
+                "failed", "cancelled" -> error(root.optString("message", "فشلت الترجمة السحابية."))
+                else -> return@withContext CloudAdvance(current.copy(stage = "صياغة الترجمة العربية", progress = 0.72f))
+            }
+        }
 
+        check(current.draft.size == ordered.size) {
+            "الترجمة لم تُرجع جميع الأسطر (${current.draft.size}/${ordered.size})."
+        }
+
+        if (current.reviewed.isEmpty() && current.reviewJobId == null) {
+            val started = startReview(ordered, current.draft)
+            if (started.optString("status") == "completed") {
+                current = current.copy(reviewed = parseTranslation(started), stage = "اكتملت مراجعة الدقة", progress = 0.95f)
+            } else {
+                current = current.copy(
+                    reviewJobId = started.getString("job_id"),
+                    stage = "مراجعة المعنى والدقة",
+                    progress = 0.84f,
+                )
+                return@withContext CloudAdvance(current)
+            }
+        }
+
+        if (current.reviewJobId != null) {
+            val root = pollTranslation(current.reviewJobId, "review")
+            when (root.optString("status")) {
+                "completed" -> current = current.copy(
+                    reviewJobId = null,
+                    reviewed = parseTranslation(root),
+                    stage = "اكتملت مراجعة الدقة",
+                    progress = 0.95f,
+                )
+                "failed", "cancelled" -> error(root.optString("message", "فشلت مراجعة الترجمة."))
+                else -> return@withContext CloudAdvance(current.copy(stage = "مراجعة المعنى والدقة", progress = 0.89f))
+            }
+        }
+
+        val finalMap = current.reviewed.takeIf { it.size == ordered.size } ?: current.draft
         val cues = ordered.map { segment ->
             SubtitleCue(
                 startMs = segment.startMs,
@@ -104,24 +179,26 @@ internal class CloudTranslationClient(context: Context) {
                 confidence = 1f,
             )
         }
-
-        CloudTranslationResult(
-            cues = cues,
-            asrMs = asrMs,
-            translationMs = translationMs,
-            totalMs = System.currentTimeMillis() - totalStarted,
-            providers = asrResults.joinToString(" + ") { it.provider } + " → Gemini + مراجعة دقة",
+        val totalMs = (System.currentTimeMillis() - current.startedAtEpochMs).coerceAtLeast(0L)
+        CloudAdvance(
+            current.copy(stage = "حفظ الترجمة", progress = 0.97f),
+            CloudTranslationResult(
+                cues = cues,
+                asrMs = 0L,
+                translationMs = 0L,
+                totalMs = totalMs,
+                providers = current.providers.joinToString(" + ").ifBlank { "Whisper + Gemini" } + " → مراجعة دقة",
+            )
         )
     }
 
-    private suspend fun transcribePart(
-        part: CloudAudioPart,
-        index: Int,
-        totalFileBytes: Long,
-        uploadedBytes: AtomicLong,
-        onUploadProgress: (Float) -> Unit,
-        onStage: (String, Float) -> Unit,
-    ): AsrResult {
+    private data class PartSubmission(
+        val segments: List<StoredSegment>,
+        val pending: PendingAsr?,
+        val provider: String,
+    )
+
+    private fun submitPart(part: CloudAudioPart, index: Int, onBytes: (Long) -> Unit): PartSubmission {
         val boundary = "----Manzl${UUID.randomUUID()}"
         val provider = if (index == 0) "groq" else "gemini"
         val connection = openConnection(135_000).apply {
@@ -130,18 +207,14 @@ internal class CloudTranslationClient(context: Context) {
             setChunkedStreamingMode(256 * 1024)
             setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
         }
-
         try {
             connection.outputStream.use { raw ->
                 val output = BufferedOutputStream(raw, 256 * 1024)
                 fun text(value: String) = output.write(value.toByteArray(Charsets.UTF_8))
                 fun field(name: String, value: String) {
                     text("--$boundary\r\n")
-                    text("Content-Disposition: form-data; name=\"$name\"\r\n\r\n")
-                    text(value)
-                    text("\r\n")
+                    text("Content-Disposition: form-data; name=\"$name\"\r\n\r\n$value\r\n")
                 }
-
                 field("mode", "asr")
                 field("device_hash", deviceHash)
                 field("provider", provider)
@@ -150,170 +223,109 @@ internal class CloudTranslationClient(context: Context) {
                 text("--$boundary\r\n")
                 text("Content-Disposition: form-data; name=\"audio\"; filename=\"part_${index + 1}.ogg\"\r\n")
                 text("Content-Type: audio/ogg\r\n\r\n")
+                var sent = 0L
                 part.file.inputStream().buffered(256 * 1024).use { input ->
                     val buffer = ByteArray(256 * 1024)
                     while (true) {
-                        currentCoroutineContext().ensureActive()
                         val read = input.read(buffer)
                         if (read <= 0) break
                         output.write(buffer, 0, read)
-                        val now = uploadedBytes.addAndGet(read.toLong())
-                        onUploadProgress(
-                            (now.toDouble() / totalFileBytes.toDouble()).toFloat().coerceIn(0f, 1f)
-                        )
+                        sent += read
+                        onBytes(sent)
                     }
                 }
                 text("\r\n--$boundary--\r\n")
                 output.flush()
             }
-
             val root = readJson(connection)
-            if (root.optString("status", "completed") == "in_progress") {
-                val jobId = root.getString("job_id")
-                onStage("تحليل الحوار التركي…", 0.46f)
-                return pollAsr(jobId, onStage)
+            val parsedProvider = parseProvider(root).ifBlank { provider }
+            return if (root.optString("status", "completed") == "in_progress") {
+                PartSubmission(
+                    segments = emptyList(),
+                    pending = PendingAsr(root.getString("job_id"), parsedProvider),
+                    provider = parsedProvider,
+                )
+            } else {
+                PartSubmission(parseAsrSegments(root), null, parsedProvider)
             }
-            return parseAsr(root)
+        } catch (error: IOException) {
+            throw CloudTransientException("تعذر الاتصال بالشبكة أثناء رفع الصوت.", error)
         } finally {
             connection.disconnect()
         }
     }
 
-    private suspend fun pollAsr(jobId: String, onStage: (String, Float) -> Unit): AsrResult {
-        repeat(MAX_POLL_ATTEMPTS) {
-            currentCoroutineContext().ensureActive()
-            val root = postJson(
-                JSONObject()
-                    .put("mode", "poll")
-                    .put("kind", "asr")
-                    .put("device_hash", deviceHash)
-                    .put("job_id", jobId),
-                timeoutMs = 25_000,
-            )
-            when (root.optString("status")) {
-                "completed" -> return parseAsr(root)
-                "failed", "cancelled" -> error(root.optString("message", "فشل التعرف السحابي على الحوار."))
-            }
-            onStage("تحليل الحوار التركي…", 0.46f)
-            delay(POLL_DELAY_MS)
+    private fun startTranslation(segments: List<StoredSegment>): JSONObject {
+        val array = JSONArray()
+        segments.forEach { s ->
+            array.put(JSONObject().put("id", s.id).put("start_ms", s.startMs).put("end_ms", s.endMs).put("tr", s.text))
         }
-        error("استغرقت مرحلة التعرف على الحوار وقتًا أطول من المتوقع.")
-    }
-
-    private fun parseAsr(root: JSONObject): AsrResult {
-        val array = root.optJSONArray("segments") ?: JSONArray()
-        val segments = ArrayList<RemoteSegment>(array.length())
-        for (i in 0 until array.length()) {
-            val item = array.getJSONObject(i)
-            val text = item.optString("tr").trim()
-            if (text.isBlank()) continue
-            segments += RemoteSegment(
-                id = item.optInt("id", 0),
-                startMs = item.getLong("start_ms"),
-                endMs = item.getLong("end_ms"),
-                text = text,
-            )
-        }
-        check(segments.isNotEmpty()) { "لم تتعرف السحابة على كلام تركي واضح." }
-        val provider = root.optJSONObject("metrics")?.optString("provider")
-            ?.takeIf { it.isNotBlank() }
-            ?: root.optString("provider", "Cloud ASR")
-        return AsrResult(segments.sortedBy { it.startMs }, provider)
-    }
-
-    private suspend fun translateWholeTranscript(
-        segments: List<RemoteSegment>,
-        onStage: (String, Float) -> Unit,
-    ): List<Pair<Int, String>> {
-        val segmentArray = JSONArray()
-        segments.forEach { segment ->
-            segmentArray.put(
-                JSONObject()
-                    .put("id", segment.id)
-                    .put("start_ms", segment.startMs)
-                    .put("end_ms", segment.endMs)
-                    .put("tr", segment.text)
-            )
-        }
-        val started = postJson(
-            JSONObject()
-                .put("mode", "translate_start")
-                .put("device_hash", deviceHash)
-                .put("segments", segmentArray),
-            timeoutMs = 40_000,
+        return postJson(
+            JSONObject().put("mode", "translate_start").put("device_hash", deviceHash).put("segments", array),
+            40_000,
         )
-        if (started.optString("status") == "completed") return parseTranslation(started)
-        val jobId = started.getString("job_id")
-        return pollTranslationJob(jobId, "translate", "صياغة الترجمة العربية…", 0.64f, onStage)
     }
 
-    private suspend fun reviewWholeTranslation(
-        segments: List<RemoteSegment>,
-        draft: List<Pair<Int, String>>,
-        onStage: (String, Float) -> Unit,
-    ): List<Pair<Int, String>> {
-        val segmentArray = JSONArray()
-        segments.forEach { segment ->
-            segmentArray.put(
-                JSONObject()
-                    .put("id", segment.id)
-                    .put("start_ms", segment.startMs)
-                    .put("end_ms", segment.endMs)
-                    .put("tr", segment.text)
-            )
+    private fun startReview(segments: List<StoredSegment>, draft: Map<Int, String>): JSONObject {
+        val source = JSONArray()
+        segments.forEach { s ->
+            source.put(JSONObject().put("id", s.id).put("start_ms", s.startMs).put("end_ms", s.endMs).put("tr", s.text))
         }
         val draftArray = JSONArray()
-        draft.forEach { (id, ar) -> draftArray.put(JSONObject().put("id", id).put("ar", ar)) }
-        val started = postJson(
+        draft.toSortedMap().forEach { (id, ar) -> draftArray.put(JSONObject().put("id", id).put("ar", ar)) }
+        return postJson(
             JSONObject()
                 .put("mode", "review_start")
                 .put("device_hash", deviceHash)
-                .put("segments", segmentArray)
+                .put("segments", source)
                 .put("draft", draftArray),
-            timeoutMs = 40_000,
+            40_000,
         )
-        if (started.optString("status") == "completed") return parseTranslation(started)
-        val jobId = started.getString("job_id")
-        return pollTranslationJob(jobId, "review", "مراجعة المعنى والدقة…", 0.84f, onStage)
     }
 
-    private suspend fun pollTranslationJob(
-        jobId: String,
-        kind: String,
-        stage: String,
-        progress: Float,
-        onStage: (String, Float) -> Unit,
-    ): List<Pair<Int, String>> {
-        repeat(MAX_POLL_ATTEMPTS) {
-            currentCoroutineContext().ensureActive()
-            val root = postJson(
-                JSONObject()
-                    .put("mode", "poll")
-                    .put("kind", kind)
-                    .put("device_hash", deviceHash)
-                    .put("job_id", jobId),
-                timeoutMs = 25_000,
-            )
-            when (root.optString("status")) {
-                "completed" -> return parseTranslation(root)
-                "failed", "cancelled" -> error(root.optString("message", "فشلت مرحلة الترجمة السحابية."))
-            }
-            onStage(stage, progress)
-            delay(POLL_DELAY_MS)
-        }
-        error("استغرقت مرحلة الترجمة وقتًا أطول من المتوقع.")
-    }
+    private fun pollTranslation(jobId: String, kind: String): JSONObject = postJson(
+        JSONObject().put("mode", "poll").put("kind", kind).put("device_hash", deviceHash).put("job_id", jobId),
+        25_000,
+    )
 
-    private fun parseTranslation(root: JSONObject): List<Pair<Int, String>> {
-        val array = root.optJSONArray("subtitles") ?: JSONArray()
+    private fun parseAsrSegments(root: JSONObject): List<StoredSegment> {
+        val array = root.optJSONArray("segments") ?: JSONArray()
         return buildList {
             for (i in 0 until array.length()) {
                 val item = array.getJSONObject(i)
-                val arabic = item.optString("ar").trim()
-                if (arabic.isNotBlank()) add(item.getInt("id") to arabic)
+                val text = item.optString("tr").trim()
+                if (text.isBlank()) continue
+                add(
+                    StoredSegment(
+                        id = item.optInt("id", i),
+                        startMs = item.optLong("start_ms"),
+                        endMs = item.optLong("end_ms"),
+                        text = text,
+                    )
+                )
             }
         }
     }
+
+    private fun parseTranslation(root: JSONObject): Map<Int, String> {
+        val array = root.optJSONArray("subtitles") ?: JSONArray()
+        return buildMap {
+            for (i in 0 until array.length()) {
+                val item = array.getJSONObject(i)
+                val text = item.optString("ar").trim()
+                if (text.isNotBlank()) put(item.getInt("id"), text)
+            }
+        }
+    }
+
+    private fun parseProvider(root: JSONObject): String =
+        root.optJSONObject("metrics")?.optString("provider")?.takeIf { it.isNotBlank() }
+            ?: root.optString("provider", "")
+
+    private fun normalizeSegments(source: List<StoredSegment>): List<StoredSegment> = source
+        .filter { it.text.isNotBlank() && it.endMs > it.startMs }
+        .sortedBy { it.startMs }
+        .mapIndexed { index, s -> s.copy(id = index) }
 
     private fun postJson(payload: JSONObject, timeoutMs: Int): JSONObject {
         val connection = openConnection(timeoutMs).apply {
@@ -321,9 +333,11 @@ internal class CloudTranslationClient(context: Context) {
             doOutput = true
             setRequestProperty("Content-Type", "application/json; charset=utf-8")
         }
-        return try {
+        try {
             connection.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
-            readJson(connection)
+            return readJson(connection)
+        } catch (error: IOException) {
+            throw CloudTransientException("الاتصال بالمنصة متوقف مؤقتًا.", error)
         } finally {
             connection.disconnect()
         }
@@ -342,21 +356,20 @@ internal class CloudTranslationClient(context: Context) {
         val status = connection.responseCode
         val body = (if (status in 200..299) connection.inputStream else connection.errorStream)
             ?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+        val root = runCatching { JSONObject(body) }.getOrElse { JSONObject() }
         if (status !in 200..299) {
-            val parsed = runCatching { JSONObject(body) }.getOrNull()
-            val message = parsed?.optString("message")?.takeIf { it.isNotBlank() }
-                ?: parsed?.optString("error")?.takeIf { it.isNotBlank() }
-                ?: "فشل الاتصال بخدمة الترجمة السحابية ($status)."
+            val message = root.optString("message").takeIf { it.isNotBlank() }
+                ?: root.optString("error").takeIf { it.isNotBlank() }
+                ?: "فشل الاتصال بخدمة الترجمة ($status)."
+            if (status == 408 || status == 429 || status >= 500) throw CloudTransientException(message)
             error(message)
         }
-        return JSONObject(body)
+        return root
     }
 
     companion object {
         internal const val ENDPOINT = "https://lbgcjmsqqhrpceijdqng.supabase.co/functions/v1/movie-translate"
         internal const val PUBLISHABLE_KEY = "sb_publishable_TllPSeKhRJx_IegHMxkZmA_Q9FLBUR_"
         internal const val ANON_JWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxiZ2NqbXNxcWhycGNlaWpkcW5nIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgyMDM1MDEsImV4cCI6MjEwMzc3OTUwMX0.sl2j-iBmb_swQlZ-qlTZ5c5nDIXrO2w6tRHYeNAoF5o"
-        private const val POLL_DELAY_MS = 2_000L
-        private const val MAX_POLL_ATTEMPTS = 450
     }
 }

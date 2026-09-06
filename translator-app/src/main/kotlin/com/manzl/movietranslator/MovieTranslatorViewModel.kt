@@ -9,6 +9,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import java.io.File
 
@@ -44,8 +45,19 @@ class MovieTranslatorViewModel(application: Application) : AndroidViewModel(appl
     val cloudUiError: StateFlow<String?> = _cloudUiError.asStateFlow()
 
     init {
+        CloudMovieTranslationService.restorePending(application.applicationContext)
         refreshLibrary()
         refreshPlatforms()
+        viewModelScope.launch {
+            var lastCompletedMovie = ""
+            uiState.collectLatest { state ->
+                if (!state.isRunning && state.progress >= 1f && state.movieKey.isNotBlank() && state.movieKey != lastCompletedMovie) {
+                    lastCompletedMovie = state.movieKey
+                    refreshLibrary()
+                    refreshPlatforms()
+                }
+            }
+        }
     }
 
     fun selectVideo(uri: Uri, displayName: String) {
@@ -88,13 +100,8 @@ class MovieTranslatorViewModel(application: Application) : AndroidViewModel(appl
         }
     }
 
-    fun start() {
-        CloudMovieTranslationService.start(getApplication())
-    }
-
-    fun cancel() {
-        CloudMovieTranslationService.cancel(getApplication())
-    }
+    fun start() = CloudMovieTranslationService.start(getApplication())
+    fun cancel() = CloudMovieTranslationService.cancel(getApplication())
 
     fun refreshLibrary() {
         viewModelScope.launch {
