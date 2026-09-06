@@ -26,11 +26,11 @@ class TranslationResilienceTest {
     }
 
     @Test
-    fun qualityGate_rejectsExplanatoryPreface() {
+    fun qualityGate_rejectsStructurallyEmptyArabicForLongSource() {
         assertTrue(
             TurkishArabicTranslator.translationNeedsRepairForTest(
-                source = "Benden bunu isteme.",
-                arabic = "بالطبع، لا تطلب مني ذلك.",
+                source = "Bunu neden yaptığını gerçekten anlamıyorum.",
+                arabic = "لا",
             )
         )
     }

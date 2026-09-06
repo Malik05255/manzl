@@ -27,16 +27,19 @@ class TurkishArabicTranslatorTest {
     }
 
     @Test
-    fun contextPlanner_preservesTimelineOrder() {
+    fun sentencePlanner_preservesSemanticTimelineOrder() {
         val cues = listOf(
             SubtitleCue(0, 900, "Seni"),
             SubtitleCue(950, 1_700, "burada beklemiyordum."),
             SubtitleCue(2_000, 2_900, "Neden geldin?"),
         )
 
-        val flattened = TurkishArabicTranslator.buildContextGroupsForTest(cues).flatten()
-        assertEquals(cues.map { it.startMs }, flattened.map { it.startMs })
-        assertEquals(cues.map { it.endMs }, flattened.map { it.endMs })
-        assertEquals(cues.map { it.sourceText }, flattened.map { it.sourceText })
+        val segments = TurkishArabicTranslator.buildSourceSegmentsForTest(cues)
+        assertEquals(2, segments.size)
+        assertEquals(0L, segments[0].startMs)
+        assertEquals(1_700L, segments[0].endMs)
+        assertEquals("Seni burada beklemiyordum.", segments[0].sourceText)
+        assertEquals(2_000L, segments[1].startMs)
+        assertEquals(2_900L, segments[1].endMs)
     }
 }
