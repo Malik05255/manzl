@@ -31,10 +31,10 @@ internal class CloudCompletionWorker(
         val advance = try {
             CloudTranslationClient(applicationContext).advance(job)
         } catch (transient: CloudTransientException) {
-            val waiting = job.copy(stage = "بانتظار الشبكة… سيتم الاستكمال تلقائيًا")
+            val waiting = job.copy(stage = CloudConnectivity.retryMessage(applicationContext, transient))
             store.save(waiting)
             CloudMovieTranslationService.updateBackgroundProgress(applicationContext, waiting)
-            schedule(applicationContext, 2_000L)
+            schedule(applicationContext, 3_000L)
             return Result.success()
         } catch (error: Throwable) {
             CloudMovieTranslationService.failBackground(
@@ -80,10 +80,15 @@ internal class CloudCompletionWorker(
             )
             runCatching { library.recordUsage(advance.job.durationMs, cloud.providers) }
         } catch (error: Throwable) {
-            val waiting = advance.job.copy(stage = "الترجمة جاهزة • بانتظار الشبكة لحفظها", progress = 0.98f)
+            val stage = if (CloudConnectivity.isOnline(applicationContext)) {
+                "الترجمة جاهزة • تعذر حفظها في المكتبة، تتم إعادة المحاولة تلقائيًا"
+            } else {
+                "الترجمة جاهزة • سنحفظها تلقائيًا عند عودة الإنترنت"
+            }
+            val waiting = advance.job.copy(stage = stage, progress = 0.98f)
             store.save(waiting)
             CloudMovieTranslationService.updateBackgroundProgress(applicationContext, waiting)
-            schedule(applicationContext, 3_000L)
+            schedule(applicationContext, 4_000L)
             return Result.success()
         }
 
