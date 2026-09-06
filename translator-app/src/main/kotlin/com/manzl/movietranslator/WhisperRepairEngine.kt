@@ -14,22 +14,21 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.util.Locale
 
 /**
- * Primary Turkish speech recognizer. Every Silero-confirmed speech window is transcribed; there is
- * no fast ASR gate allowed to discard dialogue before Whisper sees it.
+ * Two-pass Turkish ASR optimized for phone latency.
  *
- * Whisper's encoder has a substantial fixed cost per call. Silero can produce many short windows in
- * movie dialogue, so nearby windows are coalesced into timeline-preserving chunks before inference.
- * This keeps the accurate Small model while avoiding dozens of expensive Whisper invocations for a
- * short clip.
+ * Pass 1 transcribes every Silero-confirmed batch with quantized Whisper Base. Only suspicious
+ * batches are re-run with Whisper Small, capped to a small fraction of the clip. This keeps Base
+ * speed for most dialogue while spending Small compute where it can actually improve accuracy.
  */
 class WhisperRepairEngine(private val context: Context) {
     suspend fun prepareModel(): Boolean = runCatching {
-        WhisperModelManager(context).ensureModel()
+        WhisperModelManager(context).ensurePrimaryModel()
     }.isSuccess
 
-    fun isModelInstalled(): Boolean = WhisperModelManager(context).isInstalled()
+    fun isModelInstalled(): Boolean = WhisperModelManager(context).isPrimaryInstalled()
 
     suspend fun transcribeAll(
         windows: List<SpeechWindow>,
@@ -39,53 +38,105 @@ class WhisperRepairEngine(private val context: Context) {
 
         val original = windows.sortedBy { it.startMs }
         val ordered = coalesceSpeechWindows(original, context.cacheDir)
-        val modelFile = WhisperModelManager(context).ensureModel()
-        val model = Whisper.loadModel(context, modelFile.absolutePath)
-        val raw = mutableListOf<SubtitleCue>()
+        val manager = WhisperModelManager(context)
+        val primaryFile = manager.ensurePrimaryModel()
+        val primary = Whisper.loadModel(context, primaryFile.absolutePath)
         val threads = whisperThreadCount(Runtime.getRuntime().availableProcessors())
+        val batches = ArrayList<WhisperBatchResult>(ordered.size)
 
         try {
             ordered.forEachIndexed { index, window ->
                 currentCoroutineContext().ensureActive()
-                val result = runCatching {
-                    Whisper.transcribe(
-                        model,
-                        window.wavFile.absolutePath,
-                        WhisperConfig(
-                            language = "tr",
-                            threads = threads,
-                        ),
-                    )
-                }.getOrElse { error ->
-                    throw IllegalStateException(
-                        "تعذر الاستماع إلى مقطع حوار عند ${formatTime(window.startMs)}.",
-                        error,
-                    )
-                }
-
-                result.segments.orEmpty().forEach { segment ->
-                    val text = cleanTurkishTranscript(segment.text)
-                    if (text.isNotBlank()) {
-                        val start = (window.startMs + segment.startMs)
-                            .coerceIn(window.startMs, window.endMs)
-                        val end = (window.startMs + segment.endMs)
-                            .coerceIn(start + 250L, window.endMs.coerceAtLeast(start + 250L))
-                        raw += SubtitleCue(
-                            startMs = start,
-                            endMs = end,
-                            sourceText = text,
-                            confidence = 0.99f,
-                        )
-                    }
-                }
-                window.wavFile.delete()
+                val cues = transcribeWindow(primary, window, threads)
+                val suspicion = whisperBatchSuspicion(window.endMs - window.startMs, cues)
+                batches += WhisperBatchResult(window, cues, suspicion)
                 onProgress(index + 1, ordered.size)
             }
-            normalizeWhisperTimeline(raw)
+        } finally {
+            Whisper.releaseModel(primary)
+        }
+
+        val repairCandidates = batches
+            .filter { it.suspicion >= REPAIR_SUSPICION_THRESHOLD }
+            .sortedByDescending { it.suspicion }
+            .take(maxRepairBatches(batches.size))
+
+        if (repairCandidates.isNotEmpty()) {
+            // Small is optional and never allowed to make the whole movie fail. If the model cannot
+            // be downloaded, Base output remains usable and translation proceeds.
+            val repairFile = runCatching { manager.ensureRepairModel() }.getOrNull()
+            if (repairFile != null) {
+                val repairModel = runCatching {
+                    Whisper.loadModel(context, repairFile.absolutePath)
+                }.getOrNull()
+                if (repairModel != null) {
+                    try {
+                        repairCandidates.forEach { batch ->
+                            currentCoroutineContext().ensureActive()
+                            val repaired = runCatching {
+                                transcribeWindow(repairModel, batch.window, threads)
+                            }.getOrDefault(emptyList())
+                            val repairedSuspicion = whisperBatchSuspicion(
+                                batch.window.endMs - batch.window.startMs,
+                                repaired,
+                            )
+                            if (
+                                repaired.isNotEmpty() &&
+                                (batch.cues.isEmpty() || repairedSuspicion + REPAIR_ACCEPT_MARGIN < batch.suspicion)
+                            ) {
+                                batch.cues = repaired
+                                batch.suspicion = repairedSuspicion
+                            }
+                        }
+                    } finally {
+                        Whisper.releaseModel(repairModel)
+                    }
+                }
+            }
+        }
+
+        try {
+            normalizeWhisperTimeline(batches.flatMap { it.cues })
         } finally {
             ordered.forEach { it.wavFile.delete() }
             original.forEach { it.wavFile.delete() }
-            Whisper.releaseModel(model)
+        }
+    }
+
+    private fun transcribeWindow(
+        model: Long,
+        window: SpeechWindow,
+        threads: Int,
+    ): List<SubtitleCue> {
+        val result = runCatching {
+            Whisper.transcribe(
+                model,
+                window.wavFile.absolutePath,
+                WhisperConfig(
+                    language = "tr",
+                    threads = threads,
+                ),
+            )
+        }.getOrElse { error ->
+            throw IllegalStateException(
+                "تعذر الاستماع إلى مقطع حوار عند ${formatTime(window.startMs)}.",
+                error,
+            )
+        }
+
+        return result.segments.orEmpty().mapNotNull { segment ->
+            val text = cleanTurkishTranscript(segment.text)
+            if (text.isBlank()) return@mapNotNull null
+            val start = (window.startMs + segment.startMs)
+                .coerceIn(window.startMs, window.endMs)
+            val end = (window.startMs + segment.endMs)
+                .coerceIn(start + 250L, window.endMs.coerceAtLeast(start + 250L))
+            SubtitleCue(
+                startMs = start,
+                endMs = end,
+                sourceText = text,
+                confidence = 0.99f,
+            )
         }
     }
 
@@ -116,13 +167,71 @@ class WhisperRepairEngine(private val context: Context) {
     }
 
     private fun normalizeText(text: String): String = text
-        .lowercase()
+        .lowercase(Locale.forLanguageTag("tr"))
         .replace(Regex("[^\\p{L}\\p{N}]+"), "")
 
     private fun formatTime(ms: Long): String {
         val seconds = ms.coerceAtLeast(0L) / 1_000L
         return "%02d:%02d".format(seconds / 60L, seconds % 60L)
     }
+
+    private data class WhisperBatchResult(
+        val window: SpeechWindow,
+        var cues: List<SubtitleCue>,
+        var suspicion: Float,
+    )
+
+    companion object {
+        private const val REPAIR_SUSPICION_THRESHOLD = 2.5f
+        private const val REPAIR_ACCEPT_MARGIN = 0.35f
+
+        internal fun maxRepairBatches(batchCount: Int): Int {
+            if (batchCount <= 0) return 0
+            return ((batchCount + 2) / 3).coerceIn(1, 4)
+        }
+    }
+}
+
+/**
+ * Higher means the Base result deserves Small repair. The heuristic intentionally catches missing
+ * dialogue and obvious looping without pretending to estimate linguistic correctness.
+ */
+internal fun whisperBatchSuspicion(
+    windowDurationMs: Long,
+    cues: List<SubtitleCue>,
+): Float {
+    if (cues.isEmpty()) return 10f
+
+    val text = cues.joinToString(" ") { it.sourceText.trim() }.trim()
+    val letters = text.count { it.isLetter() }
+    val durationSeconds = (windowDurationMs.coerceAtLeast(1L) / 1_000f).coerceAtLeast(0.5f)
+    val words = text
+        .lowercase(Locale.forLanguageTag("tr"))
+        .split(Regex("[^\\p{L}\\p{N}]+"))
+        .filter { it.isNotBlank() }
+
+    var score = 0f
+    val lettersPerSecond = letters.toFloat() / durationSeconds
+    if (lettersPerSecond < 1.4f) score += 3.0f
+    else if (lettersPerSecond < 2.2f) score += 1.5f
+
+    if (words.size >= 6) {
+        val uniqueRatio = words.toSet().size.toFloat() / words.size.toFloat()
+        if (uniqueRatio < 0.42f) score += 2.5f
+        else if (uniqueRatio < 0.58f) score += 1.0f
+    }
+
+    if (cues.size >= 3) {
+        val normalized = cues.map { cue ->
+            cue.sourceText.lowercase(Locale.forLanguageTag("tr"))
+                .replace(Regex("[^\\p{L}\\p{N}]+"), "")
+        }
+        val distinctRatio = normalized.toSet().size.toFloat() / normalized.size.toFloat()
+        if (distinctRatio <= 0.5f) score += 2.0f
+    }
+
+    if (letters < 5 && windowDurationMs > 2_000L) score += 2.0f
+    return score
 }
 
 internal fun planWhisperBatches(windows: List<SpeechWindow>): List<List<SpeechWindow>> {
@@ -245,55 +354,61 @@ private const val MAX_WHISPER_BATCH_GAP_MS = 2_500L
 private const val MAX_WHISPER_BATCH_SPAN_MS = 28_000L
 
 private class WhisperModelManager(private val context: Context) {
+    private data class ModelSpec(
+        val name: String,
+        val url: String,
+        val expectedBytes: Long,
+        val minBytes: Long,
+    )
+
     companion object {
-        // Keep Small Q5_1 for Turkish accuracy. Performance is recovered by batching nearby speech
-        // into near-Whisper-native windows instead of invoking the encoder for every short VAD cut.
-        private const val MODEL_NAME = "ggml-small-q5_1.bin"
-        private const val MODEL_URL =
-            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin?download=true"
-        private val LEGACY_MODELS = listOf("ggml-base.bin", "ggml-base-q5_1.bin")
-        private const val MIN_VALID_BYTES = 170L * 1024L * 1024L
-        private const val REQUIRED_FREE_BYTES = 260L * 1024L * 1024L
+        private val PRIMARY = ModelSpec(
+            name = "ggml-base-q5_1.bin",
+            url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base-q5_1.bin?download=true",
+            expectedBytes = 60_000_000L,
+            minBytes = 54L * 1024L * 1024L,
+        )
+        private val REPAIR = ModelSpec(
+            name = "ggml-small-q5_1.bin",
+            url = "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small-q5_1.bin?download=true",
+            expectedBytes = 190_000_000L,
+            minBytes = 170L * 1024L * 1024L,
+        )
+        private const val DOWNLOAD_HEADROOM_BYTES = 40L * 1024L * 1024L
     }
 
-    fun isInstalled(): Boolean {
-        val model = File(File(context.filesDir, "models"), MODEL_NAME)
-        return model.isFile && model.length() >= MIN_VALID_BYTES
+    fun isPrimaryInstalled(): Boolean = installed(PRIMARY)
+
+    suspend fun ensurePrimaryModel(): File = ensure(PRIMARY)
+
+    suspend fun ensureRepairModel(): File = ensure(REPAIR)
+
+    private fun installed(spec: ModelSpec): Boolean {
+        val model = File(File(context.filesDir, "models"), spec.name)
+        return model.isFile && model.length() >= spec.minBytes
     }
 
-    suspend fun ensureModel(): File = withContext(Dispatchers.IO) {
+    private suspend fun ensure(spec: ModelSpec): File = withContext(Dispatchers.IO) {
         val modelDir = File(context.filesDir, "models").apply { mkdirs() }
-        val model = File(modelDir, MODEL_NAME)
-        if (model.isFile && model.length() >= MIN_VALID_BYTES) {
-            deleteLegacy(modelDir)
-            return@withContext model
-        }
+        val model = File(modelDir, spec.name)
+        if (model.isFile && model.length() >= spec.minBytes) return@withContext model
 
-        val partial = File(modelDir, "$MODEL_NAME.part")
+        val partial = File(modelDir, "${spec.name}.part")
         val already = partial.takeIf { it.isFile }?.length() ?: 0L
-        check(modelDir.usableSpace >= (REQUIRED_FREE_BYTES - already).coerceAtLeast(0L)) {
-            "المساحة الحرة غير كافية لتنزيل نموذج الاستماع التركي الدقيق."
+        val missing = (spec.expectedBytes - already).coerceAtLeast(0L)
+        check(modelDir.usableSpace >= missing + DOWNLOAD_HEADROOM_BYTES) {
+            "المساحة الحرة غير كافية لتنزيل نموذج الاستماع."
         }
-        download(partial)
-        check(partial.length() >= MIN_VALID_BYTES) {
-            "تعذر تنزيل نموذج الاستماع التركي الدقيق كاملًا."
-        }
+        download(spec, partial)
+        check(partial.length() >= spec.minBytes) { "تعذر تنزيل نموذج الاستماع كاملًا." }
         if (model.exists()) model.delete()
-        check(partial.renameTo(model)) { "تعذر تثبيت نموذج الاستماع التركي الدقيق." }
-        deleteLegacy(modelDir)
+        check(partial.renameTo(model)) { "تعذر تثبيت نموذج الاستماع." }
         model
     }
 
-    private fun deleteLegacy(modelDir: File) {
-        LEGACY_MODELS.forEach { name ->
-            runCatching { File(modelDir, name).delete() }
-            runCatching { File(modelDir, "$name.part").delete() }
-        }
-    }
-
-    private suspend fun download(target: File) {
+    private suspend fun download(spec: ModelSpec, target: File) {
         val existing = target.takeIf { it.isFile }?.length() ?: 0L
-        val connection = (URL(MODEL_URL).openConnection() as HttpURLConnection).apply {
+        val connection = (URL(spec.url).openConnection() as HttpURLConnection).apply {
             connectTimeout = 20_000
             readTimeout = 60_000
             instanceFollowRedirects = true
