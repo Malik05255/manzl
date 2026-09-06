@@ -58,10 +58,12 @@ dependencies {
     implementation(libs.androidx.compose.viewmodel)
     implementation(libs.androidx.lifecycle.runtime.compose.android)
 
+    // Cloud-first audio path. The audio-only build keeps the APK lean while providing Opus + soxr.
+    implementation("dev.ffmpegkit-maintained:ffmpeg-kit-audio:8.1.7")
+
+    // Kept temporarily as an offline fallback while the cloud path is validated on the target phone.
     implementation("dev.ffmpegkit-maintained:whisper-android:1.0.0")
     implementation("com.cloudflare.realtimekit.android-vad:silero:2.0.10-cf.4")
-
-    // SMaLL-100 runtime: quantized ONNX + the validated Hugging Face fast tokenizer.
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
     implementation("ai.djl.huggingface:tokenizers:0.33.0")
     runtimeOnly("ai.djl.android:tokenizer-native:0.33.0")
