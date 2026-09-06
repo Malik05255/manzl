@@ -1,8 +1,11 @@
 package com.manzl.movietranslator
 
+import android.Manifest
 import android.app.Activity
 import android.content.Context
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
 import android.util.TypedValue
@@ -12,7 +15,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -31,16 +34,18 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.CloudDone
-import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.SaveAlt
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material3.AlertDialog
@@ -49,7 +54,6 @@ import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -67,13 +71,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLayoutDirection
@@ -98,37 +102,51 @@ import java.io.File
 import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 
-private val AppBg = Color(0xFF08110D)
-private val AppSurface = Color(0xFF101A15)
-private val AppSurface2 = Color(0xFF17231C)
-private val Emerald = Color(0xFF34D36B)
-private val EmeraldSoft = Color(0xFF9EF0B8)
-private val Muted = Color(0xFF94A39A)
-private val Danger = Color(0xFFFF6B6B)
+private val Night = Color(0xFF080B12)
+private val NightSoft = Color(0xFF0D1320)
+private val Panel = Color(0xFF111827)
+private val PanelRaised = Color(0xFF182235)
+private val Stroke = Color(0xFF273349)
+private val Accent = Color(0xFF88A7FF)
+private val AccentSoft = Color(0xFFB8C8FF)
+private val TextPrimary = Color(0xFFF7F8FC)
+private val TextMuted = Color(0xFF9DA8BA)
+private val Success = Color(0xFF6EDAB3)
+private val Warning = Color(0xFFFFC66A)
+private val Danger = Color(0xFFFF8D9B)
 
-private enum class AppTab { HOME, LIBRARY, PLATFORMS }
+private enum class AppTab { HOME, LIBRARY, STATUS }
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        requestTranslationNotificationsIfNeeded()
         setContent {
             MaterialTheme(
                 colorScheme = darkColorScheme(
-                    primary = Emerald,
-                    onPrimary = Color(0xFF041108),
-                    background = AppBg,
-                    surface = AppSurface,
-                    surfaceVariant = AppSurface2,
-                    onSurface = Color.White,
-                    onBackground = Color.White,
-                    onSurfaceVariant = Muted,
+                    primary = Accent,
+                    onPrimary = Night,
+                    background = Night,
+                    surface = Panel,
+                    surfaceVariant = PanelRaised,
+                    onSurface = TextPrimary,
+                    onBackground = TextPrimary,
+                    onSurfaceVariant = TextMuted,
                     error = Danger,
                 )
             ) {
                 val vm: MovieTranslatorViewModel = viewModel()
                 MovieTranslatorApp(vm)
             }
+        }
+    }
+
+    private fun requestTranslationNotificationsIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
+            requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 701)
         }
     }
 }
@@ -163,69 +181,93 @@ private fun MovieTranslatorApp(viewModel: MovieTranslatorViewModel) {
         if (uri != null && movie != null) viewModel.exportCloudSrt(movie, uri)
         downloadTarget = null
     }
+    val homeSrtSaver = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("application/x-subrip")
+    ) { uri ->
+        if (uri != null) viewModel.exportSrt(uri)
+    }
 
     LaunchedEffect(tab) {
         when (tab) {
             AppTab.LIBRARY -> viewModel.refreshLibrary()
-            AppTab.PLATFORMS -> viewModel.refreshPlatforms()
-            else -> Unit
+            AppTab.STATUS -> viewModel.refreshPlatforms()
+            AppTab.HOME -> Unit
         }
     }
 
     androidx.compose.runtime.CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
-        Scaffold(
-            containerColor = AppBg,
-            bottomBar = {
-                AppBottomBar(tab) { tab = it }
-            },
-        ) { padding ->
-            Column(
-                modifier = Modifier
-                    .padding(padding)
-                    .statusBarsPadding()
-                    .fillMaxSize(),
-            ) {
-                AppHeader(tab)
-                when (tab) {
-                    AppTab.HOME -> HomeScreen(
-                        state = state,
-                        onPickMovie = { homePicker.launch(arrayOf("video/*")) },
-                        onExecute = viewModel::start,
-                        onCancel = viewModel::cancel,
-                        onBackground = { (context as? Activity)?.moveTaskToBack(true) },
-                        onWatch = {
-                            val uri = state.videoUri
-                            val srt = state.srtFile
-                            if (uri != null && srt != null) {
-                                activePlayerUri = uri
-                                activePlayerSrt = srt
-                                activePlayerName = state.videoName
-                            }
-                        },
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(
+                    Brush.verticalGradient(
+                        listOf(
+                            Night,
+                            NightSoft,
+                            Night,
+                        )
                     )
-                    AppTab.LIBRARY -> LibraryScreen(
-                        movies = library,
-                        onRefresh = viewModel::refreshLibrary,
-                        onRelink = { movie ->
-                            relinkTarget = movie
-                            relinkPicker.launch(arrayOf("video/*"))
-                        },
-                        onDownload = { movie ->
-                            downloadTarget = movie
-                            cloudSrtSaver.launch("${movie.movieName.substringBeforeLast('.', movie.movieName)}_ar.srt")
-                        },
-                        onDelete = viewModel::deleteTranslation,
-                        onWatch = { movie ->
-                            val uri = movie.videoUri?.let(Uri::parse)
-                            val srt = viewModel.prepareLibrarySubtitle(movie)
-                            if (uri != null && srt != null && movie.localAvailable) {
-                                activePlayerUri = uri
-                                activePlayerSrt = srt
-                                activePlayerName = movie.movieName
-                            }
-                        },
-                    )
-                    AppTab.PLATFORMS -> PlatformsScreen(platforms = platforms, onRefresh = viewModel::refreshPlatforms)
+                )
+        ) {
+            Scaffold(
+                containerColor = Color.Transparent,
+                bottomBar = { PremiumBottomBar(selected = tab, onSelect = { tab = it }) },
+            ) { padding ->
+                Column(
+                    modifier = Modifier
+                        .padding(padding)
+                        .statusBarsPadding()
+                        .fillMaxSize(),
+                ) {
+                    PremiumHeader(tab)
+                    when (tab) {
+                        AppTab.HOME -> HomeScreen(
+                            state = state,
+                            onPickMovie = { homePicker.launch(arrayOf("video/*")) },
+                            onExecute = viewModel::start,
+                            onCancel = viewModel::cancel,
+                            onBackground = { (context as? Activity)?.moveTaskToBack(true) },
+                            onWatch = {
+                                val uri = state.videoUri
+                                val srt = state.srtFile
+                                if (uri != null && srt != null) {
+                                    activePlayerUri = uri
+                                    activePlayerSrt = srt
+                                    activePlayerName = state.videoName
+                                }
+                            },
+                            onExport = {
+                                val base = state.videoName.substringBeforeLast('.', state.videoName).ifBlank { "movie" }
+                                homeSrtSaver.launch("${base}_ar.srt")
+                            },
+                        )
+
+                        AppTab.LIBRARY -> LibraryScreen(
+                            movies = library,
+                            onRefresh = viewModel::refreshLibrary,
+                            onRelink = { movie ->
+                                relinkTarget = movie
+                                relinkPicker.launch(arrayOf("video/*"))
+                            },
+                            onDownload = { movie ->
+                                downloadTarget = movie
+                                val base = movie.movieName.substringBeforeLast('.', movie.movieName).ifBlank { "movie" }
+                                cloudSrtSaver.launch("${base}_ar.srt")
+                            },
+                            onDelete = viewModel::deleteTranslation,
+                            onWatch = { movie ->
+                                val uri = movie.videoUri?.let(Uri::parse)
+                                val srt = viewModel.prepareLibrarySubtitle(movie)
+                                if (uri != null && srt != null && movie.localAvailable) {
+                                    activePlayerUri = uri
+                                    activePlayerSrt = srt
+                                    activePlayerName = movie.movieName
+                                }
+                            },
+                        )
+
+                        AppTab.STATUS -> ServicesScreen(platforms = platforms, onRefresh = viewModel::refreshPlatforms)
+                    }
                 }
             }
         }
@@ -239,13 +281,18 @@ private fun MovieTranslatorApp(viewModel: MovieTranslatorViewModel) {
                 viewModel.clearCloudUiError()
             },
             confirmButton = {
-                TextButton(onClick = {
-                    viewModel.clearError()
-                    viewModel.clearCloudUiError()
-                }) { Text("حسنًا") }
+                TextButton(
+                    onClick = {
+                        viewModel.clearError()
+                        viewModel.clearCloudUiError()
+                    }
+                ) { Text("إغلاق") }
             },
             title = { Text("تعذر إكمال العملية") },
             text = { Text(visibleError) },
+            containerColor = Panel,
+            titleContentColor = TextPrimary,
+            textContentColor = TextMuted,
         )
     }
 
@@ -266,74 +313,104 @@ private fun MovieTranslatorApp(viewModel: MovieTranslatorViewModel) {
 }
 
 @Composable
-private fun AppHeader(tab: AppTab) {
+private fun PremiumHeader(tab: AppTab) {
+    val title = when (tab) {
+        AppTab.HOME -> "مترجم الأفلام"
+        AppTab.LIBRARY -> "المكتبة"
+        AppTab.STATUS -> "الخدمات"
+    }
+    val subtitle = when (tab) {
+        AppTab.HOME -> "ترجمة تركية إلى عربية، تلقائيًا"
+        AppTab.LIBRARY -> "كل ترجماتك في مكان واحد"
+        AppTab.STATUS -> "حالة المعالجة السحابية"
+    }
+    val icon = when (tab) {
+        AppTab.HOME -> Icons.Default.AutoAwesome
+        AppTab.LIBRARY -> Icons.Default.VideoLibrary
+        AppTab.STATUS -> Icons.Default.Cloud
+    }
+
     Row(
-        modifier = Modifier.fillMaxWidth().padding(horizontal = 20.dp, vertical = 12.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Surface(shape = RoundedCornerShape(14.dp), color = Emerald.copy(alpha = 0.14f)) {
-            Icon(
-                imageVector = when (tab) {
-                    AppTab.HOME -> Icons.Default.AutoAwesome
-                    AppTab.LIBRARY -> Icons.Default.VideoLibrary
-                    AppTab.PLATFORMS -> Icons.Default.Cloud
-                },
-                contentDescription = null,
-                tint = Emerald,
-                modifier = Modifier.padding(10.dp).size(22.dp),
-            )
+        Box(
+            modifier = Modifier
+                .size(48.dp)
+                .background(Accent.copy(alpha = 0.12f), RoundedCornerShape(16.dp))
+                .border(1.dp, Accent.copy(alpha = 0.20f), RoundedCornerShape(16.dp)),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(icon, contentDescription = null, tint = Accent, modifier = Modifier.size(24.dp))
         }
-        Column(modifier = Modifier.padding(start = 12.dp)) {
-            Text(
-                when (tab) {
-                    AppTab.HOME -> "مترجم الأفلام"
-                    AppTab.LIBRARY -> "مكتبة الأفلام"
-                    AppTab.PLATFORMS -> "منصاتي"
-                },
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold,
-            )
-            if (tab == AppTab.HOME) {
-                Text("تركي ← عربي", color = Muted, style = MaterialTheme.typography.labelMedium)
+        Column(modifier = Modifier.weight(1f).padding(horizontal = 12.dp)) {
+            Text(title, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+            Text(subtitle, color = TextMuted, style = MaterialTheme.typography.bodySmall)
+        }
+        if (tab == AppTab.HOME) {
+            Surface(
+                shape = RoundedCornerShape(999.dp),
+                color = Success.copy(alpha = 0.10f),
+                border = androidx.compose.foundation.BorderStroke(1.dp, Success.copy(alpha = 0.18f)),
+            ) {
+                Text(
+                    "جاهز",
+                    modifier = Modifier.padding(horizontal = 11.dp, vertical = 6.dp),
+                    color = Success,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
+                )
             }
         }
     }
 }
 
 @Composable
-private fun AppBottomBar(selected: AppTab, onSelect: (AppTab) -> Unit) {
-    NavigationBar(containerColor = AppSurface, tonalElevation = 0.dp) {
-        NavigationBarItem(
-            selected = selected == AppTab.HOME,
-            onClick = { onSelect(AppTab.HOME) },
-            icon = { Icon(Icons.Default.Home, null) },
-            label = { Text("الرئيسية") },
-            colors = navColors(),
-        )
-        NavigationBarItem(
-            selected = selected == AppTab.LIBRARY,
-            onClick = { onSelect(AppTab.LIBRARY) },
-            icon = { Icon(Icons.Default.VideoLibrary, null) },
-            label = { Text("المكتبة") },
-            colors = navColors(),
-        )
-        NavigationBarItem(
-            selected = selected == AppTab.PLATFORMS,
-            onClick = { onSelect(AppTab.PLATFORMS) },
-            icon = { Icon(Icons.Default.Cloud, null) },
-            label = { Text("منصاتي") },
-            colors = navColors(),
-        )
+private fun PremiumBottomBar(selected: AppTab, onSelect: (AppTab) -> Unit) {
+    Surface(
+        color = Panel,
+        shape = RoundedCornerShape(topStart = 26.dp, topEnd = 26.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Stroke.copy(alpha = 0.7f)),
+    ) {
+        NavigationBar(
+            containerColor = Color.Transparent,
+            tonalElevation = 0.dp,
+            modifier = Modifier.navigationBarsPadding(),
+        ) {
+            NavigationBarItem(
+                selected = selected == AppTab.HOME,
+                onClick = { onSelect(AppTab.HOME) },
+                icon = { Icon(Icons.Default.Home, contentDescription = null) },
+                label = { Text("الرئيسية") },
+                colors = premiumNavColors(),
+            )
+            NavigationBarItem(
+                selected = selected == AppTab.LIBRARY,
+                onClick = { onSelect(AppTab.LIBRARY) },
+                icon = { Icon(Icons.Default.VideoLibrary, contentDescription = null) },
+                label = { Text("المكتبة") },
+                colors = premiumNavColors(),
+            )
+            NavigationBarItem(
+                selected = selected == AppTab.STATUS,
+                onClick = { onSelect(AppTab.STATUS) },
+                icon = { Icon(Icons.Default.Cloud, contentDescription = null) },
+                label = { Text("الخدمات") },
+                colors = premiumNavColors(),
+            )
+        }
     }
 }
 
 @Composable
-private fun navColors() = NavigationBarItemDefaults.colors(
-    selectedIconColor = Color(0xFF041108),
-    selectedTextColor = EmeraldSoft,
-    indicatorColor = Emerald,
-    unselectedIconColor = Muted,
-    unselectedTextColor = Muted,
+private fun premiumNavColors() = NavigationBarItemDefaults.colors(
+    selectedIconColor = Accent,
+    selectedTextColor = AccentSoft,
+    indicatorColor = Accent.copy(alpha = 0.13f),
+    unselectedIconColor = TextMuted,
+    unselectedTextColor = TextMuted,
 )
 
 @Composable
@@ -344,186 +421,361 @@ private fun HomeScreen(
     onCancel: () -> Unit,
     onBackground: () -> Unit,
     onWatch: () -> Unit,
+    onExport: () -> Unit,
 ) {
     Column(
-        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 18.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 18.dp),
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        Spacer(Modifier.height(2.dp))
-        Card(
-            colors = CardDefaults.cardColors(containerColor = AppSurface),
-            shape = RoundedCornerShape(24.dp),
-            modifier = Modifier.fillMaxWidth(),
-        ) {
-            Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Surface(shape = RoundedCornerShape(16.dp), color = AppSurface2, modifier = Modifier.size(56.dp)) {
-                        Box(contentAlignment = Alignment.Center) {
-                            Icon(Icons.Default.Movie, null, tint = Emerald, modifier = Modifier.size(28.dp))
-                        }
-                    }
-                    Column(modifier = Modifier.weight(1f).padding(horizontal = 12.dp)) {
-                        Text(
-                            state.videoName.ifBlank { "اختر فيلمًا" },
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                        Text(
-                            if (state.videoUri == null) "جاهز لرفع الفيلم" else formatClock(state.videoDurationMs),
-                            color = Muted,
-                            style = MaterialTheme.typography.bodySmall,
-                        )
-                    }
-                }
-
-                Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
-                    OutlinedButton(
-                        onClick = onPickMovie,
-                        enabled = !state.isRunning,
-                        modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(16.dp),
-                    ) {
-                        Icon(Icons.Default.UploadFile, null)
-                        Text(if (state.videoUri == null) " رفع الفيلم" else " تغيير")
-                    }
-                    Button(
-                        onClick = onExecute,
-                        enabled = state.videoUri != null && !state.isRunning,
-                        modifier = Modifier.weight(1f),
-                        shape = RoundedCornerShape(16.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Emerald, contentColor = Color(0xFF031108)),
-                    ) {
-                        Icon(Icons.Default.AutoAwesome, null)
-                        Text(" تنفيذ", fontWeight = FontWeight.Bold)
-                    }
-                }
-            }
+        if (state.videoUri == null) {
+            HeroPickerCard(onPickMovie = onPickMovie)
+        } else {
+            SelectedMovieCard(state = state, onPickMovie = onPickMovie)
         }
 
-        ProgressConsole(state = state, onBackground = onBackground, onCancel = onCancel)
+        when {
+            state.isRunning -> TranslationProgressCard(
+                state = state,
+                onBackground = onBackground,
+                onCancel = onCancel,
+            )
 
-        if (!state.isRunning && state.srtFile != null && state.videoUri != null) {
-            Card(
-                colors = CardDefaults.cardColors(containerColor = Emerald.copy(alpha = 0.10f)),
-                shape = RoundedCornerShape(22.dp),
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Surface(shape = CircleShape, color = Emerald) {
-                        Icon(Icons.Default.CloudDone, null, tint = Color(0xFF031108), modifier = Modifier.padding(9.dp))
-                    }
-                    Column(modifier = Modifier.weight(1f).padding(horizontal = 12.dp)) {
-                        Text("الترجمة جاهزة", fontWeight = FontWeight.Bold)
-                        Text("موجودة أيضًا في مكتبة الأفلام", color = Muted, style = MaterialTheme.typography.bodySmall)
-                    }
-                    IconButton(onClick = onWatch) {
-                        Icon(Icons.Default.PlayArrow, "مشاهدة", tint = Emerald, modifier = Modifier.size(30.dp))
-                    }
-                }
-            }
+            state.srtFile != null && state.videoUri != null -> CompletedTranslationCard(
+                state = state,
+                onWatch = onWatch,
+                onExport = onExport,
+            )
+
+            state.videoUri != null -> ReadyToTranslateCard(onExecute = onExecute)
         }
-        Spacer(Modifier.height(18.dp))
+
+        PrivacyCard()
+        Spacer(Modifier.height(16.dp))
     }
 }
 
 @Composable
-private fun ProgressConsole(
+private fun HeroPickerCard(onPickMovie: () -> Unit) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Panel),
+        shape = RoundedCornerShape(28.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.dp, Accent.copy(alpha = 0.18f), RoundedCornerShape(28.dp)),
+    ) {
+        Column(
+            modifier = Modifier.padding(22.dp),
+            verticalArrangement = Arrangement.spacedBy(16.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(58.dp)
+                    .background(Accent.copy(alpha = 0.12f), RoundedCornerShape(18.dp)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(Icons.Default.Movie, contentDescription = null, tint = Accent, modifier = Modifier.size(30.dp))
+            }
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    "اختر فيلمك وابدأ مباشرة",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    "التطبيق يتولى استخراج الصوت، فهم الحوار، الترجمة والمراجعة دون إعدادات تقنية.",
+                    color = TextMuted,
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+            Button(
+                onClick = onPickMovie,
+                modifier = Modifier.fillMaxWidth().height(54.dp),
+                shape = RoundedCornerShape(17.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Accent, contentColor = Night),
+            ) {
+                Icon(Icons.Default.UploadFile, contentDescription = null)
+                Text(" اختيار فيلم", fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}
+
+@Composable
+private fun SelectedMovieCard(state: TranslatorUiState, onPickMovie: () -> Unit) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Panel),
+        shape = RoundedCornerShape(24.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(16.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(56.dp)
+                    .background(PanelRaised, RoundedCornerShape(17.dp)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(Icons.Default.Movie, contentDescription = null, tint = Accent, modifier = Modifier.size(28.dp))
+            }
+            Column(modifier = Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                Text(
+                    state.videoName.ifBlank { "الفيلم المحدد" },
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    modifier = Modifier.padding(top = 5.dp),
+                ) {
+                    Icon(Icons.Default.Schedule, contentDescription = null, tint = TextMuted, modifier = Modifier.size(15.dp))
+                    Text(formatClock(state.videoDurationMs), color = TextMuted, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+            OutlinedButton(
+                onClick = onPickMovie,
+                enabled = !state.isRunning,
+                shape = RoundedCornerShape(14.dp),
+            ) {
+                Text("تغيير")
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReadyToTranslateCard(onExecute: () -> Unit) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Panel),
+        shape = RoundedCornerShape(24.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Surface(shape = CircleShape, color = Success.copy(alpha = 0.12f)) {
+                    Icon(
+                        Icons.Default.CheckCircle,
+                        contentDescription = null,
+                        tint = Success,
+                        modifier = Modifier.padding(8.dp).size(20.dp),
+                    )
+                }
+                Column(modifier = Modifier.weight(1f).padding(horizontal = 10.dp)) {
+                    Text("الفيلم جاهز", fontWeight = FontWeight.Bold)
+                    Text("ابدأ الترجمة وسيكمل التطبيق الخطوات تلقائيًا.", color = TextMuted, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+            Button(
+                onClick = onExecute,
+                modifier = Modifier.fillMaxWidth().height(52.dp),
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Accent, contentColor = Night),
+            ) {
+                Icon(Icons.Default.AutoAwesome, contentDescription = null)
+                Text(" ابدأ الترجمة", fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}
+
+@Composable
+private fun TranslationProgressCard(
     state: TranslatorUiState,
     onBackground: () -> Unit,
     onCancel: () -> Unit,
 ) {
     val progress = state.progress.coerceIn(0f, 1f)
     val percent = (progress * 100f).roundToInt()
-    val next = nextMilestone(percent)
-    val remaining = (next.first - percent).coerceAtLeast(0)
+    val retrying = state.stage.contains("إعادة") ||
+        state.stage.contains("غير متاح") ||
+        state.stage.contains("سنستكمل") ||
+        state.stage.contains("تأخرت") ||
+        state.stage.contains("مشغولة")
+    val statusColor = if (retrying) Warning else Accent
 
     Card(
-        colors = CardDefaults.cardColors(containerColor = AppSurface),
-        shape = RoundedCornerShape(24.dp),
+        colors = CardDefaults.cardColors(containerColor = Panel),
+        shape = RoundedCornerShape(26.dp),
         modifier = Modifier.fillMaxWidth(),
     ) {
-        Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Row(verticalAlignment = Alignment.Bottom) {
-                Text("$percent%", style = MaterialTheme.typography.headlineLarge, fontWeight = FontWeight.Black, color = Emerald)
-                Spacer(Modifier.weight(1f))
-                Text(
-                    when {
-                        percent >= 100 -> "مكتمل"
-                        state.isRunning -> "باقي $remaining٪ للخطوة التالية"
-                        else -> "جاهز"
-                    },
-                    color = if (state.isRunning) EmeraldSoft else Muted,
-                    style = MaterialTheme.typography.labelLarge,
-                )
-            }
-
-            Box(modifier = Modifier.fillMaxWidth()) {
-                LinearProgressIndicator(
-                    progress = { progress },
-                    color = Emerald,
-                    trackColor = AppSurface2,
-                    modifier = Modifier.fillMaxWidth().height(14.dp),
-                )
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    listOf(15, 45, 62, 82, 95).forEach { mark ->
-                        Box(
-                            modifier = Modifier
-                                .padding(top = 3.dp)
-                                .size(8.dp)
-                                .background(if (percent >= mark) Color(0xFF031108) else Muted.copy(alpha = 0.45f), CircleShape)
-                        )
-                    }
-                }
-            }
-
+        Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(15.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Box(modifier = Modifier.size(8.dp).background(if (state.isRunning) Emerald else Muted, CircleShape))
-                Text(
-                    state.stage,
-                    modifier = Modifier.weight(1f).padding(horizontal = 9.dp),
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.Medium,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("جارٍ ترجمة الفيلم", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+                    Text("يمكنك ترك التطبيق وسيستمر العمل تلقائيًا.", color = TextMuted, style = MaterialTheme.typography.bodySmall)
+                }
+                Surface(shape = RoundedCornerShape(14.dp), color = Accent.copy(alpha = 0.11f)) {
+                    Text(
+                        "$percent%",
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        color = AccentSoft,
+                        fontWeight = FontWeight.Bold,
+                    )
+                }
             }
 
-            if (state.isRunning && percent < 100) {
-                Text(
-                    "التالي: ${next.second}",
-                    color = Muted,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                Button(
-                    onClick = onBackground,
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = AppSurface2, contentColor = EmeraldSoft),
+            LinearProgressIndicator(
+                progress = { progress },
+                color = Accent,
+                trackColor = PanelRaised,
+                modifier = Modifier.fillMaxWidth().height(8.dp),
+            )
+
+            TranslationSteps(percent)
+
+            Surface(
+                color = statusColor.copy(alpha = 0.09f),
+                shape = RoundedCornerShape(16.dp),
+                border = androidx.compose.foundation.BorderStroke(1.dp, statusColor.copy(alpha = 0.16f)),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Row(
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Icon(Icons.Default.Cloud, null)
-                    Text(if (percent >= 45) " المنصة تكمل • إخفاء التطبيق" else " متابعة في الخلفية")
+                    Box(modifier = Modifier.size(8.dp).background(statusColor, CircleShape))
+                    Text(
+                        state.stage,
+                        modifier = Modifier.weight(1f).padding(horizontal = 10.dp),
+                        color = if (retrying) Warning else TextPrimary,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                    )
                 }
-                TextButton(onClick = onCancel, modifier = Modifier.align(Alignment.CenterHorizontally)) {
-                    Text("إيقاف المهمة", color = Danger)
+            }
+
+            OutlinedButton(
+                onClick = onBackground,
+                modifier = Modifier.fillMaxWidth().height(48.dp),
+                shape = RoundedCornerShape(15.dp),
+            ) {
+                Icon(Icons.Default.Cloud, contentDescription = null)
+                Text(" متابعة في الخلفية")
+            }
+            TextButton(onClick = onCancel, modifier = Modifier.align(Alignment.CenterHorizontally)) {
+                Text("إيقاف المهمة", color = Danger)
+            }
+        }
+    }
+}
+
+@Composable
+private fun TranslationSteps(percent: Int) {
+    val steps = listOf(
+        1 to "تجهيز",
+        15 to "رفع",
+        45 to "فهم",
+        82 to "ترجمة",
+        95 to "مراجعة",
+    )
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+    ) {
+        steps.forEach { (threshold, label) ->
+            val reached = percent >= threshold
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Box(
+                    modifier = Modifier
+                        .size(if (reached) 10.dp else 8.dp)
+                        .background(if (reached) Accent else Stroke, CircleShape)
+                )
+                Text(
+                    label,
+                    modifier = Modifier.padding(top = 5.dp),
+                    color = if (reached) AccentSoft else TextMuted,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun CompletedTranslationCard(
+    state: TranslatorUiState,
+    onWatch: () -> Unit,
+    onExport: () -> Unit,
+) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Success.copy(alpha = 0.08f)),
+        shape = RoundedCornerShape(26.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .border(1.dp, Success.copy(alpha = 0.18f), RoundedCornerShape(26.dp)),
+    ) {
+        Column(modifier = Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Surface(shape = CircleShape, color = Success.copy(alpha = 0.15f)) {
+                    Icon(
+                        Icons.Default.CloudDone,
+                        contentDescription = null,
+                        tint = Success,
+                        modifier = Modifier.padding(10.dp).size(24.dp),
+                    )
+                }
+                Column(modifier = Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                    Text("الترجمة جاهزة", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+                    val detail = if (state.processingMs > 0L) {
+                        "اكتملت خلال ${formatClock(state.processingMs)}"
+                    } else {
+                        "أصبحت جاهزة للمشاهدة والحفظ"
+                    }
+                    Text(detail, color = TextMuted, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+                Button(
+                    onClick = onWatch,
+                    modifier = Modifier.weight(1f).height(50.dp),
+                    shape = RoundedCornerShape(15.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Success, contentColor = Night),
+                ) {
+                    Icon(Icons.Default.PlayArrow, contentDescription = null)
+                    Text(" مشاهدة", fontWeight = FontWeight.Bold)
+                }
+                OutlinedButton(
+                    onClick = onExport,
+                    modifier = Modifier.weight(1f).height(50.dp),
+                    shape = RoundedCornerShape(15.dp),
+                ) {
+                    Icon(Icons.Default.Download, contentDescription = null)
+                    Text(" حفظ SRT")
                 }
             }
         }
     }
 }
 
-private fun nextMilestone(percent: Int): Pair<Int, String> = when {
-    percent < 15 -> 15 to "اكتمال تجهيز الصوت"
-    percent < 45 -> 45 to "وصول الصوت للمنصة"
-    percent < 62 -> 62 to "فهم الحوار التركي"
-    percent < 82 -> 82 to "اكتمال الترجمة الأولية"
-    percent < 95 -> 95 to "اكتمال مراجعة الدقة"
-    percent < 100 -> 100 to "الحفظ في مكتبة الأفلام"
-    else -> 100 to "تمت العملية"
+@Composable
+private fun PrivacyCard() {
+    Surface(
+        color = Panel.copy(alpha = 0.72f),
+        shape = RoundedCornerShape(18.dp),
+        border = androidx.compose.foundation.BorderStroke(1.dp, Stroke.copy(alpha = 0.55f)),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Icons.Default.CloudDone, contentDescription = null, tint = TextMuted, modifier = Modifier.size(19.dp))
+            Text(
+                "الفيلم يبقى على جهازك؛ تُرسل نسخة صوتية مؤقتة فقط لإتمام الترجمة.",
+                modifier = Modifier.padding(horizontal = 10.dp),
+                color = TextMuted,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+    }
 }
 
 @Composable
@@ -535,102 +787,168 @@ private fun LibraryScreen(
     onDelete: (CloudMovieItem) -> Unit,
     onWatch: (CloudMovieItem) -> Unit,
 ) {
+    var deleteTarget by remember { mutableStateOf<CloudMovieItem?>(null) }
+
     Column(
-        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 18.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 18.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("${movies.size} فيلم", color = Muted, modifier = Modifier.weight(1f))
-            TextButton(onClick = onRefresh) { Text("تحديث", color = Emerald) }
+            Column(modifier = Modifier.weight(1f)) {
+                Text("ترجماتك المحفوظة", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+                Text("${movies.size} فيلم", color = TextMuted, style = MaterialTheme.typography.bodySmall)
+            }
+            IconButton(onClick = onRefresh) {
+                Icon(Icons.Default.Refresh, contentDescription = "تحديث", tint = Accent)
+            }
         }
 
         if (movies.isEmpty()) {
             EmptyLibrary()
         } else {
-            movies.forEachIndexed { index, movie ->
+            movies.forEach { movie ->
                 MovieLibraryCard(
-                    index = index + 1,
                     movie = movie,
                     onRelink = { onRelink(movie) },
                     onDownload = { onDownload(movie) },
-                    onDelete = { onDelete(movie) },
+                    onDelete = { deleteTarget = movie },
                     onWatch = { onWatch(movie) },
                 )
             }
         }
-        Spacer(Modifier.height(18.dp))
+        Spacer(Modifier.height(16.dp))
+    }
+
+    val target = deleteTarget
+    if (target != null) {
+        AlertDialog(
+            onDismissRequest = { deleteTarget = null },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        onDelete(target)
+                        deleteTarget = null
+                    }
+                ) { Text("حذف", color = Danger) }
+            },
+            dismissButton = {
+                TextButton(onClick = { deleteTarget = null }) { Text("إلغاء") }
+            },
+            title = { Text("حذف الترجمة؟") },
+            text = { Text("سيتم حذف ملف الترجمة المحفوظ لهذا الفيلم فقط.") },
+            containerColor = Panel,
+        )
     }
 }
 
 @Composable
 private fun EmptyLibrary() {
-    Card(colors = CardDefaults.cardColors(containerColor = AppSurface), shape = RoundedCornerShape(24.dp)) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Panel),
+        shape = RoundedCornerShape(26.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
         Column(
-            modifier = Modifier.fillMaxWidth().padding(28.dp),
+            modifier = Modifier.fillMaxWidth().padding(30.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            Icon(Icons.Default.VideoLibrary, null, tint = Emerald, modifier = Modifier.size(42.dp))
-            Text("مكتبتك فارغة", fontWeight = FontWeight.Bold)
-            Text("أول ترجمة مكتملة ستظهر هنا", color = Muted, style = MaterialTheme.typography.bodySmall)
+            Box(
+                modifier = Modifier.size(62.dp).background(PanelRaised, RoundedCornerShape(20.dp)),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(Icons.Default.VideoLibrary, contentDescription = null, tint = Accent, modifier = Modifier.size(30.dp))
+            }
+            Text("لا توجد ترجمات بعد", fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
+            Text("عند اكتمال أول فيلم سيظهر هنا تلقائيًا.", color = TextMuted, textAlign = TextAlign.Center)
         }
     }
 }
 
 @Composable
 private fun MovieLibraryCard(
-    index: Int,
     movie: CloudMovieItem,
     onRelink: () -> Unit,
     onDownload: () -> Unit,
     onDelete: () -> Unit,
     onWatch: () -> Unit,
 ) {
-    Card(colors = CardDefaults.cardColors(containerColor = AppSurface), shape = RoundedCornerShape(22.dp)) {
+    Card(
+        colors = CardDefaults.cardColors(containerColor = Panel),
+        shape = RoundedCornerShape(23.dp),
+        modifier = Modifier.fillMaxWidth(),
+    ) {
         Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Surface(shape = RoundedCornerShape(14.dp), color = AppSurface2) {
-                    Text("$index", modifier = Modifier.padding(horizontal = 12.dp, vertical = 9.dp), color = Emerald, fontWeight = FontWeight.Bold)
+                Box(
+                    modifier = Modifier.size(52.dp).background(PanelRaised, RoundedCornerShape(16.dp)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(Icons.Default.Movie, contentDescription = null, tint = Accent, modifier = Modifier.size(25.dp))
                 }
                 Column(modifier = Modifier.weight(1f).padding(horizontal = 11.dp)) {
                     Text(movie.movieName, fontWeight = FontWeight.Bold, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                    Text(formatClock(movie.durationMs), color = Muted, style = MaterialTheme.typography.bodySmall)
+                    Text(formatClock(movie.durationMs), color = TextMuted, style = MaterialTheme.typography.bodySmall)
                 }
-                IconButton(onClick = onRelink) { Icon(Icons.Default.Edit, "تعديل المسار", tint = Muted) }
+                IconButton(onClick = onRelink) {
+                    Icon(Icons.Default.Edit, contentDescription = "تغيير ملف الفيلم", tint = TextMuted)
+                }
             }
 
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                StatusChip(
-                    text = if (movie.localAvailable) "الفيلم على الجوال" else "حدد مسار الفيلم",
+                StatusTag(
+                    text = if (movie.localAvailable) "الفيلم متصل" else "الفيلم غير محدد",
                     active = movie.localAvailable,
                     modifier = Modifier.weight(1f),
                 )
-                StatusChip(
-                    text = if (!movie.srtText.isNullOrBlank()) "الترجمة جاهزة" else "بدون ترجمة",
+                StatusTag(
+                    text = if (!movie.srtText.isNullOrBlank()) "الترجمة جاهزة" else "لا توجد ترجمة",
                     active = !movie.srtText.isNullOrBlank(),
                     modifier = Modifier.weight(1f),
                 )
             }
 
-            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-                Button(
-                    onClick = onWatch,
-                    enabled = movie.localAvailable && !movie.srtText.isNullOrBlank(),
-                    shape = RoundedCornerShape(14.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Emerald, contentColor = Color(0xFF031108)),
-                    modifier = Modifier.weight(1f),
-                ) {
-                    Icon(Icons.Default.PlayArrow, null)
-                    Text(" مشاهدة")
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalAlignment = Alignment.CenterVertically) {
+                if (movie.localAvailable && !movie.srtText.isNullOrBlank()) {
+                    Button(
+                        onClick = onWatch,
+                        modifier = Modifier.weight(1f).height(46.dp),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Accent, contentColor = Night),
+                    ) {
+                        Icon(Icons.Default.PlayArrow, contentDescription = null)
+                        Text(" مشاهدة", fontWeight = FontWeight.Bold)
+                    }
+                } else {
+                    Button(
+                        onClick = onRelink,
+                        modifier = Modifier.weight(1f).height(46.dp),
+                        shape = RoundedCornerShape(14.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = PanelRaised, contentColor = AccentSoft),
+                    ) {
+                        Icon(Icons.Default.UploadFile, contentDescription = null)
+                        Text(" تحديد الفيلم")
+                    }
                 }
-                IconButton(onClick = onDownload, enabled = !movie.srtText.isNullOrBlank()) {
-                    Icon(Icons.Default.Download, "تنزيل الترجمة", tint = if (!movie.srtText.isNullOrBlank()) EmeraldSoft else Muted)
+
+                OutlinedButton(
+                    onClick = onDownload,
+                    enabled = !movie.srtText.isNullOrBlank(),
+                    modifier = Modifier.height(46.dp),
+                    shape = RoundedCornerShape(14.dp),
+                ) {
+                    Icon(Icons.Default.Download, contentDescription = null)
+                    Text(" SRT")
                 }
                 IconButton(onClick = onDelete, enabled = !movie.srtText.isNullOrBlank()) {
-                    Icon(Icons.Default.DeleteOutline, "حذف الترجمة", tint = if (!movie.srtText.isNullOrBlank()) Danger else Muted)
-                }
-                IconButton(onClick = {}, enabled = false) {
-                    Icon(Icons.Default.SaveAlt, "حفظ الفيلم مع الترجمة", tint = Muted)
+                    Icon(
+                        Icons.Default.DeleteOutline,
+                        contentDescription = "حذف الترجمة",
+                        tint = if (!movie.srtText.isNullOrBlank()) Danger else TextMuted,
+                    )
                 }
             }
         }
@@ -638,16 +956,16 @@ private fun MovieLibraryCard(
 }
 
 @Composable
-private fun StatusChip(text: String, active: Boolean, modifier: Modifier = Modifier) {
+private fun StatusTag(text: String, active: Boolean, modifier: Modifier = Modifier) {
     Surface(
         modifier = modifier,
         shape = RoundedCornerShape(12.dp),
-        color = if (active) Emerald.copy(alpha = 0.11f) else AppSurface2,
+        color = if (active) Success.copy(alpha = 0.09f) else PanelRaised,
     ) {
         Text(
             text,
             modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
-            color = if (active) EmeraldSoft else Muted,
+            color = if (active) Success else TextMuted,
             textAlign = TextAlign.Center,
             style = MaterialTheme.typography.labelMedium,
         )
@@ -655,7 +973,7 @@ private fun StatusChip(text: String, active: Boolean, modifier: Modifier = Modif
 }
 
 @Composable
-private fun PlatformsScreen(platforms: List<PlatformQuota>, onRefresh: () -> Unit) {
+private fun ServicesScreen(platforms: List<PlatformQuota>, onRefresh: () -> Unit) {
     val now by produceState(initialValue = System.currentTimeMillis()) {
         while (true) {
             value = System.currentTimeMillis()
@@ -664,53 +982,87 @@ private fun PlatformsScreen(platforms: List<PlatformQuota>, onRefresh: () -> Uni
     }
 
     Column(
-        modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 18.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = 18.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("الحصص المجانية", color = Muted, modifier = Modifier.weight(1f))
-            TextButton(onClick = onRefresh) { Text("تحديث", color = Emerald) }
+        Surface(
+            color = Accent.copy(alpha = 0.08f),
+            shape = RoundedCornerShape(22.dp),
+            border = androidx.compose.foundation.BorderStroke(1.dp, Accent.copy(alpha = 0.16f)),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Row(
+                modifier = Modifier.padding(16.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Box(
+                    modifier = Modifier.size(46.dp).background(Accent.copy(alpha = 0.12f), RoundedCornerShape(15.dp)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Icon(Icons.Default.CloudDone, contentDescription = null, tint = Accent)
+                }
+                Column(modifier = Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                    Text("يعمل تلقائيًا", fontWeight = FontWeight.Bold)
+                    Text("لا يحتاج التطبيق إلى أي إعداد تقني منك.", color = TextMuted, style = MaterialTheme.typography.bodySmall)
+                }
+                IconButton(onClick = onRefresh) {
+                    Icon(Icons.Default.Refresh, contentDescription = "تحديث", tint = Accent)
+                }
+            }
         }
+
+        Text("السعة المتاحة", color = TextMuted, style = MaterialTheme.typography.labelLarge)
+
         if (platforms.isEmpty()) {
-            Card(colors = CardDefaults.cardColors(containerColor = AppSurface), shape = RoundedCornerShape(22.dp)) {
+            Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(22.dp)) {
                 Row(modifier = Modifier.fillMaxWidth().padding(20.dp), verticalAlignment = Alignment.CenterVertically) {
-                    CircularProgressIndicator(modifier = Modifier.size(24.dp), color = Emerald)
-                    Text("قراءة حالة المنصات…", modifier = Modifier.padding(horizontal = 12.dp), color = Muted)
+                    CircularProgressIndicator(modifier = Modifier.size(24.dp), color = Accent, strokeWidth = 3.dp)
+                    Text("جارٍ قراءة حالة الخدمات…", modifier = Modifier.padding(horizontal = 12.dp), color = TextMuted)
                 }
             }
         } else {
-            platforms.forEach { platform -> PlatformCard(platform, now) }
+            platforms.forEach { platform -> ServiceQuotaCard(platform = platform, now = now) }
         }
-        Spacer(Modifier.height(18.dp))
+        Spacer(Modifier.height(16.dp))
     }
 }
 
 @Composable
-private fun PlatformCard(platform: PlatformQuota, now: Long) {
+private fun ServiceQuotaCard(platform: PlatformQuota, now: Long) {
     val remaining = platform.remainingPercent.coerceIn(0, 100)
-    Card(colors = CardDefaults.cardColors(containerColor = AppSurface), shape = RoundedCornerShape(22.dp)) {
+    val color = when {
+        remaining >= 50 -> Success
+        remaining >= 20 -> Warning
+        else -> Danger
+    }
+    Card(colors = CardDefaults.cardColors(containerColor = Panel), shape = RoundedCornerShape(22.dp)) {
         Row(modifier = Modifier.fillMaxWidth().padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(contentAlignment = Alignment.Center, modifier = Modifier.size(68.dp)) {
+            Box(contentAlignment = Alignment.Center, modifier = Modifier.size(60.dp)) {
                 CircularProgressIndicator(
                     progress = { remaining / 100f },
                     modifier = Modifier.fillMaxSize(),
-                    color = Emerald,
-                    trackColor = AppSurface2,
-                    strokeWidth = 7.dp,
+                    color = color,
+                    trackColor = PanelRaised,
+                    strokeWidth = 6.dp,
                 )
-                Text("$remaining%", fontWeight = FontWeight.Bold, color = EmeraldSoft)
+                Text("$remaining%", fontWeight = FontWeight.Bold, color = color, style = MaterialTheme.typography.labelLarge)
             }
             Column(modifier = Modifier.weight(1f).padding(horizontal = 14.dp)) {
                 Text(platform.title, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
                 if (platform.detail.isNotBlank()) {
-                    Text(platform.detail, color = Muted, style = MaterialTheme.typography.bodySmall, maxLines = 2)
+                    Text(platform.detail, color = TextMuted, style = MaterialTheme.typography.bodySmall, maxLines = 2)
                 }
-                Text(
-                    "استعادة الحصة خلال ${formatCountdown(platform.resetAtEpochMs - now)}",
-                    color = EmeraldSoft,
-                    style = MaterialTheme.typography.labelMedium,
-                    modifier = Modifier.padding(top = 5.dp),
-                )
+                if (platform.resetAtEpochMs > 0L) {
+                    Text(
+                        "تتجدد خلال ${formatCountdown(platform.resetAtEpochMs - now)}",
+                        color = color,
+                        style = MaterialTheme.typography.labelMedium,
+                        modifier = Modifier.padding(top = 5.dp),
+                    )
+                }
             }
         }
     }
@@ -773,13 +1125,32 @@ private fun CinemaPlayerDialog(
                 )
 
                 Row(
-                    modifier = Modifier.fillMaxWidth().background(Color.Black.copy(alpha = 0.58f)).statusBarsPadding().padding(8.dp).align(Alignment.TopCenter),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color.Black.copy(alpha = 0.58f))
+                        .statusBarsPadding()
+                        .padding(8.dp)
+                        .align(Alignment.TopCenter),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    IconButton(onClick = onDismiss) { Icon(Icons.Default.Close, "إغلاق", tint = Color.White) }
-                    Text(movieName, color = Color.White, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                    Surface(shape = RoundedCornerShape(999.dp), color = Emerald.copy(alpha = 0.18f)) {
-                        Text("AR", modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp), color = EmeraldSoft, fontWeight = FontWeight.Bold)
+                    IconButton(onClick = onDismiss) {
+                        Icon(Icons.Default.Close, contentDescription = "إغلاق", tint = Color.White)
+                    }
+                    Text(
+                        movieName,
+                        color = Color.White,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Surface(shape = RoundedCornerShape(999.dp), color = Accent.copy(alpha = 0.18f)) {
+                        Text(
+                            "AR",
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                            color = AccentSoft,
+                            fontWeight = FontWeight.Bold,
+                        )
                     }
                 }
 
@@ -788,10 +1159,17 @@ private fun CinemaPlayerDialog(
                     shape = RoundedCornerShape(999.dp),
                     color = Color.Black.copy(alpha = 0.70f),
                 ) {
-                    Row(modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
-                        TextButton(onClick = { subtitleSize = (subtitleSize - 2f).coerceAtLeast(16f) }) { Text("A−", color = Color.White) }
-                        Text("ترجمة", color = Color.White.copy(alpha = 0.72f), style = MaterialTheme.typography.labelMedium)
-                        TextButton(onClick = { subtitleSize = (subtitleSize + 2f).coerceAtMost(34f) }) { Text("A+", color = Color.White) }
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        TextButton(onClick = { subtitleSize = (subtitleSize - 2f).coerceAtLeast(16f) }) {
+                            Text("A−", color = Color.White)
+                        }
+                        Text("حجم الترجمة", color = Color.White.copy(alpha = 0.72f), style = MaterialTheme.typography.labelMedium)
+                        TextButton(onClick = { subtitleSize = (subtitleSize + 2f).coerceAtMost(34f) }) {
+                            Text("A+", color = Color.White)
+                        }
                     }
                 }
             }
