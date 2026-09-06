@@ -5,11 +5,11 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 
 /**
- * Minimal SentencePiece BPE reader used by the on-device NLLB translator.
+ * Minimal SentencePiece BPE reader shared by the local translation engines.
  *
- * Adapted from the MIT-licensed Android implementation used by Light-Translator /
- * InstantVoiceTranslate. Keeping tokenization in Kotlin avoids adding another native tokenizer
- * library beside ONNX Runtime.
+ * The implementation stays in Kotlin so the app does not need a second native tokenizer runtime
+ * next to Whisper and ONNX Runtime. Besides numeric ids it can expose raw SentencePiece tokens;
+ * M2M100 needs those tokens because its model ids come from vocab.json rather than SPM ids.
  */
 internal class SentencePieceBpe {
     private data class VocabPiece(
@@ -28,8 +28,8 @@ internal class SentencePieceBpe {
     fun loadModel(modelFile: File) {
         val bytes = modelFile.readBytes()
         pieces = parseModelProto(bytes)
-        require(pieces.size > 250_000) {
-            "ملف مفردات NLLB غير صالح أو غير مكتمل."
+        require(pieces.size > 50_000) {
+            "ملف SentencePiece غير صالح أو غير مكتمل."
         }
         pieceToId = HashMap<String, Int>(pieces.size * 2).also { map ->
             pieces.forEachIndexed { index, piece -> map[piece.piece] = index }
@@ -40,8 +40,14 @@ internal class SentencePieceBpe {
         unkId = pieceToId["<unk>"] ?: 0
     }
 
-    fun encode(text: String): IntArray {
-        if (text.isEmpty()) return intArrayOf()
+    fun encode(text: String): IntArray = encodePieces(text).map { piece ->
+        pieceToId[piece] ?: unkId
+    }.toIntArray()
+
+    fun encodePieces(text: String): List<String> {
+        if (text.isEmpty()) return emptyList()
+        check(pieces.isNotEmpty()) { "SentencePiece غير جاهز." }
+
         val normalized = SPACE_MARKER_STR + text.replace(" ", SPACE_MARKER_STR)
         val symbols = ArrayList<String>(normalized.length)
         normalized.forEach { symbols += it.toString() }
@@ -63,14 +69,15 @@ internal class SentencePieceBpe {
             symbols.removeAt(bestIndex + 1)
         }
 
-        return IntArray(symbols.size) { index -> pieceToId[symbols[index]] ?: unkId }
+        return symbols
     }
 
-    fun decode(ids: IntArray): String {
-        val result = StringBuilder()
-        ids.forEach { id -> result.append(idToPiece[id].orEmpty()) }
-        return result.toString().replace(SPACE_MARKER, ' ').trimStart()
-    }
+    fun decode(ids: IntArray): String = decodePieces(ids.map { id -> idToPiece[id].orEmpty() })
+
+    fun decodePieces(tokens: List<String>): String = tokens
+        .joinToString(separator = "")
+        .replace(SPACE_MARKER, ' ')
+        .trimStart()
 
     fun close() {
         pieces = emptyList()
