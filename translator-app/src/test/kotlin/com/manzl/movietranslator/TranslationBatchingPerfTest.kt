@@ -6,7 +6,7 @@ import org.junit.Test
 
 class TranslationBatchingPerfTest {
     @Test
-    fun small100Runtime_capsThreadsAndSequenceLengthsForMobile() {
+    fun small100Runtime_capsThreadsSequenceLengthsAndBeamForMobile() {
         assertEquals(2, TurkishArabicTranslator.stableThreadCount(4))
         assertEquals(3, TurkishArabicTranslator.stableThreadCount(6))
         assertEquals(4, TurkishArabicTranslator.stableThreadCount(8))
@@ -14,6 +14,7 @@ class TranslationBatchingPerfTest {
 
         assertTrue(TurkishArabicTranslator.maxInputTokensForTest() <= 160)
         assertTrue(TurkishArabicTranslator.maxOutputTokensForTest() <= 112)
+        assertEquals(3, TurkishArabicTranslator.beamWidthForTest())
         assertEquals(128006L, Small100Tokenizer.EXPECTED_ARABIC_TOKEN_ID)
     }
 
