@@ -17,6 +17,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -26,11 +27,6 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
 
-/**
- * One-tap cloud path. The video never leaves the phone: only a speech-optimized Opus audio copy is
- * uploaded to the private gateway. Movies up to two hours use one hidden part; movies above two and
- * up to three hours use exactly two hidden parts. One unified, reviewed Arabic SRT is returned.
- */
 class CloudMovieTranslationService : Service() {
     companion object {
         private const val ACTION_START = "com.manzl.movietranslator.cloud.START"
@@ -46,7 +42,7 @@ class CloudMovieTranslationService : Service() {
 
         @Volatile private var activeService: CloudMovieTranslationService? = null
 
-        fun selectVideo(context: Context, uri: Uri, displayName: String) {
+        fun selectVideo(context: Context, uri: Uri, displayName: String, movieKeyOverride: String? = null) {
             if (_state.value.isRunning) return
             val durationMs = readMovieDurationMs(context, uri)
             val partCount = when {
@@ -55,15 +51,13 @@ class CloudMovieTranslationService : Service() {
                 durationMs <= MAX_MOVIE_MS -> 2
                 else -> 0
             }
+            val movieKey = movieKeyOverride ?: CloudLibraryClient.movieKey(displayName, durationMs)
             _state.value = TranslatorUiState(
                 videoUri = uri,
                 videoName = displayName,
+                movieKey = movieKey,
                 videoDurationMs = durationMs,
-                stage = if (durationMs > MAX_MOVIE_MS) {
-                    "هذا الفيلم أطول من 3 ساعات، والحد الحالي 3 ساعات."
-                } else {
-                    "جاهز • اضغط ترجمة فقط"
-                },
+                stage = if (durationMs > MAX_MOVIE_MS) "الفيلم أطول من الحد الحالي" else "جاهز للتنفيذ",
                 partCount = partCount,
             )
         }
@@ -79,7 +73,7 @@ class CloudMovieTranslationService : Service() {
                 it.copy(
                     isRunning = true,
                     progress = 0f,
-                    stage = "تجهيز الفيلم…",
+                    stage = "بدء المهمة…",
                     error = null,
                     cues = emptyList(),
                     srtFile = null,
@@ -137,11 +131,7 @@ class CloudMovieTranslationService : Service() {
         super.onCreate()
         activeService = this
         getSystemService(NotificationManager::class.java).createNotificationChannel(
-            NotificationChannel(
-                CHANNEL_ID,
-                "ترجمة الأفلام",
-                NotificationManager.IMPORTANCE_LOW,
-            )
+            NotificationChannel(CHANNEL_ID, "ترجمة الأفلام", NotificationManager.IMPORTANCE_LOW)
         )
     }
 
@@ -153,9 +143,7 @@ class CloudMovieTranslationService : Service() {
                     startForeground(NOTIFICATION_ID, notification("تجهيز الصوت…", 2, true))
                     beginTranslation()
                 }.onFailure { error ->
-                    _state.update {
-                        it.copy(isRunning = false, error = error.message ?: "تعذر بدء الترجمة.")
-                    }
+                    _state.update { it.copy(isRunning = false, error = error.message ?: "تعذر بدء الترجمة.") }
                     stopSelf()
                 }
             }
@@ -186,40 +174,32 @@ class CloudMovieTranslationService : Service() {
                     }
                 check(durationMs in 1..MAX_MOVIE_MS) { "يدعم التطبيق أفلامًا حتى 3 ساعات حاليًا." }
 
-                publish(0.03f, "ضغط الصوت بجودة مخصصة للكلام…", force = true)
+                publish(0.02f, "استخراج الصوت من الفيلم", force = true)
                 parts = CloudAudioExtractor(applicationContext).prepare(
                     uri = uri,
                     durationMs = durationMs,
                 ) { done, total ->
-                    val ratio = done.toFloat() / total.coerceAtLeast(1).toFloat()
-                    publish(0.03f + ratio * 0.14f, "تجهيز الصوت ${done.coerceAtMost(total)} من $total…")
+                    if (total > 1) {
+                        val ratio = done.toFloat() / total.coerceAtLeast(1).toFloat()
+                        publish(0.02f + ratio * 0.10f, "تجهيز جزء الصوت $done من $total")
+                    }
                 }
+                publish(0.15f, "تم تجهيز الصوت", force = true)
 
                 val bytes = parts.sumOf { it.file.length() }
                 _state.update {
-                    it.copy(
-                        uploadedBytes = bytes,
-                        partCount = parts.size,
-                        videoDurationMs = durationMs,
-                    )
+                    it.copy(uploadedBytes = bytes, partCount = parts.size, videoDurationMs = durationMs)
                 }
 
-                publish(0.18f, "إرسال الصوت للسحابة الخاصة…", force = true)
                 val cloud = CloudTranslationClient(applicationContext).translate(
                     parts = parts,
                     onUploadProgress = { uploadProgress ->
-                        if (uploadProgress < 0.995f) {
-                            publish(0.18f + uploadProgress * 0.30f, "رفع الصوت فقط…")
-                        } else {
-                            publish(0.50f, "السحابة تتعرف على الحوار التركي…", force = true)
-                        }
+                        publish(0.15f + uploadProgress.coerceIn(0f, 1f) * 0.30f, "رفع الصوت للمنصة")
                     },
-                    onStage = { stage, progress ->
-                        publish(progress, stage, force = true)
-                    },
+                    onStage = { stage, progress -> publish(progress, stage, force = true) },
                 )
 
-                publish(0.97f, "تنسيق الترجمة العربية والتوقيت…", force = true)
+                publish(0.97f, "حفظ الترجمة", force = true)
                 val output = withContext(Dispatchers.IO) {
                     val dir = File(filesDir, "subtitles").apply { mkdirs() }
                     val safeBase = snapshot.videoName
@@ -233,17 +213,44 @@ class CloudMovieTranslationService : Service() {
                 }
 
                 val elapsed = SystemClock.elapsedRealtime() - startedAt
+                val movieKey = snapshot.movieKey.ifBlank {
+                    CloudLibraryClient.movieKey(snapshot.videoName, durationMs)
+                }
+                val srtText = withContext(Dispatchers.IO) { output.readText(Charsets.UTF_8) }
+
+                // Keep the cloud library in sync. Retry briefly because the translation itself is
+                // already complete and should not be lost to a transient network failure.
+                var synced = false
+                repeat(2) { attempt ->
+                    if (!synced) {
+                        synced = runCatching {
+                            CloudLibraryClient(applicationContext).saveTranslation(
+                                movieKey = movieKey,
+                                movieName = snapshot.videoName,
+                                videoUri = uri,
+                                durationMs = durationMs,
+                                srtText = srtText,
+                                cueCount = cloud.cues.size,
+                                processingMs = elapsed,
+                            )
+                        }.isSuccess
+                        if (!synced && attempt == 0) delay(700L)
+                    }
+                }
+
                 val providerText = cloud.providers.ifBlank { "Whisper Large V3 + Gemini" }
                 val details = buildString {
                     append(providerText)
                     if (cloud.asrMs > 0L) append(" • استماع ${formatDuration(cloud.asrMs)}")
                     if (cloud.translationMs > 0L) append(" • ترجمة ومراجعة ${formatDuration(cloud.translationMs)}")
+                    if (!synced) append(" • الترجمة محفوظة محليًا")
                 }
                 _state.update {
                     it.copy(
                         isRunning = false,
                         progress = 1f,
-                        stage = "اكتملت الترجمة خلال ${formatDuration(elapsed)}",
+                        stage = "اكتملت الترجمة",
+                        movieKey = movieKey,
                         cues = cloud.cues,
                         srtFile = output,
                         uploadedBytes = bytes,
@@ -254,13 +261,7 @@ class CloudMovieTranslationService : Service() {
                 }
                 postCompletionNotification(snapshot.videoName, elapsed)
             } catch (cancelled: CancellationException) {
-                _state.update {
-                    it.copy(
-                        isRunning = false,
-                        stage = "تم إيقاف الترجمة",
-                        error = null,
-                    )
-                }
+                _state.update { it.copy(isRunning = false, stage = "تم إيقاف الترجمة", error = null) }
                 throw cancelled
             } catch (error: Throwable) {
                 _state.update {
@@ -280,14 +281,7 @@ class CloudMovieTranslationService : Service() {
 
     private fun publish(progress: Float, stage: String, force: Boolean = false) {
         val bounded = progress.coerceIn(0f, 1f)
-        val elapsed = SystemClock.elapsedRealtime() - startedAt
-        _state.update {
-            it.copy(
-                isRunning = true,
-                progress = bounded,
-                stage = "$stage\nمضى ${formatDuration(elapsed)}",
-            )
-        }
+        _state.update { it.copy(isRunning = true, progress = bounded, stage = stage) }
         val percent = (bounded * 100f).toInt().coerceIn(0, 100)
         if (force || percent - lastNotificationPercent >= 4) {
             lastNotificationPercent = percent
