@@ -57,12 +57,7 @@ internal class CloudLibraryClient(private val context: Context) {
         }
     }
 
-    suspend fun upsertPath(
-        movieKey: String,
-        movieName: String,
-        videoUri: Uri,
-        durationMs: Long,
-    ) = withContext(Dispatchers.IO) {
+    suspend fun upsertPath(movieKey: String, movieName: String, videoUri: Uri, durationMs: Long) = withContext(Dispatchers.IO) {
         post(
             JSONObject()
                 .put("mode", "library_upsert_path")
@@ -99,13 +94,34 @@ internal class CloudLibraryClient(private val context: Context) {
         Unit
     }
 
-    suspend fun deleteTranslation(movieKey: String) = withContext(Dispatchers.IO) {
+    suspend fun recordUsage(durationMs: Long, providers: String) = withContext(Dispatchers.IO) {
+        val totalSeconds = (durationMs.coerceAtLeast(0L) / 1000L).coerceAtMost(10_800L)
+        val lower = providers.lowercase()
+        val hasGroq = "whisper" in lower || "groq" in lower
+        val hasGeminiAudio = "audio" in lower && "gemini" in lower
+        val groqSeconds = when {
+            hasGroq && hasGeminiAudio && totalSeconds > 7_200L -> 7_200L
+            hasGroq -> totalSeconds
+            else -> 0L
+        }
+        val geminiAudioSeconds = when {
+            hasGeminiAudio -> (totalSeconds - groqSeconds).coerceAtLeast(0L)
+            hasGroq -> 0L
+            else -> totalSeconds
+        }
         post(
             JSONObject()
-                .put("mode", "library_delete_translation")
+                .put("mode", "usage_record")
                 .put("device_hash", deviceHash)
-                .put("movie_key", movieKey)
+                .put("groq_audio_seconds", groqSeconds)
+                .put("gemini_audio_seconds", geminiAudioSeconds)
+                .put("gemini_requests", 2)
         )
+        Unit
+    }
+
+    suspend fun deleteTranslation(movieKey: String) = withContext(Dispatchers.IO) {
+        post(JSONObject().put("mode", "library_delete_translation").put("device_hash", deviceHash).put("movie_key", movieKey))
         Unit
     }
 
@@ -139,7 +155,7 @@ internal class CloudLibraryClient(private val context: Context) {
     }.getOrDefault(false)
 
     private fun post(payload: JSONObject, timeoutMs: Int = 25_000): JSONObject {
-        val connection = (URL(CloudTranslationClient.ENDPOINT).openConnection() as HttpURLConnection).apply {
+        val connection = (URL(ENDPOINT).openConnection() as HttpURLConnection).apply {
             connectTimeout = 15_000
             readTimeout = timeoutMs
             requestMethod = "POST"
@@ -158,7 +174,7 @@ internal class CloudLibraryClient(private val context: Context) {
             if (status !in 200..299) {
                 val message = root.optString("message").takeIf { it.isNotBlank() }
                     ?: root.optString("error").takeIf { it.isNotBlank() }
-                    ?: "تعذر الاتصال بالمنصة ($status)."
+                    ?: "تعذر الاتصال بمكتبة المنصة ($status)."
                 error(message)
             }
             root
@@ -168,10 +184,11 @@ internal class CloudLibraryClient(private val context: Context) {
     }
 
     companion object {
+        private const val ENDPOINT = "https://lbgcjmsqqhrpceijdqng.supabase.co/functions/v1/movie-library"
+
         fun movieKey(name: String, durationMs: Long): String {
             val normalized = name.trim().lowercase() + "|" + durationMs
-            val digest = MessageDigest.getInstance("SHA-256")
-                .digest(normalized.toByteArray(Charsets.UTF_8))
+            val digest = MessageDigest.getInstance("SHA-256").digest(normalized.toByteArray(Charsets.UTF_8))
             return digest.joinToString("") { "%02x".format(it) }.take(32)
         }
     }
