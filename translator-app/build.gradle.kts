@@ -64,6 +64,10 @@ dependencies {
 
     // Cloud-first audio path. The audio-only build provides Opus resampling/encoding.
     implementation("dev.ffmpegkit-maintained:ffmpeg-kit-audio:8.1.7")
+    // ffmpeg-kit-audio 8.1.7's published POM currently omits this runtime dependency even though
+    // FFmpegKitConfig references it. Without it Android crashes with NoClassDefFoundError for
+    // com.arthenica.smartexception.java.Exceptions / FFmpegKitConfig as soon as cloud audio starts.
+    implementation("com.arthenica:smart-exception-java:0.2.1")
 
     // Temporary rollback dependencies; the active user flow is cloud-first.
     implementation("dev.ffmpegkit-maintained:whisper-android:1.0.0")
