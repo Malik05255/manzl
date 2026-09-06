@@ -388,7 +388,7 @@ internal class CloudTranslationClient(context: Context) {
         error("استغرقت مرحلة $stageName وقتًا أطول من المتوقع.")
     }
 
-    private fun uploadGeminiFile(
+    private suspend fun uploadGeminiFile(
         file: File,
         apiKey: String,
         totalFileBytes: Long,
