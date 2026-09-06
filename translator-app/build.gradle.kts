@@ -59,8 +59,8 @@ dependencies {
     implementation(libs.androidx.lifecycle.runtime.compose.android)
 
     implementation("dev.ffmpegkit-maintained:whisper-android:1.0.0")
-    implementation("dev.ffmpegkit-maintained:llama-android:0.1.1")
     implementation("com.cloudflare.realtimekit.android-vad:silero:2.0.10-cf.4")
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.2")
 
     implementation("androidx.media3:media3-exoplayer:1.10.1")
     implementation("androidx.media3:media3-ui:1.10.1")
