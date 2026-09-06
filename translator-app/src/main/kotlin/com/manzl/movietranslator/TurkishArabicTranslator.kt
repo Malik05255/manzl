@@ -1,5 +1,6 @@
 package com.manzl.movietranslator
 
+import ai.onnxruntime.OnnxJavaType
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
 import ai.onnxruntime.OrtSession
@@ -11,26 +12,23 @@ import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.nio.ByteBuffer
 import java.nio.FloatBuffer
 import java.nio.LongBuffer
 import java.util.Locale
 
 /**
- * Direct on-device Turkish -> Arabic translation with quantized M2M100-418M.
+ * Fast direct Turkish -> Arabic subtitle translation with int8 SMaLL-100.
  *
- * Two design choices are deliberate:
- * 1) M2M100 translates Turkish directly to Arabic instead of pivoting through English.
- * 2) Whisper fragments are rebuilt into complete dialogue sentences before translation. The Arabic
- *    sentence keeps the full time span instead of being chopped back into Turkish-shaped pieces.
- *
- * The decoder uses KV caching, so only the newest output token is evaluated after the first step.
+ * SMaLL-100 is a distilled M2M-100 model with a shallow 3-layer decoder. Unlike ML Kit, it does not
+ * pivot Turkish through English. Whisper fragments are rebuilt into complete dialogue sentences
+ * before translation and the Arabic sentence keeps the full source time span.
  */
 class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
     private var env: OrtEnvironment? = null
     private var encoder: OrtSession? = null
     private var decoder: OrtSession? = null
-    private var decoderWithPast: OrtSession? = null
-    private var tokenizer: M2M100Tokenizer? = null
+    private var tokenizer: Small100Tokenizer? = null
     private var failed = false
 
     suspend fun ensureModel(
@@ -49,7 +47,7 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
             val modelDir = manager.ensureModel(onProgress)
             initializeSessions(modelDir)
         }.onFailure { error ->
-            Log.e(TAG, "Failed to initialize M2M100", error)
+            Log.e(TAG, "Failed to initialize SMaLL-100", error)
             close()
         }.isSuccess
 
@@ -63,7 +61,7 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
         deadlineAtElapsedRealtimeMs: Long = Long.MAX_VALUE,
         onProgress: (done: Int, total: Int) -> Unit,
     ): List<SubtitleCue> = withContext(Dispatchers.Default) {
-        check(isReady()) { "مترجم M2M100 التركي ← العربي غير جاهز." }
+        check(isReady()) { "مترجم SMaLL-100 التركي ← العربي غير جاهز." }
         val source = cues.filter { it.sourceText.isNotBlank() }.sortedBy { it.startMs }
         if (source.isEmpty()) return@withContext emptyList()
 
@@ -73,7 +71,7 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
         val compatibilityFillers = ArrayList<SubtitleCue>()
         var consumedSourceCues = 0
 
-        segments.forEach { segment ->
+        for (segment in segments) {
             currentCoroutineContext().ensureActive()
             val key = normalizeTurkish(segment.sourceText)
             val translated = COMMON_PHRASES[key]
@@ -86,10 +84,8 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
             val representedCueCount = segment.confidence.toInt().coerceAtLeast(1)
             output += segment.copy(translatedText = translated, confidence = 1f)
 
-            // MovieTranslationService currently guards against source-cue loss by comparing list
-            // sizes. Keep that invariant without breaking the Arabic sentence back into Turkish
-            // fragments: invisible fillers are appended after all real cues and SrtFormatter drops
-            // them before rendering.
+            // Preserve the service's source-count invariant without chopping an Arabic sentence back
+            // into Turkish-shaped fragments. SrtFormatter removes these invisible filler cues.
             repeat((representedCueCount - 1).coerceAtLeast(0)) {
                 compatibilityFillers += SubtitleCue(
                     startMs = segment.endMs,
@@ -119,72 +115,61 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
         try {
             val enc = runtime.createSession(File(modelDir, ENCODER_FILENAME).absolutePath, options)
             val dec = runtime.createSession(File(modelDir, DECODER_FILENAME).absolutePath, options)
-            val cached = runtime.createSession(File(modelDir, DECODER_WITH_PAST_FILENAME).absolutePath, options)
-            val tok = M2M100Tokenizer().also { it.initialize(modelDir) }
-
+            val tok = Small100Tokenizer().also { it.initialize(modelDir) }
             env = runtime
             encoder = enc
             decoder = dec
-            decoderWithPast = cached
             tokenizer = tok
         } finally {
             options.close()
         }
     }
 
-    private fun translateWithQualityFallback(
+    private suspend fun translateWithQualityFallback(
         sourceText: String,
         deadlineAtElapsedRealtimeMs: Long,
     ): String {
         val first = cleanArabicCandidate(runInference(sourceText))
         if (!translationNeedsRepair(sourceText, first)) return first
 
-        // Only pay for a second pass when the first output is structurally bad. Splitting at real
-        // Turkish sentence boundaries is safer than feeding artificial markers to a translation model.
+        // A second pass is exceptional: only structurally bad output and only when budget remains.
         val remaining = deadlineAtElapsedRealtimeMs - SystemClock.elapsedRealtime()
         if (remaining > RETRY_MIN_REMAINING_MS) {
             val clauses = splitTurkishSentences(sourceText)
             if (clauses.size > 1) {
-                val repaired = clauses.joinToString(" ") { clause ->
-                    cleanArabicCandidate(runInference(clause))
+                val repaired = buildString {
+                    clauses.forEachIndexed { index, clause ->
+                        currentCoroutineContext().ensureActive()
+                        if (index > 0) append(' ')
+                        append(cleanArabicCandidate(runInference(clause)))
+                    }
                 }.trim()
                 if (!translationNeedsRepair(sourceText, repaired)) return repaired
             }
         }
-
         return first.ifBlank { sourceText.trim() }
     }
 
-    private fun runInference(text: String): String {
+    private suspend fun runInference(text: String): String {
         val runtime = env ?: error("ONNX Runtime غير جاهز.")
-        val enc = encoder ?: error("M2M100 encoder غير جاهز.")
-        val dec = decoder ?: error("M2M100 decoder غير جاهز.")
-        val cachedDecoder = decoderWithPast ?: error("M2M100 cached decoder غير جاهز.")
-        val tok = tokenizer ?: error("M2M100 tokenizer غير جاهز.")
+        val enc = encoder ?: error("SMaLL-100 encoder غير جاهز.")
+        val dec = decoder ?: error("SMaLL-100 decoder غير جاهز.")
+        val tok = tokenizer ?: error("SMaLL-100 tokenizer غير جاهز.")
 
-        var inputIds = tok.encodeTurkish(text)
+        var inputIds = tok.encodeForArabic(text)
         if (inputIds.size > MAX_INPUT_TOKENS) {
             inputIds = inputIds.copyOfRange(0, MAX_INPUT_TOKENS - 1) +
-                longArrayOf(M2M100Tokenizer.EOS_TOKEN_ID)
+                longArrayOf(Small100Tokenizer.EOS_TOKEN_ID)
         }
         val attentionMask = LongArray(inputIds.size) { 1L }
-        val outputTokens = mutableListOf<Long>()
+        val generationLimit = (inputIds.size * 2 + 8).coerceIn(MIN_OUTPUT_TOKENS, MAX_OUTPUT_TOKENS)
+        val outputTokens = ArrayList<Long>(generationLimit)
         val started = SystemClock.elapsedRealtime()
 
-        val inputTensor = OnnxTensor.createTensor(
-            runtime,
-            LongBuffer.wrap(inputIds),
-            longArrayOf(1, inputIds.size.toLong()),
-        )
-        val maskTensor = OnnxTensor.createTensor(
-            runtime,
-            LongBuffer.wrap(attentionMask),
-            longArrayOf(1, attentionMask.size.toLong()),
-        )
-
+        val inputTensor = long2d(runtime, inputIds)
+        val maskTensor = long2d(runtime, attentionMask)
         var encoderResult: OrtSession.Result? = null
-        val encoderKvCache = mutableMapOf<String, OnnxTensor>()
-        var decoderKvCache = mutableMapOf<String, OnnxTensor>()
+        var past = emptyPast(runtime)
 
         try {
             encoderResult = enc.run(
@@ -194,77 +179,49 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
                 )
             )
             val hiddenStates = encoderResult[0] as OnnxTensor
-            val targetLanguageToken = tok.arabicTargetTokenId()
 
-            // M2M100 generation starts with EOS, then forces the target-language token as the first
-            // generated token. The initial decoder call also materializes encoder/self KV caches.
-            val firstInputIds = OnnxTensor.createTensor(
-                runtime,
-                LongBuffer.wrap(longArrayOf(M2M100Tokenizer.EOS_TOKEN_ID)),
-                longArrayOf(1, 1),
-            )
-            val firstInputs = mutableMapOf<String, OnnxTensor>(
-                "input_ids" to firstInputIds,
-                "encoder_hidden_states" to hiddenStates,
-                "encoder_attention_mask" to maskTensor,
-            )
-            val firstResult = dec.run(firstInputs)
-            outputTokens += targetLanguageToken
+            var currentToken = Small100Tokenizer.DECODER_START_TOKEN_ID
+            var useCache = false
 
-            try {
-                val expectedNames = cachedDecoder.inputNames
-                val initialCache = extractKvCache(firstResult, runtime, expectedNames)
-                initialCache.forEach { (name, tensor) ->
-                    if (name.contains(".encoder.")) encoderKvCache[name] = tensor
-                    else decoderKvCache[name] = tensor
-                }
-            } finally {
-                firstResult.close()
-                firstInputIds.close()
-            }
-
-            val expectedNames = cachedDecoder.inputNames
-            var nextInput = targetLanguageToken
-            var generated = 0
-            while (generated < MAX_OUTPUT_TOKENS) {
+            repeat(generationLimit) {
                 currentCoroutineContext().ensureActive()
-                generated++
-                val stepInputIds = OnnxTensor.createTensor(
-                    runtime,
-                    LongBuffer.wrap(longArrayOf(nextInput)),
-                    longArrayOf(1, 1),
-                )
-                val stepInputs = mutableMapOf<String, OnnxTensor>("input_ids" to stepInputIds)
-                if ("encoder_hidden_states" in expectedNames) {
-                    stepInputs["encoder_hidden_states"] = hiddenStates
-                }
-                if ("encoder_attention_mask" in expectedNames) {
-                    stepInputs["encoder_attention_mask"] = maskTensor
-                }
-                stepInputs.putAll(decoderKvCache)
-                stepInputs.putAll(encoderKvCache)
-
-                val stepResult = cachedDecoder.run(stepInputs)
-                val logits = stepResult[0] as OnnxTensor
-                val nextToken = argMax(logits)
-
-                decoderKvCache.values.forEach { runCatching { it.close() } }
-                decoderKvCache = mutableMapOf()
-                stepInputIds.close()
-
-                if (nextToken == M2M100Tokenizer.EOS_TOKEN_ID) {
-                    stepResult.close()
-                    break
+                val stepInput = long2d(runtime, longArrayOf(currentToken))
+                val cacheFlag = boolTensor(runtime, useCache)
+                val feeds = HashMap<String, OnnxTensor>(past.size + 4).apply {
+                    put("input_ids", stepInput)
+                    put("encoder_hidden_states", hiddenStates)
+                    put("encoder_attention_mask", maskTensor)
+                    put("use_cache_branch", cacheFlag)
+                    putAll(past)
                 }
 
-                outputTokens += nextToken
-                nextInput = nextToken
-                decoderKvCache = extractDecoderOnlyKvCache(stepResult, runtime, expectedNames)
-                stepResult.close()
+                val result = dec.run(feeds)
+                try {
+                    val logits = result[0] as OnnxTensor
+                    val nextToken = argMaxLast(logits)
+                    val nextPast = rollPast(
+                        outputs = result,
+                        runtime = runtime,
+                        wasCache = useCache,
+                        previous = past,
+                    )
+                    closePastReplacedBy(past, keepEncoder = useCache)
+                    past = nextPast
+
+                    if (nextToken == Small100Tokenizer.EOS_TOKEN_ID) return@repeat
+                    outputTokens += nextToken
+                    currentToken = nextToken
+                    useCache = true
+                } finally {
+                    result.close()
+                    stepInput.close()
+                    cacheFlag.close()
+                }
+
+                if (outputTokens.lastOrNull() == Small100Tokenizer.EOS_TOKEN_ID) return@repeat
             }
         } finally {
-            decoderKvCache.values.forEach { runCatching { it.close() } }
-            encoderKvCache.values.forEach { runCatching { it.close() } }
+            past.values.toSet().forEach { runCatching { it.close() } }
             encoderResult?.close()
             inputTensor.close()
             maskTensor.close()
@@ -273,15 +230,86 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
         val result = tok.decodeArabic(outputTokens.toLongArray())
         Log.d(
             TAG,
-            "M2M100 ${text.length} chars -> ${result.length} chars in " +
+            "SMaLL-100 ${text.length} chars -> ${result.length} chars in " +
                 "${SystemClock.elapsedRealtime() - started} ms",
         )
         return result
     }
 
-    private fun argMax(logits: OnnxTensor): Long {
+    private fun long2d(runtime: OrtEnvironment, values: LongArray): OnnxTensor =
+        OnnxTensor.createTensor(
+            runtime,
+            LongBuffer.wrap(values),
+            longArrayOf(1, values.size.toLong()),
+        )
+
+    private fun boolTensor(runtime: OrtEnvironment, value: Boolean): OnnxTensor {
+        val bytes = ByteBuffer.wrap(byteArrayOf(if (value) 1 else 0))
+        return OnnxTensor.createTensor(runtime, bytes, longArrayOf(1), OnnxJavaType.BOOL)
+    }
+
+    private fun emptyPast(runtime: OrtEnvironment): MutableMap<String, OnnxTensor> {
+        val result = mutableMapOf<String, OnnxTensor>()
+        for (layer in 0 until DECODER_LAYERS) {
+            for (kind in listOf("decoder", "encoder")) {
+                for (kv in listOf("key", "value")) {
+                    result["past_key_values.$layer.$kind.$kv"] = OnnxTensor.createTensor(
+                        runtime,
+                        FloatBuffer.allocate(0),
+                        longArrayOf(1, ATTENTION_HEADS, 0, HEAD_DIM),
+                    )
+                }
+            }
+        }
+        return result
+    }
+
+    /** Decoder KV changes every step; encoder KV is frozen after the first merged-decoder call. */
+    private fun rollPast(
+        outputs: OrtSession.Result,
+        runtime: OrtEnvironment,
+        wasCache: Boolean,
+        previous: Map<String, OnnxTensor>,
+    ): MutableMap<String, OnnxTensor> {
+        val result = mutableMapOf<String, OnnxTensor>()
+        for (layer in 0 until DECODER_LAYERS) {
+            for (kv in listOf("key", "value")) {
+                val decoderName = "present.$layer.decoder.$kv"
+                val decoderTensor = outputs.get(decoderName).orElse(null) as? OnnxTensor
+                    ?: error("SMaLL-100 missing output $decoderName")
+                result["past_key_values.$layer.decoder.$kv"] = cloneTensor(decoderTensor, runtime)
+
+                val encoderInput = "past_key_values.$layer.encoder.$kv"
+                if (wasCache) {
+                    result[encoderInput] = previous.getValue(encoderInput)
+                } else {
+                    val encoderName = "present.$layer.encoder.$kv"
+                    val encoderTensor = outputs.get(encoderName).orElse(null) as? OnnxTensor
+                        ?: error("SMaLL-100 missing output $encoderName")
+                    result[encoderInput] = cloneTensor(encoderTensor, runtime)
+                }
+            }
+        }
+        return result
+    }
+
+    private fun closePastReplacedBy(previous: Map<String, OnnxTensor>, keepEncoder: Boolean) {
+        previous.forEach { (name, tensor) ->
+            if (!keepEncoder || name.contains(".decoder.")) runCatching { tensor.close() }
+        }
+    }
+
+    private fun cloneTensor(tensor: OnnxTensor, runtime: OrtEnvironment): OnnxTensor {
+        val buffer = tensor.floatBuffer
+        val data = FloatArray(buffer.remaining())
+        buffer.get(data)
+        return OnnxTensor.createTensor(runtime, FloatBuffer.wrap(data), tensor.info.shape)
+    }
+
+    private fun argMaxLast(logits: OnnxTensor): Long {
+        val shape = logits.info.shape
+        val vocabularySize = shape.last().toInt()
         val buffer = logits.floatBuffer
-        val vocabularySize = logits.info.shape.last().toInt()
         val start = (buffer.limit() - vocabularySize).coerceAtLeast(0)
         var bestValue = Float.NEGATIVE_INFINITY
         var bestIndex = 0L
@@ -293,48 +321,6 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
             }
         }
         return bestIndex
-    }
-
-    private fun extractKvCache(
-        outputs: OrtSession.Result,
-        runtime: OrtEnvironment,
-        expectedInputNames: Set<String>,
-    ): MutableMap<String, OnnxTensor> {
-        val result = mutableMapOf<String, OnnxTensor>()
-        for ((name, _) in outputs) {
-            if (!name.startsWith("present")) continue
-            val inputName = name.replace("present", "past_key_values")
-            if (inputName !in expectedInputNames) continue
-            val tensor = outputs.get(name).orElse(null) as? OnnxTensor ?: continue
-            result[inputName] = cloneTensor(tensor, runtime)
-        }
-        return result
-    }
-
-    private fun extractDecoderOnlyKvCache(
-        outputs: OrtSession.Result,
-        runtime: OrtEnvironment,
-        expectedInputNames: Set<String>,
-    ): MutableMap<String, OnnxTensor> {
-        val result = mutableMapOf<String, OnnxTensor>()
-        for ((name, _) in outputs) {
-            if (!name.startsWith("present") || name.contains(".encoder.")) continue
-            val inputName = name.replace("present", "past_key_values")
-            if (inputName !in expectedInputNames) continue
-            val tensor = outputs.get(name).orElse(null) as? OnnxTensor ?: continue
-            result[inputName] = cloneTensor(tensor, runtime)
-        }
-        return result
-    }
-
-    private fun cloneTensor(
-        tensor: OnnxTensor,
-        runtime: OrtEnvironment,
-    ): OnnxTensor {
-        val buffer = tensor.floatBuffer
-        val data = FloatArray(buffer.remaining())
-        buffer.get(data)
-        return OnnxTensor.createTensor(runtime, FloatBuffer.wrap(data), tensor.info.shape)
     }
 
     private fun cleanArabicCandidate(value: String): String = value
@@ -359,34 +345,35 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
         return false
     }
 
-    private fun isReady(): Boolean =
-        env != null && encoder != null && decoder != null && decoderWithPast != null && tokenizer != null
+    private fun isReady(): Boolean = env != null && encoder != null && decoder != null && tokenizer != null
 
     override fun close() {
         runCatching { encoder?.close() }
         runCatching { decoder?.close() }
-        runCatching { decoderWithPast?.close() }
         runCatching { tokenizer?.close() }
         encoder = null
         decoder = null
-        decoderWithPast = null
         tokenizer = null
         env = null
     }
 
     companion object {
-        private const val TAG = "ManzlM2M100"
-        private const val ENCODER_FILENAME = "encoder_model_quantized.onnx"
-        private const val DECODER_FILENAME = "decoder_model_quantized.onnx"
-        private const val DECODER_WITH_PAST_FILENAME = "decoder_with_past_model_quantized.onnx"
-        private const val MAX_INPUT_TOKENS = 192
-        private const val MAX_OUTPUT_TOKENS = 144
-        private const val RETRY_MIN_REMAINING_MS = 25_000L
+        private const val TAG = "ManzlSmall100"
+        private const val ENCODER_FILENAME = "encoder_model.onnx"
+        private const val DECODER_FILENAME = "decoder_model_merged.onnx"
+        private const val DECODER_LAYERS = 3
+        private const val ATTENTION_HEADS = 16L
+        private const val HEAD_DIM = 64L
 
-        private const val MAX_SEGMENT_CUES = 5
-        private const val MAX_SEGMENT_CHARS = 260
-        private const val MAX_SEGMENT_SPAN_MS = 12_000L
-        private const val MAX_SEGMENT_GAP_MS = 1_200L
+        private const val MAX_INPUT_TOKENS = 160
+        private const val MIN_OUTPUT_TOKENS = 20
+        private const val MAX_OUTPUT_TOKENS = 112
+        private const val RETRY_MIN_REMAINING_MS = 12_000L
+
+        private const val MAX_SEGMENT_CUES = 4
+        private const val MAX_SEGMENT_CHARS = 190
+        private const val MAX_SEGMENT_SPAN_MS = 9_000L
+        private const val MAX_SEGMENT_GAP_MS = 1_000L
 
         private val TURKISH_LOCALE = Locale.forLanguageTag("tr")
         private val SENTENCE_END = setOf('.', '!', '?', '…')
@@ -415,11 +402,7 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
             .map { it.trim() }
             .filter { it.isNotBlank() }
 
-        /**
-         * Rebuilds Whisper fragments into semantic translation units. Confidence is repurposed
-         * internally to carry how many original cues are represented, so progress and the service's
-         * source-count invariant stay exact while the visible subtitle is sentence-level.
-         */
+        /** Rebuild Whisper fragments into semantic translation units before Arabic generation. */
         private fun buildSourceSegments(cues: List<SubtitleCue>): List<SubtitleCue> {
             if (cues.isEmpty()) return emptyList()
             val ordered = cues.sortedBy { it.startMs }
@@ -453,8 +436,7 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
                 }
 
                 current += cue
-                val endsSentence = cue.sourceText.trimEnd().lastOrNull() in SENTENCE_END
-                if (endsSentence) flush()
+                if (cue.sourceText.trimEnd().lastOrNull() in SENTENCE_END) flush()
             }
             flush()
             return result
