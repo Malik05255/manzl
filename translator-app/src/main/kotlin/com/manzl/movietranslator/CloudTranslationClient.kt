@@ -1,6 +1,7 @@
 package com.manzl.movietranslator
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -42,7 +43,7 @@ class CloudTranslationClient {
                 audioFile.inputStream().buffered(256 * 1024).use { input ->
                     val buffer = ByteArray(256 * 1024)
                     while (true) {
-                        coroutineContext.ensureActive()
+                        currentCoroutineContext().ensureActive()
                         val read = input.read(buffer)
                         if (read <= 0) break
                         output.write(buffer, 0, read)
@@ -58,6 +59,8 @@ class CloudTranslationClient {
             if (status !in 200..299) {
                 val message = runCatching { JSONObject(body).optString("message") }.getOrNull()
                     ?.takeIf { it.isNotBlank() }
+                    ?: runCatching { JSONObject(body).optString("error") }.getOrNull()
+                        ?.takeIf { it.isNotBlank() }
                     ?: "فشل الاتصال بخدمة الترجمة السحابية ($status)."
                 error(message)
             }
