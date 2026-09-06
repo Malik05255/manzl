@@ -60,7 +60,11 @@ dependencies {
 
     implementation("dev.ffmpegkit-maintained:whisper-android:1.0.0")
     implementation("com.cloudflare.realtimekit.android-vad:silero:2.0.10-cf.4")
-    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.19.2")
+
+    // SMaLL-100 runtime: quantized ONNX + the validated Hugging Face fast tokenizer.
+    implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
+    implementation("ai.djl.huggingface:tokenizers:0.33.0")
+    runtimeOnly("ai.djl.android:tokenizer-native:0.33.0")
 
     implementation("androidx.media3:media3-exoplayer:1.10.1")
     implementation("androidx.media3:media3-ui:1.10.1")
