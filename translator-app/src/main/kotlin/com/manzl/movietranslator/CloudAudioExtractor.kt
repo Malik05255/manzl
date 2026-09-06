@@ -1,86 +1,125 @@
 package com.manzl.movietranslator
 
 import android.content.Context
-import android.media.MediaCodec
-import android.media.MediaExtractor
-import android.media.MediaFormat
-import android.media.MediaMuxer
 import android.net.Uri
+import com.arthenica.ffmpegkit.FFmpegKit
+import com.arthenica.ffmpegkit.FFmpegKitConfig
+import com.arthenica.ffmpegkit.ReturnCode
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.File
-import java.nio.ByteBuffer
+import java.util.Locale
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
 
-/** Fast path: copy the existing compressed audio track into a small M4A container without decoding. */
+internal data class CloudAudioPart(
+    val file: File,
+    val offsetMs: Long,
+    val durationMs: Long,
+)
+
+/**
+ * Produces tiny speech-optimized Opus files for the cloud path.
+ *
+ * A movie up to two hours becomes one file. A movie between two and three hours becomes exactly two
+ * files: a two-hour first part and the remaining tail. This keeps the Groq part under the free-tier
+ * upload limit at 24 kbps while respecting the product requirement of at most two hidden parts.
+ */
 class CloudAudioExtractor(private val context: Context) {
-    suspend fun extract(uri: Uri): File = withContext(Dispatchers.IO) {
+    suspend fun prepare(
+        uri: Uri,
+        durationMs: Long,
+        onProgress: (done: Int, total: Int) -> Unit = { _, _ -> },
+    ): List<CloudAudioPart> = withContext(Dispatchers.IO) {
+        require(durationMs in 1..MAX_MOVIE_DURATION_MS) {
+            "يدعم المسار السحابي أفلامًا حتى 3 ساعات حاليًا."
+        }
+
+        val plan = planParts(durationMs)
         val outputDir = File(context.cacheDir, "cloud_audio").apply { mkdirs() }
-        val output = File(outputDir, "audio_${System.currentTimeMillis()}.m4a")
-        val extractor = MediaExtractor()
-        var muxer: MediaMuxer? = null
-        var muxerStarted = false
+        outputDir.listFiles()?.filter { it.name.startsWith("cloud_") }?.forEach { it.delete() }
+
+        val safInput = FFmpegKitConfig.getSafParameterForRead(context, uri)
+        val outputs = ArrayList<CloudAudioPart>(plan.size)
         try {
-            extractor.setDataSource(context, uri, null)
-            val trackIndex = (0 until extractor.trackCount).firstOrNull { index ->
-                extractor.getTrackFormat(index).getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true
-            } ?: error("لم أجد مسارًا صوتيًا داخل الفيديو.")
-
-            val format = extractor.getTrackFormat(trackIndex)
-            val mime = format.getString(MediaFormat.KEY_MIME).orEmpty()
-            require(mime in SUPPORTED_MUX_MIMES) {
-                "صيغة الصوت $mime غير مدعومة في المسار السريع بعد."
+            plan.forEachIndexed { index, spec ->
+                coroutineContext.ensureActive()
+                val output = File(outputDir, "cloud_${System.currentTimeMillis()}_${index + 1}.ogg")
+                transcodePart(
+                    input = safInput,
+                    output = output,
+                    offsetMs = spec.first,
+                    durationMs = spec.second,
+                )
+                check(output.isFile && output.length() > 0L) { "تعذر تجهيز الصوت للسحابة." }
+                check(output.length() <= MAX_PART_BYTES) {
+                    "الصوت المضغوط أكبر من حد الرفع المجاني. جرّب الملف مرة أخرى بعد تحديث التطبيق."
+                }
+                outputs += CloudAudioPart(output, spec.first, spec.second)
+                onProgress(index + 1, plan.size)
             }
-            extractor.selectTrack(trackIndex)
-
-            val activeMuxer = MediaMuxer(output.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-            muxer = activeMuxer
-            val muxTrack = activeMuxer.addTrack(format)
-            activeMuxer.start()
-            muxerStarted = true
-
-            val maxInput = format.getIntegerOrDefault(MediaFormat.KEY_MAX_INPUT_SIZE, 512 * 1024)
-                .coerceIn(64 * 1024, 2 * 1024 * 1024)
-            val buffer = ByteBuffer.allocateDirect(maxInput)
-            val info = MediaCodec.BufferInfo()
-
-            while (true) {
-                currentCoroutineContext().ensureActive()
-                buffer.clear()
-                val size = extractor.readSampleData(buffer, 0)
-                if (size < 0) break
-                info.offset = 0
-                info.size = size
-                info.presentationTimeUs = extractor.sampleTime.coerceAtLeast(0L)
-                info.flags = extractor.sampleFlags
-                activeMuxer.writeSampleData(muxTrack, buffer, info)
-                extractor.advance()
-            }
-            check(output.isFile && output.length() > 0L) { "تعذر استخراج الصوت من الفيديو." }
-            check(output.length() <= MAX_CLOUD_AUDIO_BYTES) {
-                "حجم الصوت المستخرج أكبر من الحد السحابي الحالي (${output.length() / 1024 / 1024}MB)."
-            }
-            output
+            outputs
         } catch (error: Throwable) {
-            output.delete()
+            outputs.forEach { it.file.delete() }
             throw error
-        } finally {
-            if (muxerStarted) runCatching { muxer?.stop() }
-            runCatching { muxer?.release() }
-            runCatching { extractor.release() }
         }
     }
 
-    private fun MediaFormat.getIntegerOrDefault(key: String, fallback: Int): Int =
-        if (containsKey(key)) getInteger(key) else fallback
+    private suspend fun transcodePart(
+        input: String,
+        output: File,
+        offsetMs: Long,
+        durationMs: Long,
+    ) = suspendCancellableCoroutine<Unit> { continuation ->
+        val startSeconds = String.format(Locale.US, "%.3f", offsetMs / 1000.0)
+        val durationSeconds = String.format(Locale.US, "%.3f", durationMs / 1000.0)
+        val command = buildString {
+            append("-hide_banner -loglevel error -y ")
+            if (offsetMs > 0L) append("-ss $startSeconds ")
+            append("-i $input -t $durationSeconds -vn -map 0:a:0 ")
+            append("-ac 1 -ar 16000 -c:a libopus -b:a 24k -vbr off ")
+            append("-application voip -compression_level 5 -f ogg ")
+            append(quote(output.absolutePath))
+        }
+
+        var sessionId: Long? = null
+        val session = FFmpegKit.executeAsync(command) { completed ->
+            if (!continuation.isActive) return@executeAsync
+            if (ReturnCode.isSuccess(completed.returnCode)) {
+                continuation.resume(Unit)
+            } else {
+                continuation.resumeWithException(
+                    IllegalStateException("تعذر ضغط صوت الفيلم للمسار السحابي.")
+                )
+            }
+        }
+        sessionId = session.sessionId
+        continuation.invokeOnCancellation {
+            sessionId?.let { FFmpegKit.cancel(it) }
+            output.delete()
+        }
+    }
 
     companion object {
-        private const val MAX_CLOUD_AUDIO_BYTES = 25L * 1024L * 1024L
-        private val SUPPORTED_MUX_MIMES = setOf(
-            MediaFormat.MIMETYPE_AUDIO_AAC,
-            MediaFormat.MIMETYPE_AUDIO_AMR_NB,
-            MediaFormat.MIMETYPE_AUDIO_AMR_WB,
-        )
+        private const val HOUR_MS = 60L * 60_000L
+        private const val TWO_HOURS_MS = 2L * HOUR_MS
+        private const val MAX_MOVIE_DURATION_MS = 3L * HOUR_MS
+        private const val MAX_PART_BYTES = 24L * 1024L * 1024L
+
+        internal fun planParts(durationMs: Long): List<Pair<Long, Long>> {
+            require(durationMs in 1..MAX_MOVIE_DURATION_MS)
+            return if (durationMs <= TWO_HOURS_MS) {
+                listOf(0L to durationMs)
+            } else {
+                listOf(
+                    0L to TWO_HOURS_MS,
+                    TWO_HOURS_MS to (durationMs - TWO_HOURS_MS),
+                )
+            }
+        }
+
+        private fun quote(value: String): String = "'${value.replace("'", "'\\''")}'"
     }
 }
