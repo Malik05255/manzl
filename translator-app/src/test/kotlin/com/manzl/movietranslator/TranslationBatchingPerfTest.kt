@@ -15,12 +15,12 @@ class TranslationBatchingPerfTest {
     }
 
     @Test
-    fun normalContextBatches_preserveEveryCueAndKeepScenesSmall() {
+    fun normalContextBatches_preserveEveryCueAndKeepNativePromptsSmall() {
         val input = cues(24)
         val batches = TurkishArabicTranslator.buildContextBatchesForTest(input)
 
-        assertTrue(batches.all { it.size <= 8 })
-        assertTrue(batches.all { batch -> batch.sumOf { it.sourceText.length } <= 800 })
+        assertTrue(batches.all { it.size <= 4 })
+        assertTrue(batches.all { batch -> batch.sumOf { it.sourceText.length } <= 360 })
         assertEquals(input.size, batches.sumOf { it.size })
         assertEquals(input.map { it.sourceText }, batches.flatten().map { it.sourceText })
     }
@@ -32,9 +32,20 @@ class TranslationBatchingPerfTest {
         val compact = TurkishArabicTranslator.buildContextBatchesForTest(input, compressed = true)
 
         assertTrue(compact.size <= normal.size)
-        assertTrue(compact.all { it.size <= 10 })
-        assertTrue(compact.all { batch -> batch.sumOf { it.sourceText.length } <= 1_000 })
+        assertTrue(compact.all { it.size <= 5 })
+        assertTrue(compact.all { batch -> batch.sumOf { it.sourceText.length } <= 420 })
         assertEquals(input.size, compact.sumOf { it.size })
+    }
+
+    @Test
+    fun mobileInferenceProfile_capsThreadsAndGeneratedTokens() {
+        assertEquals(2, TurkishArabicTranslator.stableThreadCount(4))
+        assertEquals(2, TurkishArabicTranslator.stableThreadCount(6))
+        assertEquals(3, TurkishArabicTranslator.stableThreadCount(8))
+        assertEquals(3, TurkishArabicTranslator.stableThreadCount(12))
+
+        assertTrue(TurkishArabicTranslator.maxBatchTokensForTest(120, 2) <= 200)
+        assertTrue(TurkishArabicTranslator.maxBatchTokensForTest(420, 5) <= 200)
     }
 
     @Test
