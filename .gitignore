@@ -34,3 +34,10 @@ app/build/**
 .idea/copilot.data.migration.ask2agent.xml
 /.kotlin
 /tmp_log
+
+# Movie-domain model training: corpora/checkpoints are large and may carry dataset-specific terms.
+/training/work/
+/training/data/
+/training/output/
+/training/export/
+/.venv/
