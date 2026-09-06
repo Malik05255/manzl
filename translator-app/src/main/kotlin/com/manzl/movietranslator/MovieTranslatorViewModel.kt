@@ -7,7 +7,6 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import java.io.File
 
@@ -20,14 +19,14 @@ data class TranslatorUiState(
     val error: String? = null,
     val cues: List<SubtitleCue> = emptyList(),
     val srtFile: File? = null,
-    val modelInstalled: Boolean = false,
+    val modelInstalled: Boolean = true,
 )
 
 class MovieTranslatorViewModel(application: Application) : AndroidViewModel(application) {
-    val uiState: StateFlow<TranslatorUiState> = MovieTranslationService.state
+    val uiState: StateFlow<TranslatorUiState> = CloudMovieTranslationService.state
 
     init {
-        MovieTranslationService.refreshModelStatus(application)
+        CloudMovieTranslationService.refreshModelStatus(application)
     }
 
     fun selectVideo(uri: Uri, displayName: String) {
@@ -35,15 +34,15 @@ class MovieTranslatorViewModel(application: Application) : AndroidViewModel(appl
         runCatching {
             app.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        MovieTranslationService.selectVideo(app, uri, displayName)
+        CloudMovieTranslationService.selectVideo(app, uri, displayName)
     }
 
     fun start() {
-        MovieTranslationService.start(getApplication())
+        CloudMovieTranslationService.start(getApplication())
     }
 
     fun cancel() {
-        MovieTranslationService.cancel(getApplication())
+        CloudMovieTranslationService.cancel(getApplication())
     }
 
     fun exportSrt(destination: Uri) {
@@ -54,12 +53,12 @@ class MovieTranslatorViewModel(application: Application) : AndroidViewModel(appl
                     source.inputStream().use { input -> input.copyTo(output) }
                 } ?: error("تعذر فتح مكان الحفظ.")
             }.onSuccess {
-                MovieTranslationService.stateMutableUpdateForUi("تم حفظ ملف الترجمة العربية")
+                CloudMovieTranslationService.stateMutableUpdateForUi("تم حفظ ملف الترجمة العربية")
             }.onFailure { error ->
-                MovieTranslationService.stateMutableErrorForUi(error.message ?: "تعذر حفظ ملف الترجمة.")
+                CloudMovieTranslationService.stateMutableErrorForUi(error.message ?: "تعذر حفظ ملف الترجمة.")
             }
         }
     }
 
-    fun clearError() = MovieTranslationService.clearError()
+    fun clearError() = CloudMovieTranslationService.clearError()
 }
