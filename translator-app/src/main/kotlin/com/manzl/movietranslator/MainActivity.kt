@@ -26,7 +26,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Movie
@@ -36,7 +35,6 @@ import androidx.compose.material.icons.filled.Translate
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
@@ -73,11 +71,12 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MimeTypes
+import androidx.media3.common.util.UnstableApi
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import java.io.File
-import java.util.Locale
+import kotlin.math.roundToInt
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -114,18 +113,20 @@ private fun MovieTranslatorApp(viewModel: MovieTranslatorViewModel) {
             topBar = {
                 TopAppBar(
                     modifier = Modifier.statusBarsPadding(),
-                    title = {
-                        Column {
-                            Text("مترجم الأفلام", fontWeight = FontWeight.Bold)
+                    title = { Text("مترجم الأفلام") },
+                    actions = {
+                        Surface(
+                            shape = RoundedCornerShape(999.dp),
+                            color = MaterialTheme.colorScheme.primaryContainer,
+                            modifier = Modifier.padding(end = 12.dp),
+                        ) {
                             Text(
-                                "تركي ← عربي • سحابي سريع",
+                                "تركي ← عربي",
+                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 6.dp),
                                 style = MaterialTheme.typography.labelMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                fontWeight = FontWeight.SemiBold,
                             )
                         }
-                    },
-                    actions = {
-                        Icon(Icons.Default.Translate, contentDescription = null, modifier = Modifier.padding(16.dp))
                     },
                 )
             },
@@ -139,38 +140,24 @@ private fun MovieTranslatorApp(viewModel: MovieTranslatorViewModel) {
                 verticalArrangement = Arrangement.spacedBy(14.dp),
             ) {
                 Spacer(Modifier.height(2.dp))
+                Text(
+                    "ترجمة أفلام تركية بضغطة واحدة",
+                    style = MaterialTheme.typography.headlineMedium,
+                    fontWeight = FontWeight.Bold,
+                )
+                Text(
+                    "الفيديو يبقى على جوالك. نجهّز صوتًا صغيرًا فقط، نترجم الحوار في السحابة، ثم تشاهد الفيلم الأصلي بترجمة عربية احترافية.",
+                    style = MaterialTheme.typography.bodyLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
 
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.primaryContainer),
-                    shape = RoundedCornerShape(24.dp),
-                ) {
-                    Column(
-                        modifier = Modifier.padding(20.dp),
-                        verticalArrangement = Arrangement.spacedBy(12.dp),
-                    ) {
-                        Text(
-                            "فيلمك، لكن عربي",
-                            style = MaterialTheme.typography.headlineMedium,
-                            fontWeight = FontWeight.Bold,
-                        )
-                        Text(
-                            "اختر الفيلم واضغط ترجمة. نرسل الصوت المضغوط فقط إلى السحابة، ويظل الفيديو الأصلي على جهازك.",
-                            style = MaterialTheme.typography.bodyLarge,
-                        )
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            FeaturePill("Whisper Large V3")
-                            FeaturePill("Gemini")
-                        }
-                        Text(
-                            "حتى 3 ساعات • جزء واحد أو جزآن مخفيان تلقائيًا • ملف SRT واحد",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onPrimaryContainer,
-                        )
-                    }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FeaturePill("لا رفع للفيديو")
+                    FeaturePill("حتى 3 ساعات")
+                    FeaturePill("SRT مباشر")
                 }
 
-                Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(20.dp)) {
+                Card(modifier = Modifier.fillMaxWidth()) {
                     Column(
                         modifier = Modifier.padding(18.dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -180,31 +167,32 @@ private fun MovieTranslatorApp(viewModel: MovieTranslatorViewModel) {
                             horizontalArrangement = Arrangement.spacedBy(12.dp),
                         ) {
                             Surface(
+                                modifier = Modifier.size(52.dp),
                                 shape = RoundedCornerShape(16.dp),
-                                color = MaterialTheme.colorScheme.secondaryContainer,
+                                color = MaterialTheme.colorScheme.primaryContainer,
                             ) {
-                                Icon(
-                                    Icons.Default.Movie,
-                                    contentDescription = null,
-                                    modifier = Modifier.padding(12.dp).size(30.dp),
-                                )
+                                Box(contentAlignment = Alignment.Center) {
+                                    Icon(Icons.Default.Movie, contentDescription = null, modifier = Modifier.size(28.dp))
+                                }
                             }
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(
-                                    state.videoName.ifBlank { "اختر فيلمًا للبدء" },
+                                    state.videoName.ifBlank { "اختر فيلمك" },
                                     style = MaterialTheme.typography.titleMedium,
                                     fontWeight = FontWeight.SemiBold,
+                                    maxLines = 2,
                                 )
-                                val duration = state.videoDurationMs.takeIf { it > 0L }?.let(::formatMediaDuration)
-                                Text(
-                                    duration?.let { "المدة $it • الفيديو لا يُرفع" }
-                                        ?: "يدعم MP4 وMKV ومعظم صيغ الفيديو الشائعة",
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
+                                val meta = if (state.videoUri == null) {
+                                    "MP4 • MKV • MOV وغيرها"
+                                } else {
+                                    buildString {
+                                        append(formatClock(state.videoDurationMs))
+                                        if (state.partCount > 0) append(" • ${state.partCount} ${if (state.partCount == 1) "مسار صوت" else "مساري صوت"}")
+                                    }
+                                }
+                                Text(meta, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
                         }
-
                         OutlinedButton(
                             onClick = { videoPicker.launch(arrayOf("video/*")) },
                             enabled = !state.isRunning,
@@ -215,51 +203,35 @@ private fun MovieTranslatorApp(viewModel: MovieTranslatorViewModel) {
                     }
                 }
 
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(20.dp),
-                ) {
+                Card(modifier = Modifier.fillMaxWidth()) {
                     Column(
                         modifier = Modifier.padding(18.dp),
                         verticalArrangement = Arrangement.spacedBy(12.dp),
                     ) {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    if (state.isRunning) "جاري العمل" else if (state.srtFile != null) "اكتملت الترجمة" else "جاهز",
-                                    style = MaterialTheme.typography.labelLarge,
-                                    color = MaterialTheme.colorScheme.primary,
-                                )
-                                Text(state.stage, style = MaterialTheme.typography.titleMedium)
-                            }
-                            if (state.srtFile != null) {
-                                Icon(Icons.Default.CheckCircle, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
-                            }
-                        }
+                        Text(
+                            when {
+                                state.isRunning -> "جاري صنع الترجمة"
+                                state.srtFile != null -> "الترجمة جاهزة"
+                                else -> "جاهز عندك"
+                            },
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.Bold,
+                        )
+                        Text(state.stage, style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
 
                         if (state.isRunning || state.progress > 0f) {
                             LinearProgressIndicator(
                                 progress = { state.progress.coerceIn(0f, 1f) },
                                 modifier = Modifier.fillMaxWidth(),
                             )
-                            Text(
-                                "${(state.progress * 100).toInt()}%",
-                                style = MaterialTheme.typography.labelLarge,
-                            )
-                        }
-
-                        if (state.partCount > 0 || state.uploadedBytes > 0L) {
-                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                if (state.partCount > 0) FeaturePill(if (state.partCount == 1) "صوت واحد" else "جزآن تلقائيًا")
-                                if (state.uploadedBytes > 0L) FeaturePill(formatBytes(state.uploadedBytes) + " رفع")
+                            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                Text("${(state.progress * 100).roundToInt()}%", fontWeight = FontWeight.SemiBold)
+                                if (state.uploadedBytes > 0L) Text("رفع ${formatBytes(state.uploadedBytes)}", style = MaterialTheme.typography.labelMedium)
                             }
                         }
 
                         if (state.isRunning) {
-                            FilledTonalButton(
-                                onClick = viewModel::cancel,
-                                modifier = Modifier.fillMaxWidth(),
-                            ) {
+                            FilledTonalButton(onClick = viewModel::cancel, modifier = Modifier.fillMaxWidth()) {
                                 Icon(Icons.Default.Stop, contentDescription = null)
                                 Text(" إيقاف")
                             }
@@ -277,28 +249,20 @@ private fun MovieTranslatorApp(viewModel: MovieTranslatorViewModel) {
                 }
 
                 if (state.srtFile != null && state.videoUri != null) {
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(24.dp),
-                        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.tertiaryContainer),
-                    ) {
+                    Card(modifier = Modifier.fillMaxWidth()) {
                         Column(
-                            modifier = Modifier.padding(20.dp),
+                            modifier = Modifier.padding(18.dp),
                             verticalArrangement = Arrangement.spacedBy(12.dp),
                         ) {
-                            Text("جاهز للمشاهدة", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.Bold)
-                            Text("${state.cues.size} مقطع ترجمة عربي • ملف الفيديو الأصلي لم يتغير")
-                            if (state.processingMs > 0L) {
-                                Text(
-                                    "الوقت الكلي ${formatMediaDuration(state.processingMs)}" +
-                                        state.cloudMetrics.takeIf { it.isNotBlank() }?.let { " • $it" }.orEmpty(),
-                                    style = MaterialTheme.typography.bodySmall,
-                                )
+                            Text("جاهز للمشاهدة", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                            Text(
+                                "${state.cues.size} مقطع ترجمة • ${formatDuration(state.processingMs)}" +
+                                    if (state.uploadedBytes > 0L) " • رفع ${formatBytes(state.uploadedBytes)}" else ""
+                            )
+                            if (state.cloudMetrics.isNotBlank()) {
+                                Text(state.cloudMetrics, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
-                            Button(
-                                onClick = { showPlayer = true },
-                                modifier = Modifier.fillMaxWidth(),
-                            ) {
+                            Button(onClick = { showPlayer = true }, modifier = Modifier.fillMaxWidth()) {
                                 Icon(Icons.Default.PlayArrow, contentDescription = null)
                                 Text(" مشاهدة الآن")
                             }
@@ -312,37 +276,33 @@ private fun MovieTranslatorApp(viewModel: MovieTranslatorViewModel) {
                         }
                     }
 
-                    Text("معاينة", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
-                    Card(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(18.dp)) {
-                        Column(modifier = Modifier.padding(horizontal = 16.dp)) {
-                            state.cues.take(5).forEachIndexed { index, cue ->
-                                Column(modifier = Modifier.padding(vertical = 12.dp)) {
-                                    Text(
-                                        cue.translatedText,
-                                        modifier = Modifier.fillMaxWidth(),
-                                        textAlign = TextAlign.Start,
-                                        style = MaterialTheme.typography.bodyLarge,
-                                        fontWeight = FontWeight.Medium,
-                                    )
-                                    Text(
-                                        cue.sourceText,
-                                        modifier = Modifier.fillMaxWidth(),
-                                        textAlign = TextAlign.End,
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                    )
-                                }
-                                if (index < state.cues.take(5).lastIndex) HorizontalDivider()
-                            }
+                    Text("لمحة من الترجمة", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.Bold)
+                    state.cues.take(5).forEach { cue ->
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            Text(
+                                cue.translatedText,
+                                modifier = Modifier.fillMaxWidth(),
+                                textAlign = TextAlign.Start,
+                                style = MaterialTheme.typography.bodyLarge,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            Text(
+                                cue.sourceText,
+                                modifier = Modifier.fillMaxWidth(),
+                                textAlign = TextAlign.End,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                            HorizontalDivider(modifier = Modifier.padding(top = 10.dp))
                         }
                     }
                 }
 
                 Text(
-                    "الخصوصية: لا نرفع الفيديو. يُنشئ التطبيق نسخة صوتية صغيرة مؤقتة، وترجع السحابة النص والتوقيت فقط.",
+                    "نرفع الصوت المضغوط فقط. الفيلم لا يغادر جهازك، ولا تتم إعادة ترميزه بعد الترجمة.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(bottom = 22.dp),
+                    modifier = Modifier.padding(bottom = 20.dp),
                 )
             }
         }
@@ -382,6 +342,7 @@ private fun FeaturePill(text: String) {
     }
 }
 
+@OptIn(UnstableApi::class)
 @Composable
 private fun CinemaPlayerDialog(
     videoUri: Uri,
@@ -470,19 +431,17 @@ private fun CinemaPlayerDialog(
                     color = Color.Black.copy(alpha = 0.66f),
                 ) {
                     Row(
-                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-                        horizontalArrangement = Arrangement.spacedBy(2.dp),
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 7.dp),
                         verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        Text("حجم الترجمة", color = Color.White, style = MaterialTheme.typography.labelSmall, modifier = Modifier.padding(horizontal = 6.dp))
-                        listOf(18f to "ص", 22f to "م", 27f to "ك").forEach { (size, label) ->
-                            TextButton(onClick = { subtitleSize = size }) {
-                                Text(
-                                    label,
-                                    color = if (subtitleSize == size) MaterialTheme.colorScheme.primary else Color.White,
-                                    fontWeight = if (subtitleSize == size) FontWeight.Bold else FontWeight.Normal,
-                                )
-                            }
+                        Text("حجم الترجمة", color = Color.White, style = MaterialTheme.typography.labelMedium)
+                        TextButton(onClick = { subtitleSize = (subtitleSize - 2f).coerceAtLeast(16f) }) {
+                            Text("أصغر", color = Color.White)
+                        }
+                        Text("${subtitleSize.toInt()}", color = Color.White, fontWeight = FontWeight.Bold)
+                        TextButton(onClick = { subtitleSize = (subtitleSize + 2f).coerceAtMost(34f) }) {
+                            Text("أكبر", color = Color.White)
                         }
                     }
                 }
@@ -499,17 +458,17 @@ private fun android.content.Context.displayName(uri: Uri): String {
 }
 
 private fun formatBytes(bytes: Long): String {
-    val mb = bytes.toDouble() / (1024.0 * 1024.0)
-    return if (mb >= 1.0) String.format(Locale.US, "%.1f MB", mb) else "${bytes / 1024} KB"
+    if (bytes <= 0L) return "0 MB"
+    return if (bytes < 1024L * 1024L) "${bytes / 1024} KB" else "%.1f MB".format(bytes / 1024.0 / 1024.0)
 }
 
-private fun formatMediaDuration(ms: Long): String {
+private fun formatClock(ms: Long): String {
+    if (ms <= 0L) return "—"
+    val totalMinutes = ms / 60_000L
+    return if (totalMinutes < 60) "$totalMinutes د" else "${totalMinutes / 60} س ${totalMinutes % 60} د"
+}
+
+private fun formatDuration(ms: Long): String {
     val seconds = (ms.coerceAtLeast(0L) + 500L) / 1000L
-    val hours = seconds / 3600L
-    val minutes = (seconds % 3600L) / 60L
-    val secs = seconds % 60L
-    return when {
-        hours > 0 -> String.format(Locale.US, "%d:%02d:%02d", hours, minutes, secs)
-        else -> String.format(Locale.US, "%d:%02d", minutes, secs)
-    }
+    return if (seconds < 60L) "$seconds ث" else "${seconds / 60}:${(seconds % 60).toString().padStart(2, '0')} د"
 }
