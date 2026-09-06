@@ -13,6 +13,7 @@ import java.io.File
 import java.util.Locale
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
+import kotlin.math.ceil
 
 internal data class CloudAudioPart(
     val file: File,
@@ -40,13 +41,20 @@ internal class CloudAudioExtractor(private val context: Context) {
         try {
             plan.forEachIndexed { index, spec ->
                 coroutineContext.ensureActive()
+
+                // Keep a tiny overlap after the first part so a sentence crossing the boundary is not lost.
+                // Duplicate lines are removed after ASR using their absolute timestamp and normalized text.
+                val overlapMs = if (index == 0) 0L else minOf(PART_OVERLAP_MS, spec.first)
+                val actualOffset = spec.first - overlapMs
+                val actualDuration = spec.second + overlapMs
+
                 val output = File(outputDir, "cloud_${System.currentTimeMillis()}_${index + 1}.ogg")
-                transcodePart(safInput, output, spec.first, spec.second)
+                transcodePart(safInput, output, actualOffset, actualDuration)
                 check(output.isFile && output.length() > 0L) { "تعذر تجهيز الصوت للسحابة." }
                 check(output.length() <= MAX_PART_BYTES) {
                     "الصوت المضغوط أكبر من حد الرفع المجاني. جرّب الملف مرة أخرى بعد تحديث التطبيق."
                 }
-                outputs += CloudAudioPart(output, spec.first, spec.second)
+                outputs += CloudAudioPart(output, actualOffset, actualDuration)
                 onProgress(index + 1, plan.size)
             }
             outputs
@@ -88,16 +96,25 @@ internal class CloudAudioExtractor(private val context: Context) {
 
     companion object {
         private const val HOUR_MS = 60L * 60_000L
-        private const val TWO_HOURS_MS = 2L * HOUR_MS
         private const val MAX_MOVIE_DURATION_MS = 3L * HOUR_MS
         private const val MAX_PART_BYTES = 24L * 1024L * 1024L
+        private const val PART_OVERLAP_MS = 2_500L
 
+        /**
+         * Splits the movie into balanced parts with a target maximum of one hour.
+         * 1:45 => ~52:30 + 52:30, 2:00 => 60 + 60, 3:00 => 60 + 60 + 60.
+         */
         internal fun planParts(durationMs: Long): List<Pair<Long, Long>> {
             require(durationMs in 1..MAX_MOVIE_DURATION_MS)
-            return if (durationMs <= TWO_HOURS_MS) {
-                listOf(0L to durationMs)
-            } else {
-                listOf(0L to TWO_HOURS_MS, TWO_HOURS_MS to (durationMs - TWO_HOURS_MS))
+            val partCount = ceil(durationMs.toDouble() / HOUR_MS.toDouble())
+                .toInt()
+                .coerceIn(1, 3)
+            val baseDuration = durationMs / partCount
+            val remainder = durationMs % partCount
+            var offset = 0L
+            return List(partCount) { index ->
+                val length = baseDuration + if (index < remainder) 1L else 0L
+                (offset to length).also { offset += length }
             }
         }
 
