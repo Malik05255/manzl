@@ -13,21 +13,21 @@ import java.io.File
 data class TranslatorUiState(
     val videoUri: Uri? = null,
     val videoName: String = "",
+    val videoDurationMs: Long = 0L,
     val isRunning: Boolean = false,
     val progress: Float = 0f,
     val stage: String = "اختر فيلمًا تركيًا للبدء",
     val error: String? = null,
     val cues: List<SubtitleCue> = emptyList(),
     val srtFile: File? = null,
-    val modelInstalled: Boolean = true,
+    val uploadedBytes: Long = 0L,
+    val processingMs: Long = 0L,
+    val cloudMetrics: String = "",
+    val partCount: Int = 0,
 )
 
 class MovieTranslatorViewModel(application: Application) : AndroidViewModel(application) {
     val uiState: StateFlow<TranslatorUiState> = CloudMovieTranslationService.state
-
-    init {
-        CloudMovieTranslationService.refreshModelStatus(application)
-    }
 
     fun selectVideo(uri: Uri, displayName: String) {
         val app = getApplication<Application>()
