@@ -24,6 +24,8 @@ data class TranslatorUiState(
     val processingMs: Long = 0L,
     val cloudMetrics: String = "",
     val partCount: Int = 0,
+    // Kept while the previous local engine remains in-tree as a rollback fallback.
+    val modelInstalled: Boolean = false,
 )
 
 class MovieTranslatorViewModel(application: Application) : AndroidViewModel(application) {
