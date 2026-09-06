@@ -7,34 +7,44 @@ import kotlin.math.min
 import kotlin.math.roundToInt
 
 class MovieTranslatorApplication : Application() {
+    private var baseDensityDpi: Int = 0
+
     override fun onCreate() {
         super.onCreate()
+        baseDensityDpi = resources.configuration.densityDpi.coerceAtLeast(120)
         applyAdaptivePhoneDensity()
         appContext = applicationContext
     }
 
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        applyAdaptivePhoneDensity()
+    }
+
     /**
-     * The reference UI was designed around a roomy ~430dp portrait phone.
-     * On narrower or shorter phones we reduce the app density proportionally,
-     * so fixed Compose dp/sp values reflow without clipping or oversized cards.
-     * Large phones keep the original 1:1 design instead of being enlarged.
+     * The reference UI is composed around a roomy ~430dp portrait phone.
+     * Narrow/short phones get a proportional app-only density reduction so
+     * cards, typography, progress rings and bottom navigation all fit without
+     * clipping. Larger phones keep the reference 1:1 sizing.
      */
     @Suppress("DEPRECATION")
     private fun applyAdaptivePhoneDensity() {
         val metrics = resources.displayMetrics
-        if (metrics.widthPixels <= 0 || metrics.heightPixels <= 0 || metrics.density <= 0f) return
+        val originalDpi = baseDensityDpi.takeIf { it > 0 } ?: resources.configuration.densityDpi
+        val originalDensity = originalDpi / 160f
+        if (metrics.widthPixels <= 0 || metrics.heightPixels <= 0 || originalDensity <= 0f) return
 
-        val widthDp = metrics.widthPixels / metrics.density
-        val heightDp = metrics.heightPixels / metrics.density
+        val widthDp = metrics.widthPixels / originalDensity
+        val heightDp = metrics.heightPixels / originalDensity
         val widthScale = (widthDp / REFERENCE_WIDTH_DP).coerceIn(MIN_UI_SCALE, 1f)
         val heightScale = (heightDp / REFERENCE_HEIGHT_DP).coerceIn(MIN_UI_SCALE, 1f)
         val scale = min(widthScale, heightScale)
-        if (scale >= 0.995f) return
+
+        val targetDpi = (originalDpi * scale).roundToInt().coerceAtLeast(120)
+        if (resources.configuration.densityDpi == targetDpi) return
 
         val configuration = Configuration(resources.configuration)
-        configuration.densityDpi = (configuration.densityDpi * scale)
-            .roundToInt()
-            .coerceAtLeast(120)
+        configuration.densityDpi = targetDpi
         resources.updateConfiguration(configuration, metrics)
     }
 
