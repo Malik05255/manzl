@@ -43,6 +43,10 @@ android {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
+        jniLibs {
+            // FFmpegKit and the temporary local Whisper rollback both package the same C++ runtime.
+            pickFirsts += "**/libc++_shared.so"
+        }
     }
 }
 
@@ -58,10 +62,10 @@ dependencies {
     implementation(libs.androidx.compose.viewmodel)
     implementation(libs.androidx.lifecycle.runtime.compose.android)
 
-    // Cloud-first audio path. The audio-only build keeps the APK lean while providing Opus + soxr.
+    // Cloud-first audio path. The audio-only build provides Opus resampling/encoding.
     implementation("dev.ffmpegkit-maintained:ffmpeg-kit-audio:8.1.7")
 
-    // Kept temporarily as an offline fallback while the cloud path is validated on the target phone.
+    // Temporary rollback dependencies; the active user flow is cloud-first.
     implementation("dev.ffmpegkit-maintained:whisper-android:1.0.0")
     implementation("com.cloudflare.realtimekit.android-vad:silero:2.0.10-cf.4")
     implementation("com.microsoft.onnxruntime:onnxruntime-android:1.20.0")
