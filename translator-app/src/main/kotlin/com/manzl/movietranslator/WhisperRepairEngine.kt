@@ -3,6 +3,7 @@ package com.manzl.movietranslator
 import android.content.Context
 import dev.ffmpegkit.whisper.Whisper
 import dev.ffmpegkit.whisper.WhisperConfig
+import dev.ffmpegkit.whisper.WhisperModel
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
@@ -103,8 +104,8 @@ class WhisperRepairEngine(private val context: Context) {
         }
     }
 
-    private fun transcribeWindow(
-        model: Long,
+    private suspend fun transcribeWindow(
+        model: WhisperModel,
         window: SpeechWindow,
         threads: Int,
     ): List<SubtitleCue> {
