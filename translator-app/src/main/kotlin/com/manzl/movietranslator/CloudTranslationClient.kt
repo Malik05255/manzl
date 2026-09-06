@@ -37,13 +37,6 @@ private data class AsrResult(
     val provider: String,
 )
 
-/**
- * Cloud path used by the personal translator.
- *
- * Provider credentials stay on the cloud gateway. The Android app sends only the compressed audio,
- * a device-scoped identifier, and the Turkish transcript. The gateway performs Groq/Gemini calls
- * and returns only transcription/translation data.
- */
 internal class CloudTranslationClient(context: Context) {
     private val deviceHash = CloudIdentity.deviceHash(context.applicationContext)
 
@@ -59,7 +52,7 @@ internal class CloudTranslationClient(context: Context) {
         val totalFileBytes = parts.sumOf { it.file.length() }.coerceAtLeast(1L)
         val uploadedBytes = AtomicLong(0L)
 
-        onStage("رفع الصوت المضغوط للسحابة…", 0.18f)
+        onStage("رفع الصوت للمنصة…", 0.15f)
         val asrStarted = System.currentTimeMillis()
         val asrResults = coroutineScope {
             parts.mapIndexed { index, part ->
@@ -82,21 +75,24 @@ internal class CloudTranslationClient(context: Context) {
             .sortedBy { it.startMs }
             .mapIndexed { index, segment -> segment.copy(id = index) }
         check(ordered.isNotEmpty()) { "لم تتعرف السحابة على حوار تركي في هذا المقطع." }
+        onStage("تم التقاط الحوار التركي", 0.62f)
 
-        onStage("Gemini يترجم الفيلم كسياق واحد…", 0.72f)
+        onStage("صياغة الترجمة العربية…", 0.64f)
         val translationStarted = System.currentTimeMillis()
         val firstPass = translateWholeTranscript(ordered, onStage)
         val firstMap = firstPass.associate { it.first to it.second }
         check(firstMap.size == ordered.size) {
             "الترجمة السحابية لم تُرجع جميع أسطر الحوار (${firstMap.size}/${ordered.size})."
         }
+        onStage("اكتملت الترجمة الأولية", 0.82f)
 
-        onStage("مراجعة الدقة والمعنى سطرًا بسطر…", 0.90f)
+        onStage("مراجعة المعنى والدقة…", 0.84f)
         val reviewed = runCatching {
             reviewWholeTranslation(ordered, firstPass, onStage)
         }.getOrNull()
         val reviewedMap = reviewed?.associate { it.first to it.second }.orEmpty()
         val finalMap = if (reviewedMap.size == ordered.size) reviewedMap else firstMap
+        onStage("اكتملت مراجعة الدقة", 0.95f)
         val translationMs = System.currentTimeMillis() - translationStarted
 
         val cues = ordered.map { segment ->
@@ -174,7 +170,7 @@ internal class CloudTranslationClient(context: Context) {
             val root = readJson(connection)
             if (root.optString("status", "completed") == "in_progress") {
                 val jobId = root.getString("job_id")
-                onStage("السحابة تتعرف على الحوار التركي…", 0.52f)
+                onStage("تحليل الحوار التركي…", 0.46f)
                 return pollAsr(jobId, onStage)
             }
             return parseAsr(root)
@@ -184,7 +180,7 @@ internal class CloudTranslationClient(context: Context) {
     }
 
     private suspend fun pollAsr(jobId: String, onStage: (String, Float) -> Unit): AsrResult {
-        repeat(MAX_POLL_ATTEMPTS) { attempt ->
+        repeat(MAX_POLL_ATTEMPTS) {
             currentCoroutineContext().ensureActive()
             val root = postJson(
                 JSONObject()
@@ -198,8 +194,7 @@ internal class CloudTranslationClient(context: Context) {
                 "completed" -> return parseAsr(root)
                 "failed", "cancelled" -> error(root.optString("message", "فشل التعرف السحابي على الحوار."))
             }
-            val progress = (0.52f + (attempt.coerceAtMost(40) / 40f) * 0.13f).coerceAtMost(0.65f)
-            onStage("السحابة تتعرف على الحوار التركي…", progress)
+            onStage("تحليل الحوار التركي…", 0.46f)
             delay(POLL_DELAY_MS)
         }
         error("استغرقت مرحلة التعرف على الحوار وقتًا أطول من المتوقع.")
@@ -249,7 +244,7 @@ internal class CloudTranslationClient(context: Context) {
         )
         if (started.optString("status") == "completed") return parseTranslation(started)
         val jobId = started.getString("job_id")
-        return pollTranslationJob(jobId, "translate", "Gemini يترجم الفيلم كسياق واحد…", 0.75f, 0.88f, onStage)
+        return pollTranslationJob(jobId, "translate", "صياغة الترجمة العربية…", 0.64f, onStage)
     }
 
     private suspend fun reviewWholeTranslation(
@@ -279,18 +274,17 @@ internal class CloudTranslationClient(context: Context) {
         )
         if (started.optString("status") == "completed") return parseTranslation(started)
         val jobId = started.getString("job_id")
-        return pollTranslationJob(jobId, "review", "مراجعة الدقة والمعنى سطرًا بسطر…", 0.91f, 0.96f, onStage)
+        return pollTranslationJob(jobId, "review", "مراجعة المعنى والدقة…", 0.84f, onStage)
     }
 
     private suspend fun pollTranslationJob(
         jobId: String,
         kind: String,
         stage: String,
-        from: Float,
-        to: Float,
+        progress: Float,
         onStage: (String, Float) -> Unit,
     ): List<Pair<Int, String>> {
-        repeat(MAX_POLL_ATTEMPTS) { attempt ->
+        repeat(MAX_POLL_ATTEMPTS) {
             currentCoroutineContext().ensureActive()
             val root = postJson(
                 JSONObject()
@@ -304,8 +298,7 @@ internal class CloudTranslationClient(context: Context) {
                 "completed" -> return parseTranslation(root)
                 "failed", "cancelled" -> error(root.optString("message", "فشلت مرحلة الترجمة السحابية."))
             }
-            val fraction = attempt.coerceAtMost(60) / 60f
-            onStage(stage, from + (to - from) * fraction)
+            onStage(stage, progress)
             delay(POLL_DELAY_MS)
         }
         error("استغرقت مرحلة الترجمة وقتًا أطول من المتوقع.")
