@@ -10,7 +10,10 @@ data class SubtitleCue(
 
 object SrtFormatter {
     fun format(cues: List<SubtitleCue>): String {
-        val normalized = normalizeTimeline(cues)
+        // Sentence-level translation may represent several Whisper fragments. Compatibility filler
+        // cues keep the service's source-count invariant but must never appear on screen or in SRT.
+        val visible = cues.filterNot { it.translatedText == SKIP_SUBTITLE_TEXT }
+        val normalized = normalizeTimeline(visible)
         return buildString {
             normalized.forEachIndexed { index, cue ->
                 append(index + 1).append('\n')
