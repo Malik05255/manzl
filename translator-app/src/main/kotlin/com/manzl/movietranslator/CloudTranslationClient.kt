@@ -1,5 +1,6 @@
 package com.manzl.movietranslator
 
+import android.content.Context
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
@@ -11,8 +12,10 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedOutputStream
+import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 
@@ -36,13 +39,22 @@ private data class AsrResult(
     val provider: String,
 )
 
+private data class GeminiUploadedFile(
+    val name: String,
+    val uri: String,
+    val mimeType: String,
+)
+
 /**
- * Cloud requests are deliberately staged instead of keeping one Edge Function request open while
- * ASR + translation both finish. Supabase Free Edge workers have a 150 s wall-clock/idle ceiling;
- * each stage therefore returns independently, while Gemini long-running work uses background
- * Interactions and short polling calls.
+ * Personal-app cloud client.
+ *
+ * The movie itself never leaves the phone. The app uploads only the compressed audio directly to
+ * Groq/Gemini over HTTPS. The user's API keys are read from SecureApiKeyStore (Android Keystore)
+ * and never depend on Supabase or any developer-owned backend.
  */
-internal class CloudTranslationClient {
+internal class CloudTranslationClient(context: Context) {
+    private val keyStore = SecureApiKeyStore(context.applicationContext)
+
     suspend fun translate(
         parts: List<CloudAudioPart>,
         onUploadProgress: (Float) -> Unit = {},
@@ -51,23 +63,35 @@ internal class CloudTranslationClient {
         require(parts.size in 1..2)
         parts.forEach { require(it.file.isFile && it.file.length() > 0L) }
 
+        val groqKey = keyStore.requireGroqKey()
+        val geminiKey = keyStore.requireGeminiKey()
         val totalStarted = System.currentTimeMillis()
         val totalFileBytes = parts.sumOf { it.file.length() }.coerceAtLeast(1L)
         val uploadedBytes = AtomicLong(0L)
 
-        onStage("رفع الصوت المضغوط للسحابة…", 0.18f)
+        onStage("إرسال الصوت مباشرة لخدمات الذكاء الاصطناعي…", 0.18f)
         val asrStarted = System.currentTimeMillis()
         val asrResults = coroutineScope {
             parts.mapIndexed { index, part ->
                 async(Dispatchers.IO) {
-                    transcribePart(
-                        part = part,
-                        index = index,
-                        totalFileBytes = totalFileBytes,
-                        uploadedBytes = uploadedBytes,
-                        onUploadProgress = onUploadProgress,
-                        onStage = onStage,
-                    )
+                    if (index == 0) {
+                        transcribeWithGroq(
+                            part = part,
+                            apiKey = groqKey,
+                            totalFileBytes = totalFileBytes,
+                            uploadedBytes = uploadedBytes,
+                            onUploadProgress = onUploadProgress,
+                        )
+                    } else {
+                        transcribeWithGemini(
+                            part = part,
+                            apiKey = geminiKey,
+                            totalFileBytes = totalFileBytes,
+                            uploadedBytes = uploadedBytes,
+                            onUploadProgress = onUploadProgress,
+                            onStage = onStage,
+                        )
+                    }
                 }
             }.awaitAll()
         }
@@ -79,9 +103,9 @@ internal class CloudTranslationClient {
             .mapIndexed { index, segment -> segment.copy(id = index) }
         check(ordered.isNotEmpty()) { "لم تتعرف السحابة على حوار تركي في هذا المقطع." }
 
-        onStage("Gemini يصيغ الترجمة العربية كسياق واحد…", 0.74f)
+        onStage("Gemini يصيغ الترجمة العربية كسياق فيلم واحد…", 0.74f)
         val translationStarted = System.currentTimeMillis()
-        val translated = translateWholeTranscript(ordered, onStage)
+        val translated = translateWholeTranscript(ordered, geminiKey, onStage)
         val translationMs = System.currentTimeMillis() - translationStarted
 
         val arabicById = translated.associate { it.first to it.second }
@@ -108,21 +132,21 @@ internal class CloudTranslationClient {
         )
     }
 
-    private suspend fun transcribePart(
+    private suspend fun transcribeWithGroq(
         part: CloudAudioPart,
-        index: Int,
+        apiKey: String,
         totalFileBytes: Long,
         uploadedBytes: AtomicLong,
         onUploadProgress: (Float) -> Unit,
-        onStage: (String, Float) -> Unit,
     ): AsrResult {
         val boundary = "----Manzl${UUID.randomUUID()}"
-        val provider = if (index == 0) "groq" else "gemini"
-        val connection = openConnection(135_000).apply {
+        val connection = open(GROQ_URL, 95_000).apply {
             requestMethod = "POST"
             doOutput = true
             setChunkedStreamingMode(256 * 1024)
+            setRequestProperty("Authorization", "Bearer $apiKey")
             setRequestProperty("Content-Type", "multipart/form-data; boundary=$boundary")
+            setRequestProperty("Accept", "application/json")
         }
 
         try {
@@ -135,184 +159,434 @@ internal class CloudTranslationClient {
                     text(value)
                     text("\r\n")
                 }
-
-                field("mode", "asr")
-                field("provider", provider)
-                field("offset_ms", part.offsetMs.toString())
-                field("duration_ms", part.durationMs.toString())
+                field("model", GROQ_MODEL)
+                field("language", "tr")
+                field("response_format", "verbose_json")
+                field("temperature", "0")
+                field("timestamp_granularities[]", "segment")
                 text("--$boundary\r\n")
-                text("Content-Disposition: form-data; name=\"audio\"; filename=\"part_${index + 1}.ogg\"\r\n")
+                text("Content-Disposition: form-data; name=\"file\"; filename=\"audio.ogg\"\r\n")
                 text("Content-Type: audio/ogg\r\n\r\n")
-                part.file.inputStream().buffered(256 * 1024).use { input ->
-                    val buffer = ByteArray(256 * 1024)
-                    while (true) {
-                        currentCoroutineContext().ensureActive()
-                        val read = input.read(buffer)
-                        if (read <= 0) break
-                        output.write(buffer, 0, read)
-                        val now = uploadedBytes.addAndGet(read.toLong())
-                        onUploadProgress(
-                            (now.toDouble() / totalFileBytes.toDouble()).toFloat().coerceIn(0f, 1f)
-                        )
-                    }
-                }
+                copyWithProgress(part.file, output, totalFileBytes, uploadedBytes, onUploadProgress)
                 text("\r\n--$boundary--\r\n")
                 output.flush()
             }
 
-            val root = readJson(connection)
-            val status = root.optString("status", "completed")
-            if (status == "in_progress") {
-                val jobId = root.getString("job_id")
-                onStage("السحابة تتعرف على الحوار التركي…", 0.52f)
-                return pollAsr(jobId, onStage)
+            val root = readJson(connection, "Groq")
+            val source = root.optJSONArray("segments") ?: JSONArray()
+            val segments = buildList {
+                for (i in 0 until source.length()) {
+                    val item = source.getJSONObject(i)
+                    val text = cleanTurkish(item.optString("text"))
+                    if (text.isBlank()) continue
+                    val start = part.offsetMs + (item.optDouble("start", 0.0) * 1000.0).toLong().coerceAtLeast(0L)
+                    val end = part.offsetMs + (item.optDouble("end", 0.0) * 1000.0).toLong().coerceAtLeast(1L)
+                    add(RemoteSegment(0, start, end.coerceAtLeast(start + 120L), text))
+                }
             }
-            return parseAsr(root)
+            check(segments.isNotEmpty()) { "Groq لم يتعرف على كلام تركي واضح." }
+            return AsrResult(segments.sortedBy { it.startMs }, GROQ_MODEL)
         } finally {
             connection.disconnect()
         }
     }
 
-    private suspend fun pollAsr(jobId: String, onStage: (String, Float) -> Unit): AsrResult {
-        repeat(MAX_POLL_ATTEMPTS) { attempt ->
-            currentCoroutineContext().ensureActive()
-            val root = postJson(
-                JSONObject()
-                    .put("mode", "poll")
-                    .put("kind", "asr")
-                    .put("job_id", jobId),
-                timeoutMs = 25_000,
-            )
-            when (root.optString("status")) {
-                "completed" -> return parseAsr(root)
-                "failed", "cancelled" -> error(root.optString("message", "فشل التعرف السحابي على الحوار."))
+    private suspend fun transcribeWithGemini(
+        part: CloudAudioPart,
+        apiKey: String,
+        totalFileBytes: Long,
+        uploadedBytes: AtomicLong,
+        onUploadProgress: (Float) -> Unit,
+        onStage: (String, Float) -> Unit,
+    ): AsrResult {
+        onStage("Gemini السحابي يتعرف على الجزء الثاني…", 0.52f)
+        val uploaded = uploadGeminiFile(
+            file = part.file,
+            apiKey = apiKey,
+            totalFileBytes = totalFileBytes,
+            uploadedBytes = uploadedBytes,
+            onUploadProgress = onUploadProgress,
+        )
+        try {
+            waitForGeminiFile(uploaded.name, apiKey)
+            val interaction = createGeminiAsrInteraction(uploaded, apiKey)
+            val completed = if (interaction.optString("status") == "completed") {
+                interaction
+            } else {
+                val id = interaction.optString("id").takeIf { it.isNotBlank() }
+                    ?: error("Gemini لم يُرجع رقم مهمة الاستماع.")
+                pollGeminiInteraction(id, apiKey, "الاستماع", onStage, 0.52f, 0.66f)
             }
-            val progress = (0.52f + (attempt.coerceAtMost(40) / 40f) * 0.14f).coerceAtMost(0.66f)
-            onStage("السحابة تتعرف على الحوار التركي…", progress)
-            delay(POLL_DELAY_MS)
+            return AsrResult(parseGeminiAsr(completed, part.offsetMs), "$GEMINI_MODEL-audio")
+        } finally {
+            deleteGeminiFile(uploaded.name, apiKey)
         }
-        error("استغرقت مرحلة التعرف على الحوار وقتًا أطول من المتوقع. أعد المحاولة لاحقًا.")
-    }
-
-    private fun parseAsr(root: JSONObject): AsrResult {
-        val array = root.optJSONArray("segments") ?: JSONArray()
-        val segments = ArrayList<RemoteSegment>(array.length())
-        for (i in 0 until array.length()) {
-            val item = array.getJSONObject(i)
-            val text = item.optString("tr").trim()
-            if (text.isBlank()) continue
-            segments += RemoteSegment(
-                id = item.optInt("id", 0),
-                startMs = item.getLong("start_ms"),
-                endMs = item.getLong("end_ms"),
-                text = text,
-            )
-        }
-        check(segments.isNotEmpty()) { "لم تتعرف السحابة على كلام تركي واضح." }
-        val provider = root.optJSONObject("metrics")?.optString("provider")
-            ?.takeIf { it.isNotBlank() }
-            ?: root.optString("provider", "Cloud ASR")
-        return AsrResult(segments.sortedBy { it.startMs }, provider)
     }
 
     private suspend fun translateWholeTranscript(
         segments: List<RemoteSegment>,
+        apiKey: String,
         onStage: (String, Float) -> Unit,
     ): List<Pair<Int, String>> {
-        val segmentArray = JSONArray()
-        segments.forEach { segment ->
-            segmentArray.put(
+        val schema = JSONObject()
+            .put("type", "object")
+            .put("properties", JSONObject().put(
+                "subtitles",
                 JSONObject()
-                    .put("id", segment.id)
-                    .put("start_ms", segment.startMs)
-                    .put("end_ms", segment.endMs)
-                    .put("tr", segment.text)
-            )
-        }
-        val started = postJson(
-            JSONObject().put("mode", "translate_start").put("segments", segmentArray),
-            timeoutMs = 40_000,
-        )
-        if (started.optString("status") == "completed") return parseTranslation(started)
-        val jobId = started.getString("job_id")
+                    .put("type", "array")
+                    .put("items", JSONObject()
+                        .put("type", "object")
+                        .put("properties", JSONObject()
+                            .put("id", JSONObject().put("type", "integer"))
+                            .put("ar", JSONObject().put("type", "string")))
+                        .put("required", JSONArray().put("id").put("ar")))
+            ))
+            .put("required", JSONArray().put("subtitles"))
 
-        repeat(MAX_POLL_ATTEMPTS) { attempt ->
-            currentCoroutineContext().ensureActive()
-            val root = postJson(
-                JSONObject()
-                    .put("mode", "poll")
-                    .put("kind", "translate")
-                    .put("job_id", jobId),
-                timeoutMs = 25_000,
-            )
-            when (root.optString("status")) {
-                "completed" -> return parseTranslation(root)
-                "failed", "cancelled" -> error(root.optString("message", "فشلت صياغة الترجمة العربية."))
-            }
-            val progress = (0.76f + (attempt.coerceAtMost(50) / 50f) * 0.13f).coerceAtMost(0.89f)
-            onStage("Gemini يصيغ الترجمة العربية كسياق واحد…", progress)
-            delay(POLL_DELAY_MS)
+        val source = JSONArray()
+        segments.forEach { source.put(JSONObject().put("id", it.id).put("tr", it.text)) }
+        val prompt = """
+            You are the senior Arabic subtitle translator for a Turkish feature film.
+            Read the ENTIRE ordered Turkish dialogue first so character relationships, names,
+            pronouns, jokes, threats, idioms, callbacks and tone stay consistent across the movie.
+
+            Translate every segment into polished, natural Modern Standard Arabic that feels
+            professionally subtitled, not machine-translated.
+
+            Rules:
+            - Preserve the exact intended meaning and emotional tone.
+            - Prefer natural cinematic Arabic over literal Turkish word order.
+            - Preserve names and recurring terminology consistently.
+            - Translate Turkish idioms by meaning, not word-for-word.
+            - Keep concise subtitle phrasing without deleting information.
+            - Never omit, merge, reorder, summarize, censor, explain or add dialogue.
+            - Return every id exactly once and only the Arabic for that id.
+            - Do not output timestamps; the app preserves the verified ASR timeline.
+
+            Full movie dialogue:
+            $source
+        """.trimIndent()
+
+        val body = JSONObject()
+            .put("model", GEMINI_MODEL)
+            .put("input", prompt)
+            .put("response_format", JSONObject()
+                .put("type", "text")
+                .put("mime_type", "application/json")
+                .put("schema", schema))
+            .put("generation_config", JSONObject()
+                .put("thinking_level", "low")
+                .put("max_output_tokens", 65536))
+            .put("background", true)
+            .put("store", true)
+
+        val started = createGeminiInteraction(body, apiKey)
+        val completed = if (started.optString("status") == "completed") {
+            started
+        } else {
+            val id = started.optString("id").takeIf { it.isNotBlank() }
+                ?: error("Gemini لم يُرجع رقم مهمة الترجمة.")
+            pollGeminiInteraction(id, apiKey, "الترجمة", onStage, 0.76f, 0.89f)
         }
-        error("استغرقت الترجمة العربية وقتًا أطول من المتوقع. أعد المحاولة لاحقًا.")
+        return parseTranslation(completed)
     }
 
-    private fun parseTranslation(root: JSONObject): List<Pair<Int, String>> {
-        val array = root.optJSONArray("subtitles") ?: JSONArray()
+    private fun createGeminiAsrInteraction(uploaded: GeminiUploadedFile, apiKey: String): JSONObject {
+        val schema = JSONObject()
+            .put("type", "object")
+            .put("properties", JSONObject().put(
+                "segments",
+                JSONObject()
+                    .put("type", "array")
+                    .put("items", JSONObject()
+                        .put("type", "object")
+                        .put("properties", JSONObject()
+                            .put("start_ms", JSONObject().put("type", "integer"))
+                            .put("end_ms", JSONObject().put("type", "integer"))
+                            .put("tr", JSONObject().put("type", "string")))
+                        .put("required", JSONArray().put("start_ms").put("end_ms").put("tr")))
+            ))
+            .put("required", JSONArray().put("segments"))
+
+        val input = JSONArray()
+            .put(JSONObject().put("type", "text").put("text", """
+                Transcribe this Turkish movie audio accurately. Return subtitle-ready Turkish
+                dialogue segments with start_ms and end_ms relative to THIS audio file only.
+                Turkish transcription only; do not translate. Preserve every intelligible spoken
+                line, names, slang, particles and short replies. Do not invent dialogue from music
+                or sound effects. Keep segments naturally sized for subtitles, normally 1-8 seconds.
+                Return only the requested structured JSON.
+            """.trimIndent()))
+            .put(JSONObject()
+                .put("type", "audio")
+                .put("uri", uploaded.uri)
+                .put("mime_type", uploaded.mimeType))
+
+        val body = JSONObject()
+            .put("model", GEMINI_MODEL)
+            .put("input", input)
+            .put("response_format", JSONObject()
+                .put("type", "text")
+                .put("mime_type", "application/json")
+                .put("schema", schema))
+            .put("generation_config", JSONObject()
+                .put("thinking_level", "low")
+                .put("max_output_tokens", 65536))
+            .put("background", true)
+            .put("store", true)
+        return createGeminiInteraction(body, apiKey)
+    }
+
+    private fun createGeminiInteraction(body: JSONObject, apiKey: String): JSONObject {
+        val connection = open(GEMINI_INTERACTIONS_URL, 40_000).apply {
+            requestMethod = "POST"
+            doOutput = true
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+            setRequestProperty("x-goog-api-key", apiKey)
+            setRequestProperty("Api-Revision", API_REVISION)
+        }
+        return try {
+            connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+            readJson(connection, "Gemini")
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private suspend fun pollGeminiInteraction(
+        id: String,
+        apiKey: String,
+        stageName: String,
+        onStage: (String, Float) -> Unit,
+        fromProgress: Float,
+        toProgress: Float,
+    ): JSONObject {
+        repeat(MAX_POLL_ATTEMPTS) { attempt ->
+            currentCoroutineContext().ensureActive()
+            val encodedId = URLEncoder.encode(id, Charsets.UTF_8.name()).replace("+", "%20")
+            val connection = open("$GEMINI_INTERACTIONS_URL/$encodedId", 25_000).apply {
+                setRequestProperty("x-goog-api-key", apiKey)
+                setRequestProperty("Api-Revision", API_REVISION)
+                setRequestProperty("Accept", "application/json")
+            }
+            val root = try {
+                readJson(connection, "Gemini")
+            } finally {
+                connection.disconnect()
+            }
+            when (root.optString("status", "completed")) {
+                "completed" -> return root
+                "failed", "cancelled" -> error("فشلت مهمة Gemini في مرحلة $stageName.")
+            }
+            val fraction = attempt.coerceAtMost(60) / 60f
+            onStage(
+                if (stageName == "الترجمة") "Gemini يصيغ الترجمة العربية كسياق فيلم واحد…" else "Gemini السحابي يتعرف على الحوار…",
+                fromProgress + (toProgress - fromProgress) * fraction,
+            )
+            delay(POLL_DELAY_MS)
+        }
+        error("استغرقت مرحلة $stageName وقتًا أطول من المتوقع.")
+    }
+
+    private fun uploadGeminiFile(
+        file: File,
+        apiKey: String,
+        totalFileBytes: Long,
+        uploadedBytes: AtomicLong,
+        onUploadProgress: (Float) -> Unit,
+    ): GeminiUploadedFile {
+        val start = open(GEMINI_UPLOAD_URL, 30_000).apply {
+            requestMethod = "POST"
+            doOutput = true
+            setRequestProperty("x-goog-api-key", apiKey)
+            setRequestProperty("X-Goog-Upload-Protocol", "resumable")
+            setRequestProperty("X-Goog-Upload-Command", "start")
+            setRequestProperty("X-Goog-Upload-Header-Content-Length", file.length().toString())
+            setRequestProperty("X-Goog-Upload-Header-Content-Type", "audio/ogg")
+            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+        }
+        val uploadUrl = try {
+            start.outputStream.use {
+                it.write(JSONObject().put("file", JSONObject().put("display_name", "manzl-movie-audio")).toString().toByteArray(Charsets.UTF_8))
+            }
+            val status = start.responseCode
+            if (status !in 200..299) readJson(start, "Gemini")
+            start.getHeaderField("x-goog-upload-url") ?: error("Gemini لم يُرجع رابط رفع الصوت.")
+        } finally {
+            start.disconnect()
+        }
+
+        val upload = open(uploadUrl, 100_000).apply {
+            requestMethod = "POST"
+            doOutput = true
+            setFixedLengthStreamingMode(file.length())
+            setRequestProperty("Content-Length", file.length().toString())
+            setRequestProperty("X-Goog-Upload-Offset", "0")
+            setRequestProperty("X-Goog-Upload-Command", "upload, finalize")
+            setRequestProperty("Content-Type", "audio/ogg")
+        }
+        return try {
+            upload.outputStream.use { raw ->
+                val output = BufferedOutputStream(raw, 256 * 1024)
+                copyWithProgress(file, output, totalFileBytes, uploadedBytes, onUploadProgress)
+                output.flush()
+            }
+            val root = readJson(upload, "Gemini")
+            val info = root.optJSONObject("file") ?: error("Gemini لم يُرجع بيانات ملف الصوت.")
+            GeminiUploadedFile(
+                name = info.getString("name"),
+                uri = info.getString("uri"),
+                mimeType = info.optString("mimeType", info.optString("mime_type", "audio/ogg")),
+            )
+        } finally {
+            upload.disconnect()
+        }
+    }
+
+    private suspend fun waitForGeminiFile(name: String, apiKey: String) {
+        repeat(40) {
+            currentCoroutineContext().ensureActive()
+            val connection = open("$GEMINI_API_BASE/$name", 15_000).apply {
+                setRequestProperty("x-goog-api-key", apiKey)
+                setRequestProperty("Accept", "application/json")
+            }
+            val root = try {
+                readJson(connection, "Gemini")
+            } finally {
+                connection.disconnect()
+            }
+            when (root.optString("state", "ACTIVE")) {
+                "ACTIVE", "STATE_UNSPECIFIED" -> return
+                "FAILED" -> error("تعذر تجهيز الصوت لدى Gemini.")
+            }
+            delay(500L)
+        }
+        error("تأخر تجهيز ملف الصوت لدى Gemini.")
+    }
+
+    private fun deleteGeminiFile(name: String, apiKey: String) {
+        if (!name.startsWith("files/")) return
+        runCatching {
+            val connection = open("$GEMINI_API_BASE/$name", 15_000).apply {
+                requestMethod = "DELETE"
+                setRequestProperty("x-goog-api-key", apiKey)
+            }
+            try {
+                connection.responseCode
+            } finally {
+                connection.disconnect()
+            }
+        }
+    }
+
+    private fun parseGeminiAsr(interaction: JSONObject, offsetMs: Long): List<RemoteSegment> {
+        val parsed = JSONObject(extractInteractionText(interaction))
+        val source = parsed.optJSONArray("segments") ?: JSONArray()
+        val result = buildList {
+            for (i in 0 until source.length()) {
+                val item = source.getJSONObject(i)
+                val text = cleanTurkish(item.optString("tr"))
+                if (text.isBlank()) continue
+                val start = offsetMs + item.optLong("start_ms", 0L).coerceAtLeast(0L)
+                val end = offsetMs + item.optLong("end_ms", 1L).coerceAtLeast(1L)
+                add(RemoteSegment(0, start, end.coerceAtLeast(start + 120L), text))
+            }
+        }
+        check(result.isNotEmpty()) { "Gemini لم يتعرف على كلام تركي واضح." }
+        return result.sortedBy { it.startMs }
+    }
+
+    private fun parseTranslation(interaction: JSONObject): List<Pair<Int, String>> {
+        val parsed = JSONObject(extractInteractionText(interaction))
+        val source = parsed.optJSONArray("subtitles") ?: JSONArray()
         return buildList {
-            for (i in 0 until array.length()) {
-                val item = array.getJSONObject(i)
-                val arabic = item.optString("ar").trim()
+            for (i in 0 until source.length()) {
+                val item = source.getJSONObject(i)
+                val arabic = cleanArabic(item.optString("ar"))
                 if (arabic.isNotBlank()) add(item.getInt("id") to arabic)
             }
         }
     }
 
-    private fun postJson(payload: JSONObject, timeoutMs: Int): JSONObject {
-        val connection = openConnection(timeoutMs).apply {
-            requestMethod = "POST"
-            doOutput = true
-            setRequestProperty("Content-Type", "application/json; charset=utf-8")
+    private fun extractInteractionText(interaction: JSONObject): String {
+        interaction.optString("output_text").takeIf { it.isNotBlank() }?.let { return it.trim() }
+        val steps = interaction.optJSONArray("steps") ?: JSONArray()
+        for (i in steps.length() - 1 downTo 0) {
+            val step = steps.optJSONObject(i) ?: continue
+            if (step.optString("type") != "model_output") continue
+            val content = step.optJSONArray("content") ?: continue
+            val text = StringBuilder()
+            for (j in 0 until content.length()) {
+                val part = content.optJSONObject(j) ?: continue
+                if (part.optString("type") == "text") text.append(part.optString("text"))
+            }
+            if (text.isNotBlank()) return text.toString().trim()
         }
-        return try {
-            connection.outputStream.use { it.write(payload.toString().toByteArray(Charsets.UTF_8)) }
-            readJson(connection)
-        } finally {
-            connection.disconnect()
+        error("Gemini لم يُرجع نتيجة قابلة للقراءة.")
+    }
+
+    private suspend fun copyWithProgress(
+        file: File,
+        output: BufferedOutputStream,
+        totalFileBytes: Long,
+        uploadedBytes: AtomicLong,
+        onUploadProgress: (Float) -> Unit,
+    ) {
+        file.inputStream().buffered(256 * 1024).use { input ->
+            val buffer = ByteArray(256 * 1024)
+            while (true) {
+                currentCoroutineContext().ensureActive()
+                val read = input.read(buffer)
+                if (read <= 0) break
+                output.write(buffer, 0, read)
+                val now = uploadedBytes.addAndGet(read.toLong())
+                onUploadProgress((now.toDouble() / totalFileBytes.toDouble()).toFloat().coerceIn(0f, 1f))
+            }
         }
     }
 
-    private fun openConnection(timeoutMs: Int): HttpURLConnection =
-        (URL(ENDPOINT).openConnection() as HttpURLConnection).apply {
-            connectTimeout = 15_000
-            readTimeout = timeoutMs
-            setRequestProperty("Authorization", "Bearer $ANON_JWT")
-            setRequestProperty("apikey", PUBLISHABLE_KEY)
-            setRequestProperty("Accept", "application/json")
+    private fun open(url: String, readTimeoutMs: Int): HttpURLConnection =
+        (URL(url).openConnection() as HttpURLConnection).apply {
+            connectTimeout = 20_000
+            readTimeout = readTimeoutMs
+            useCaches = false
         }
 
-    private fun readJson(connection: HttpURLConnection): JSONObject {
+    private fun readJson(connection: HttpURLConnection, provider: String): JSONObject {
         val status = connection.responseCode
         val body = (if (status in 200..299) connection.inputStream else connection.errorStream)
             ?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
         if (status !in 200..299) {
             val parsed = runCatching { JSONObject(body) }.getOrNull()
-            val message = parsed?.optString("message")?.takeIf { it.isNotBlank() }
+            val serverMessage = parsed?.optJSONObject("error")?.optString("message")
+                ?.takeIf { it.isNotBlank() }
+                ?: parsed?.optString("message")?.takeIf { it.isNotBlank() }
                 ?: parsed?.optString("error")?.takeIf { it.isNotBlank() }
-                ?: if (status == 504) {
-                    "انتهت مهلة مرحلة سحابية. تم فصل المراحل في النسخة الجديدة؛ أعد المحاولة."
-                } else {
-                    "فشل الاتصال بخدمة الترجمة السحابية ($status)."
-                }
-            error(message)
+            error(serverMessage ?: "فشل اتصال $provider ($status).")
         }
-        return JSONObject(body)
+        return if (body.isBlank()) JSONObject() else JSONObject(body)
     }
 
+    private fun cleanTurkish(value: String): String =
+        value.replace(Regex("<[^>]+>"), " ").replace(Regex("\\s+"), " ").trim()
+
+    private fun cleanArabic(value: String): String = value
+        .replace(Regex("<[^>]+>"), " ")
+        .replace(Regex("\\s+"), " ")
+        .replace(",", "،")
+        .replace(";", "؛")
+        .replace("?", "؟")
+        .trim()
+
     companion object {
-        private const val ENDPOINT = "https://lbgcjmsqqhrpceijdqng.supabase.co/functions/v1/movie-translate"
-        private const val PUBLISHABLE_KEY = "sb_publishable_TllPSeKhRJx_IegHMxkZmA_Q9FLBUR_"
-        private const val ANON_JWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImxiZ2NqbXNxcWhycGNlaWpkcW5nIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgyMDM1MDEsImV4cCI6MjEwMzc3OTUwMX0.sl2j-iBmb_swQlZ-qlTZ5c5nDIXrO2w6tRHYeNAoF5o"
+        private const val GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
+        private const val GROQ_MODEL = "whisper-large-v3"
+        private const val GEMINI_MODEL = "gemini-3.8-flash"
+        private const val GEMINI_INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
+        private const val GEMINI_UPLOAD_URL = "https://generativelanguage.googleapis.com/upload/v1beta/files"
+        private const val GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+        private const val API_REVISION = "2026-05-20"
         private const val POLL_DELAY_MS = 2_000L
-        private const val MAX_POLL_ATTEMPTS = 450 // up to ~15 minutes without one long HTTP request
+        private const val MAX_POLL_ATTEMPTS = 450
     }
 }
