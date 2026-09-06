@@ -69,7 +69,8 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
 
         val segments = buildSourceSegments(source)
         val cache = HashMap<String, String>()
-        val output = ArrayList<SubtitleCue>(segments.size)
+        val output = ArrayList<SubtitleCue>(source.size)
+        val compatibilityFillers = ArrayList<SubtitleCue>()
         var consumedSourceCues = 0
 
         segments.forEach { segment ->
@@ -82,11 +83,28 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
                     deadlineAtElapsedRealtimeMs = deadlineAtElapsedRealtimeMs,
                 ).also { cache[key] = it }
 
-            output += segment.copy(translatedText = translated)
-            consumedSourceCues += segment.confidence.toInt().coerceAtLeast(1)
+            val representedCueCount = segment.confidence.toInt().coerceAtLeast(1)
+            output += segment.copy(translatedText = translated, confidence = 1f)
+
+            // MovieTranslationService currently guards against source-cue loss by comparing list
+            // sizes. Keep that invariant without breaking the Arabic sentence back into Turkish
+            // fragments: invisible fillers are appended after all real cues and SrtFormatter drops
+            // them before rendering.
+            repeat((representedCueCount - 1).coerceAtLeast(0)) {
+                compatibilityFillers += SubtitleCue(
+                    startMs = segment.endMs,
+                    endMs = segment.endMs + 1L,
+                    sourceText = "",
+                    translatedText = SKIP_SUBTITLE_TEXT,
+                    confidence = 0f,
+                )
+            }
+
+            consumedSourceCues += representedCueCount
             onProgress(consumedSourceCues.coerceAtMost(source.size), source.size)
         }
 
+        output += compatibilityFillers
         output
     }
 
@@ -399,8 +417,8 @@ class TurkishArabicTranslator(private val context: Context) : AutoCloseable {
 
         /**
          * Rebuilds Whisper fragments into semantic translation units. Confidence is repurposed
-         * internally to carry how many original cues are represented, so progress remains based on
-         * the source-cue count while the final subtitle uses sentence-level timing.
+         * internally to carry how many original cues are represented, so progress and the service's
+         * source-count invariant stay exact while the visible subtitle is sentence-level.
          */
         private fun buildSourceSegments(cues: List<SubtitleCue>): List<SubtitleCue> {
             if (cues.isEmpty()) return emptyList()
