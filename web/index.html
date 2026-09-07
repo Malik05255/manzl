@@ -12,6 +12,19 @@
     <section class="hero">
       <h1>مترجم H AI الرقمي</h1>
       <p>ألصق رابط فيلم مباشر، وسيتم اكتشاف اللغة وترجمتها للعربية سحابيًا.</p>
+
+      <section class="card sync-card">
+        <div>
+          <label for="syncKey">مفتاح H AI الشخصي</label>
+          <p class="hint">نفس المفتاح على الجوال والكمبيوتر = نفس المكتبة السحابية. لا تشاركه مع أحد.</p>
+        </div>
+        <div class="sync-row">
+          <input id="syncKey" type="password" autocomplete="off" spellcheck="false" aria-label="مفتاح H AI الشخصي" />
+          <button id="copySyncKey" type="button" class="secondary">نسخ</button>
+          <button id="newSyncKey" type="button" class="secondary danger-soft">جديد</button>
+        </div>
+      </section>
+
       <form id="translateForm" class="card">
         <label>رابط الفيلم المباشر</label>
         <input id="sourceUrl" type="url" required placeholder="https://example.com/movie.mp4" />
