@@ -134,7 +134,7 @@ internal class CloudAudioExtractor(private val context: Context) {
                     0,
                     sampleSize,
                     (sampleTimeUs - writer.originalStartUs).coerceAtLeast(0L),
-                    extractor.sampleFlags,
+                    mediaCodecFlags(extractor.sampleFlags),
                 )
                 writer.muxer.writeSampleData(writer.muxerTrack, sampleBuffer, info)
                 writer.payloadBytes += sampleSize.toLong()
@@ -178,6 +178,17 @@ internal class CloudAudioExtractor(private val context: Context) {
             if (mime.startsWith("audio/")) return index
         }
         return -1
+    }
+
+    private fun mediaCodecFlags(extractorFlags: Int): Int {
+        var result = 0
+        if (extractorFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0) {
+            result = result or MediaCodec.BUFFER_FLAG_KEY_FRAME
+        }
+        if (extractorFlags and MediaExtractor.SAMPLE_FLAG_PARTIAL_FRAME != 0) {
+            result = result or MediaCodec.BUFFER_FLAG_PARTIAL_FRAME
+        }
+        return result
     }
 
     private fun createNativeWriter(
