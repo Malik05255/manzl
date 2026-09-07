@@ -16,13 +16,17 @@
         android:theme="@style/Theme.MovieTranslator">
 
         <activity
-            android:name=".LightMainActivity"
+            android:name=".PremiumMainActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <activity
+            android:name=".LightMainActivity"
+            android:exported="false" />
 
         <service
             android:name=".CloudMovieTranslationService"
