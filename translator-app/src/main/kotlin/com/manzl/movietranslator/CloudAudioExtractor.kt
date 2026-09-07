@@ -76,7 +76,10 @@ internal class CloudAudioExtractor(private val context: Context) {
             append("-hide_banner -loglevel error -y ")
             if (offsetMs > 0L) append("-ss $startSeconds ")
             append("-i $input -t $durationSeconds -vn -map 0:a:0 ")
-            append("-ac 1 -ar 16000 -c:a libopus -b:a 24k -vbr off ")
+            // FFmpeg 8.x no longer supports the legacy runtime -ac option in this pipeline.
+            // Force mono + 16 kHz through aformat instead so FFmpegKit 8.1.7 can build the audio graph.
+            append("-af \"aformat=sample_rates=16000:channel_layouts=mono\" ")
+            append("-c:a libopus -b:a 24k -vbr off ")
             append("-application voip -compression_level 5 -f ogg ")
             append(quote(output.absolutePath))
         }
