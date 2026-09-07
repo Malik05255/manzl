@@ -1,60 +1,123 @@
 package com.manzl.movietranslator
 
+import android.app.Activity
 import android.app.Application
 import android.content.Context
 import android.content.res.Configuration
+import android.os.Bundle
+import kotlin.math.abs
 import kotlin.math.min
 import kotlin.math.roundToInt
 
 class MovieTranslatorApplication : Application() {
-    private var baseDensityDpi: Int = 0
+    private var lastSystemFontScale: Float = 1f
 
     override fun onCreate() {
         super.onCreate()
-        baseDensityDpi = resources.configuration.densityDpi.coerceAtLeast(120)
-        applyAdaptivePhoneDensity()
+        lastSystemFontScale = resources.configuration.fontScale
+        applyAdaptiveConfiguration(this, lastSystemFontScale)
+
+        // Apply the same app-only normalization to each Activity before Compose is created.
+        // This makes the layout independent from Android Display size / Screen zoom settings.
+        registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
+            override fun onActivityPreCreated(activity: Activity, savedInstanceState: Bundle?) {
+                applyAdaptiveConfiguration(activity, lastSystemFontScale)
+            }
+
+            override fun onActivityCreated(activity: Activity, savedInstanceState: Bundle?) = Unit
+            override fun onActivityStarted(activity: Activity) = Unit
+            override fun onActivityResumed(activity: Activity) = Unit
+            override fun onActivityPaused(activity: Activity) = Unit
+            override fun onActivityStopped(activity: Activity) = Unit
+            override fun onActivitySaveInstanceState(activity: Activity, outState: Bundle) = Unit
+            override fun onActivityDestroyed(activity: Activity) = Unit
+        })
+
         appContext = applicationContext
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
+        // Capture the user's real font setting before applying our app-local capped value.
+        lastSystemFontScale = newConfig.fontScale
         super.onConfigurationChanged(newConfig)
-        applyAdaptivePhoneDensity()
+        applyAdaptiveConfiguration(this, lastSystemFontScale)
     }
 
-    /**
-     * The reference UI is composed around a roomy ~430dp portrait phone.
-     * Narrow/short phones get a proportional app-only density reduction so
-     * cards, typography, progress rings and bottom navigation all fit without
-     * clipping. Larger phones keep the reference 1:1 sizing.
-     */
     @Suppress("DEPRECATION")
-    private fun applyAdaptivePhoneDensity() {
+    private fun applyAdaptiveConfiguration(context: Context, systemFontScale: Float) {
+        val resources = context.resources
         val metrics = resources.displayMetrics
-        val originalDpi = baseDensityDpi.takeIf { it > 0 } ?: resources.configuration.densityDpi
-        val originalDensity = originalDpi / 160f
-        if (metrics.widthPixels <= 0 || metrics.heightPixels <= 0 || originalDensity <= 0f) return
+        val adaptive = calculateAdaptiveUiMetrics(
+            widthPixels = metrics.widthPixels,
+            heightPixels = metrics.heightPixels,
+            systemDensity = metrics.density,
+            systemFontScale = systemFontScale,
+        )
+        val targetDpi = (adaptive.density * 160f).roundToInt().coerceAtLeast(120)
+        val current = resources.configuration
+        if (current.densityDpi == targetDpi && abs(current.fontScale - adaptive.fontScale) < 0.001f) return
 
-        val widthDp = metrics.widthPixels / originalDensity
-        val heightDp = metrics.heightPixels / originalDensity
-        val widthScale = (widthDp / REFERENCE_WIDTH_DP).coerceIn(MIN_UI_SCALE, 1f)
-        val heightScale = (heightDp / REFERENCE_HEIGHT_DP).coerceIn(MIN_UI_SCALE, 1f)
-        val scale = min(widthScale, heightScale)
-
-        val targetDpi = (originalDpi * scale).roundToInt().coerceAtLeast(120)
-        if (resources.configuration.densityDpi == targetDpi) return
-
-        val configuration = Configuration(resources.configuration)
-        configuration.densityDpi = targetDpi
+        val configuration = Configuration(current).apply {
+            densityDpi = targetDpi
+            fontScale = adaptive.fontScale
+        }
         resources.updateConfiguration(configuration, metrics)
     }
 
     companion object {
-        private const val REFERENCE_WIDTH_DP = 430f
-        private const val REFERENCE_HEIGHT_DP = 820f
-        private const val MIN_UI_SCALE = 0.78f
-
         @Volatile
         internal lateinit var appContext: Context
             private set
     }
 }
+
+/**
+ * App-local UI metrics derived from physical pixels rather than Android's logical dp size.
+ *
+ * A 200% Display size setting can halve the logical width Android reports while the phone still
+ * has the same physical pixel area. Using the physical pixel bounds as the source of truth keeps
+ * the reference layout proportional instead of multiplying already-large cards and typography.
+ */
+internal data class AdaptiveUiMetrics(
+    val density: Float,
+    val fontScale: Float,
+)
+
+internal fun calculateAdaptiveUiMetrics(
+    widthPixels: Int,
+    heightPixels: Int,
+    systemDensity: Float,
+    systemFontScale: Float,
+): AdaptiveUiMetrics {
+    val safeSystemDensity = systemDensity.takeIf { it.isFinite() && it > 0f } ?: 1f
+    val safeSystemFontScale = systemFontScale.takeIf { it.isFinite() && it > 0f } ?: 1f
+    if (widthPixels <= 0 || heightPixels <= 0) {
+        return AdaptiveUiMetrics(
+            density = safeSystemDensity,
+            fontScale = safeSystemFontScale.coerceIn(MIN_APP_FONT_SCALE, MAX_APP_FONT_SCALE),
+        )
+    }
+
+    val portrait = heightPixels >= widthPixels
+    val referenceWidth = if (portrait) REFERENCE_PORTRAIT_WIDTH_DP else REFERENCE_PORTRAIT_HEIGHT_DP
+    val referenceHeight = if (portrait) REFERENCE_PORTRAIT_HEIGHT_DP else REFERENCE_PORTRAIT_WIDTH_DP
+
+    val widthFitDensity = widthPixels / referenceWidth
+    val heightFitDensity = heightPixels / referenceHeight
+    val fittedDensity = min(widthFitDensity, heightFitDensity)
+        .takeIf { it.isFinite() && it > 0f }
+        ?: safeSystemDensity
+
+    return AdaptiveUiMetrics(
+        density = fittedDensity.coerceAtLeast(MIN_APP_DENSITY),
+        // Retain modest accessibility scaling, but prevent 150–200% font/display combinations
+        // from clipping dialogs, action buttons and the bottom navigation.
+        fontScale = safeSystemFontScale.coerceIn(MIN_APP_FONT_SCALE, MAX_APP_FONT_SCALE),
+    )
+}
+
+private const val REFERENCE_PORTRAIT_WIDTH_DP = 430f
+private const val REFERENCE_PORTRAIT_HEIGHT_DP = 820f
+private const val MIN_APP_DENSITY = 0.75f
+private const val MIN_APP_FONT_SCALE = 0.85f
+private const val MAX_APP_FONT_SCALE = 1.15f
