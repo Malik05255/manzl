@@ -1,6 +1,5 @@
 import concurrent.futures
 import ipaddress
-import json
 import os
 import socket
 import subprocess
@@ -14,7 +13,7 @@ import requests
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-app = FastAPI(title="H AI Audio Extractor", version="1.0.0")
+app = FastAPI(title="H AI Audio Extractor", version="1.0.1")
 
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 DEFAULT_PRIMARY = "whisper-large-v3"
@@ -25,6 +24,21 @@ MAX_REDIRECTS = 5
 MAX_SOURCE_BYTES = int(os.getenv("MAX_SOURCE_BYTES", str(8 * 1024 * 1024 * 1024)))
 REQUEST_TIMEOUT = int(os.getenv("SOURCE_TIMEOUT_SECONDS", "1800"))
 GROQ_TIMEOUT = int(os.getenv("GROQ_TIMEOUT_SECONDS", "600"))
+LANGUAGE_NAMES = {
+    "english": "en",
+    "turkish": "tr",
+    "japanese": "ja",
+    "hindi": "hi",
+    "arabic": "ar",
+    "korean": "ko",
+    "chinese": "zh",
+    "french": "fr",
+    "spanish": "es",
+    "german": "de",
+    "italian": "it",
+    "portuguese": "pt",
+    "russian": "ru",
+}
 
 
 class TranscribeRequest(BaseModel):
@@ -115,8 +129,10 @@ def transcribe(req: TranscribeRequest, authorization: str | None = Header(defaul
                 text = " ".join(str(seg.get("text", "")).split()).strip()
                 if not text:
                     continue
-                start = max(0.0, float(seg.get("start", 0.0))) + offset
-                end = max(start + 0.001, float(seg.get("end", start))) + offset
+                local_start = max(0.0, float(seg.get("start", 0.0)))
+                local_end = max(local_start + 0.001, float(seg.get("end", local_start + 0.001)))
+                start = local_start + offset
+                end = local_end + offset
                 segments.append({"start": round(start, 3), "end": round(end, 3), "text": text})
             offset += max(0.0, durations[index])
 
@@ -326,6 +342,8 @@ def normalize_language(value: Any) -> str:
     raw = str(value or "auto").strip().lower().replace("_", "-")
     if not raw or raw == "auto":
         return "auto"
+    if raw in LANGUAGE_NAMES:
+        return LANGUAGE_NAMES[raw]
     code = raw.split("-", 1)[0]
     return code if 2 <= len(code) <= 3 and code.isalpha() else "auto"
 
