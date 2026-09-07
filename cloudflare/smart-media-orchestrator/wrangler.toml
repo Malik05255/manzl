@@ -1,9 +1,12 @@
 name = "h-ai-smart-media-orchestrator"
-main = "src/index-v3.ts"
+main = "src/index-v4.ts"
 compatibility_date = "2026-09-08"
 
 [observability]
 enabled = true
+
+[triggers]
+crons = ["17 3 * * *"]
 
 [[workflows]]
 name = "h-ai-smart-media-v1"
@@ -34,3 +37,6 @@ PUBLIC_BASE_URL = ""
 # - AZURE_TRANSLATOR_KEY
 # - AZURE_TRANSLATOR_REGION
 # - AZURE_TRANSLATOR_ENDPOINT
+#
+# The 03:17 UTC daily cron removes expired R2 movie objects under ttl/*.
+# Translation/SRT/summary data stays in Supabase unless the user deletes it separately.
