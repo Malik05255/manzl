@@ -12,7 +12,6 @@ import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.FFmpegKitConfig
 import com.arthenica.ffmpegkit.ReturnCode
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -118,7 +117,7 @@ internal class CloudAudioExtractor(private val context: Context) {
                 if (shouldSplit) {
                     outputs += finishNativeWriter(current)
                     activeWriter = null
-                    continue // Re-read this same extractor sample into the next part.
+                    continue
                 }
 
                 val writer = activeWriter ?: createNativeWriter(
@@ -231,7 +230,7 @@ internal class CloudAudioExtractor(private val context: Context) {
         writer.file.delete()
     }
 
-    private fun prepareWithFfmpeg(
+    private suspend fun prepareWithFfmpeg(
         uri: Uri,
         durationMs: Long,
         outputDir: File,
@@ -269,11 +268,6 @@ internal class CloudAudioExtractor(private val context: Context) {
         }
     }
 
-    /**
-     * FFmpeg compatibility fallback: try an already-open Android descriptor first, then the
-     * FFmpegKit SAF URL. This path is only reached when native remuxing cannot represent the
-     * source audio codec/container.
-     */
     private suspend fun transcodePart(
         uri: Uri,
         safInput: String,
@@ -417,8 +411,6 @@ internal class CloudAudioExtractor(private val context: Context) {
         private const val MAX_MOVIE_DURATION_MS = 3L * HOUR_MS
         private const val MAX_PART_BYTES = 24L * 1024L * 1024L
         private const val PART_OVERLAP_MS = 2_500L
-
-        // Keep native remux payload comfortably below the 24 MiB backend/provider ceiling.
         private const val NATIVE_TARGET_PAYLOAD_BYTES = 20L * 1024L * 1024L
         private const val NATIVE_MAX_PART_DURATION_US = 60L * 60L * 1_000_000L
         private const val NATIVE_SAMPLE_TAIL_US = 40_000L
@@ -438,10 +430,6 @@ internal class CloudAudioExtractor(private val context: Context) {
             else -> null
         }
 
-        /**
-         * FFmpeg fallback splitter. 1:45 => ~52:30 + 52:30, 2:00 => 60 + 60,
-         * 3:00 => 60 + 60 + 60.
-         */
         internal fun planParts(durationMs: Long): List<Pair<Long, Long>> {
             require(durationMs in 1..MAX_MOVIE_DURATION_MS)
             val partCount = ceil(durationMs.toDouble() / HOUR_MS.toDouble())
