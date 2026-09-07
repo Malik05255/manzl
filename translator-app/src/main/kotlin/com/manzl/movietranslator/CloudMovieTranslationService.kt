@@ -274,7 +274,7 @@ class CloudMovieTranslationService : Service() {
         while (scope.isActive) {
             waitUntilConnected()
             try {
-                return CloudTranslationClient(applicationContext).submitForBackground(parts) { progress ->
+                return CloudAudioUploadClient(applicationContext).submitForBackground(parts) { progress ->
                     maxUploadProgress = maxOf(maxUploadProgress, progress.coerceIn(0f, 1f))
                     publish(0.15f + maxUploadProgress * 0.30f, "رفع الصوت بأمان")
                 }
