@@ -55,15 +55,17 @@ export function makeRoutePlan(input: {
     targetLanguage: 'ar',
     asrPrimary,
     asrFallback,
-    translationOrder: ['azure', 'groq'],
+    // Preserve Azure's monthly free characters by using Groq for bulk text first.
+    translationOrder: ['groq', 'azure'],
     reviewProvider: 'groq:gpt-oss-120b',
-    analysisProvider: 'groq:gpt-oss-120b',
+    analysisProvider: 'groq:gpt-oss-20b',
     retention,
     expiresAt: retentionExpiry(retention),
     rationale: [
       `duration:${bucket}`,
       `language:${language}`,
       qualityFirst ? 'quality-first-asr' : 'speed-first-with-quality-fallback',
+      input.sourceKind === 'url' ? 'server-side-direct-url-route' : 'local-audio-derivative-route',
       retention === 'none' ? 'zero-copy-playback' : `retention:${retention}`,
       'zero-bill-route-only',
     ],
@@ -85,6 +87,7 @@ export function isSafeRemoteMediaUrl(value: unknown): boolean {
     if (!host || host === 'localhost' || host.endsWith('.local')) return false;
     if (/^(127\.|10\.|192\.168\.|169\.254\.)/.test(host)) return false;
     if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return false;
+    if (host === '0.0.0.0' || host === '::1') return false;
     return true;
   } catch {
     return false;
