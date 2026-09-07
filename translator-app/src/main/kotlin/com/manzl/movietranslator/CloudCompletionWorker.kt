@@ -5,10 +5,12 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.content.Context
+import android.content.pm.ServiceInfo
 import android.net.Uri
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
 import androidx.work.Data
+import androidx.work.ForegroundInfo
 import androidx.work.NetworkType
 import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
@@ -27,6 +29,9 @@ internal class CloudCompletionWorker(
         val store = CloudJobStore(applicationContext)
         val job = store.load() ?: return Result.success()
 
+        // Keep the process alive while the cloud phase continues after the Activity is backgrounded.
+        setForeground(createForegroundInfo(job))
+
         if (CloudMovieTranslationService.isPauseRequested(applicationContext)) {
             CloudMovieTranslationService.markBackgroundPaused(applicationContext, job)
             return Result.success()
@@ -37,6 +42,8 @@ internal class CloudCompletionWorker(
         val advance = try {
             advanceWithResumableFallback(job)
         } catch (transient: CloudTransientException) {
+            // A hard stop clears the stored job. Do not resurrect it on retry.
+            if (!sameJobStillActive(store, job.movieKey)) return Result.success()
             if (CloudMovieTranslationService.isPauseRequested(applicationContext)) {
                 CloudMovieTranslationService.markBackgroundPaused(applicationContext, job)
                 return Result.success()
@@ -47,10 +54,14 @@ internal class CloudCompletionWorker(
             schedule(applicationContext, 3_000L)
             return Result.success()
         } catch (error: Throwable) {
+            if (!sameJobStillActive(store, job.movieKey)) return Result.success()
             val friendly = CloudConnectivity.userFacingFailure(applicationContext, error)
             CloudMovieTranslationService.failBackground(applicationContext, friendly)
             return Result.failure(Data.Builder().putString("error", friendly).build())
         }
+
+        // If the red stop button was pressed while a network request was in flight, discard its result.
+        if (!sameJobStillActive(store, job.movieKey)) return Result.success()
 
         store.save(advance.job)
         val cloud = advance.result
@@ -66,6 +77,8 @@ internal class CloudCompletionWorker(
             return Result.success()
         }
 
+        if (!sameJobStillActive(store, job.movieKey)) return Result.success()
+
         val uri = Uri.parse(advance.job.videoUri)
         val output = withContext(Dispatchers.IO) {
             val dir = File(applicationContext.filesDir, "subtitles").apply { mkdirs() }
@@ -78,6 +91,12 @@ internal class CloudCompletionWorker(
                 writeText(SrtFormatter.format(cloud.cues), Charsets.UTF_8)
             }
         }
+
+        if (!sameJobStillActive(store, job.movieKey)) {
+            runCatching { output.delete() }
+            return Result.success()
+        }
+
         val srtText = withContext(Dispatchers.IO) { output.readText(Charsets.UTF_8) }
         val elapsed = (System.currentTimeMillis() - advance.job.startedAtEpochMs).coerceAtLeast(0L)
         val library = CloudLibraryClient(applicationContext)
@@ -94,6 +113,7 @@ internal class CloudCompletionWorker(
             )
             runCatching { library.recordUsage(advance.job.durationMs, cloud.providers) }
         } catch (error: Throwable) {
+            if (!sameJobStillActive(store, job.movieKey)) return Result.success()
             val stage = if (CloudConnectivity.isOnline(applicationContext)) {
                 "الترجمة جاهزة • تعذر حفظها في المكتبة، تتم إعادة المحاولة تلقائيًا"
             } else {
@@ -105,6 +125,8 @@ internal class CloudCompletionWorker(
             schedule(applicationContext, 4_000L)
             return Result.success()
         }
+
+        if (!sameJobStillActive(store, job.movieKey)) return Result.success()
 
         CloudMovieTranslationService.completeBackground(
             context = applicationContext,
@@ -118,11 +140,12 @@ internal class CloudCompletionWorker(
         return Result.success()
     }
 
+    private fun sameJobStillActive(store: CloudJobStore, movieKey: String): Boolean =
+        store.load()?.movieKey == movieKey
+
     private suspend fun advanceWithResumableFallback(job: BackgroundCloudJob): CloudAdvance {
         val fallback = ResumableTranslationFallbackClient(applicationContext)
-        if (ResumableTranslationFallbackClient.isActive(job)) {
-            return fallback.advance(job)
-        }
+        if (ResumableTranslationFallbackClient.isActive(job)) return fallback.advance(job)
 
         return try {
             CloudTranslationClient(applicationContext).advance(job)
@@ -136,6 +159,34 @@ internal class CloudCompletionWorker(
                 )
             )
         }
+    }
+
+    private fun createForegroundInfo(job: BackgroundCloudJob): ForegroundInfo {
+        val manager = applicationContext.getSystemService(NotificationManager::class.java)
+        manager.createNotificationChannel(
+            NotificationChannel(BACKGROUND_CHANNEL_ID, "ترجمة في الخلفية", NotificationManager.IMPORTANCE_LOW)
+        )
+        val launch = applicationContext.packageManager.getLaunchIntentForPackage(applicationContext.packageName)
+        val pending = PendingIntent.getActivity(
+            applicationContext,
+            78,
+            launch,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+        )
+        val notification = Notification.Builder(applicationContext, BACKGROUND_CHANNEL_ID)
+            .setSmallIcon(R.drawable.ic_status_translate)
+            .setContentTitle("مترجم H AI الرقمي")
+            .setContentText("تستمر ترجمة ${job.movieName} في الخلفية")
+            .setContentIntent(pending)
+            .setOnlyAlertOnce(true)
+            .setOngoing(true)
+            .setProgress(100, (job.progress.coerceIn(0f, 1f) * 100f).toInt(), false)
+            .build()
+        return ForegroundInfo(
+            BACKGROUND_NOTIFICATION_ID,
+            notification,
+            ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+        )
     }
 
     private fun notifyComplete(movieName: String) {
@@ -164,7 +215,9 @@ internal class CloudCompletionWorker(
 
     companion object {
         private const val CHANNEL_ID = "cloud_translation_results"
+        private const val BACKGROUND_CHANNEL_ID = "cloud_translation_background"
         private const val COMPLETE_NOTIFICATION_ID = 4310
+        private const val BACKGROUND_NOTIFICATION_ID = 4311
 
         fun schedule(context: Context, delayMs: Long = 0L) {
             if (CloudMovieTranslationService.isPauseRequested(context)) return
