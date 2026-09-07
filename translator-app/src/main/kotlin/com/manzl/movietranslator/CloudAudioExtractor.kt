@@ -1,6 +1,10 @@
 package com.manzl.movietranslator
 
 import android.content.Context
+import android.media.MediaCodec
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.media.MediaMuxer
 import android.net.Uri
 import android.os.ParcelFileDescriptor
 import android.util.Log
@@ -8,10 +12,10 @@ import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.FFmpegKitConfig
 import com.arthenica.ffmpegkit.ReturnCode
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.nio.ByteBuffer
 import java.util.Locale
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -23,7 +27,15 @@ internal data class CloudAudioPart(
     val durationMs: Long,
 )
 
-/** Produces speech-optimized Opus for the cloud path without ever uploading the video. */
+/**
+ * Prepares an audio-only derivative for cloud speech recognition.
+ *
+ * The primary path deliberately avoids FFmpeg. Android's MediaExtractor/MediaMuxer remuxes the
+ * existing compressed audio track into small audio-only chunks without decoding the video and
+ * without transcoding the audio. This is substantially faster and avoids vendor-specific SAF /
+ * FFmpeg failures seen on long movies. FFmpeg remains only as a compatibility fallback for source
+ * audio codecs that Android cannot remux directly.
+ */
 internal class CloudAudioExtractor(private val context: Context) {
     suspend fun prepare(
         uri: Uri,
@@ -34,21 +46,218 @@ internal class CloudAudioExtractor(private val context: Context) {
             "يدعم المسار السحابي أفلامًا حتى 3 ساعات حاليًا."
         }
 
-        val plan = planParts(durationMs)
         val outputDir = File(context.cacheDir, "cloud_audio").apply { mkdirs() }
         outputDir.listFiles()?.filter { it.name.startsWith("cloud_") }?.forEach { it.delete() }
 
+        val nativeAttempt = runCatching {
+            prepareWithNativeRemux(uri, durationMs, outputDir, onProgress)
+        }
+        if (nativeAttempt.isSuccess) return@withContext nativeAttempt.getOrThrow()
+
+        Log.w(TAG, "Native audio remux failed; falling back to FFmpeg", nativeAttempt.exceptionOrNull())
+        outputDir.listFiles()?.filter { it.name.startsWith("cloud_") }?.forEach { it.delete() }
+
+        val ffmpegAttempt = runCatching {
+            prepareWithFfmpeg(uri, durationMs, outputDir, onProgress)
+        }
+        if (ffmpegAttempt.isSuccess) return@withContext ffmpegAttempt.getOrThrow()
+
+        Log.e(TAG, "Native remux and FFmpeg audio preparation both failed", ffmpegAttempt.exceptionOrNull())
+        outputDir.listFiles()?.filter { it.name.startsWith("cloud_") }?.forEach { it.delete() }
+        throw IllegalStateException(
+            "تعذر تجهيز صوت الفيلم محليًا. [AUDIO-PREP-3]",
+            ffmpegAttempt.exceptionOrNull() ?: nativeAttempt.exceptionOrNull(),
+        )
+    }
+
+    private fun prepareWithNativeRemux(
+        uri: Uri,
+        durationMs: Long,
+        outputDir: File,
+        onProgress: (done: Int, total: Int) -> Unit,
+    ): List<CloudAudioPart> {
+        val extractor = MediaExtractor()
+        val outputs = mutableListOf<CloudAudioPart>()
+        var activeWriter: NativePartWriter? = null
+
+        try {
+            extractor.setDataSource(context, uri, null)
+            val audioTrack = findAudioTrack(extractor)
+            check(audioTrack >= 0) { "audio_track_missing" }
+
+            val format = extractor.getTrackFormat(audioTrack)
+            val mime = format.getString(MediaFormat.KEY_MIME).orEmpty()
+            val container = nativeContainerForMime(mime)
+                ?: error("native_audio_container_unsupported:$mime")
+
+            extractor.selectTrack(audioTrack)
+            val bufferSize = if (format.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
+                format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE).coerceAtLeast(DEFAULT_NATIVE_BUFFER_BYTES)
+            } else {
+                DEFAULT_NATIVE_BUFFER_BYTES
+            }
+            val sampleBuffer = ByteBuffer.allocateDirect(bufferSize.coerceAtMost(MAX_NATIVE_BUFFER_BYTES))
+            val info = MediaCodec.BufferInfo()
+            var partIndex = 0
+            var sampleCounter = 0
+
+            while (true) {
+                sampleBuffer.clear()
+                val sampleSize = extractor.readSampleData(sampleBuffer, 0)
+                if (sampleSize < 0) break
+                val sampleTimeUs = extractor.sampleTime
+                if (sampleTimeUs < 0L) break
+                check(sampleSize <= sampleBuffer.capacity()) { "native_audio_sample_too_large:$sampleSize" }
+
+                val current = activeWriter
+                val shouldSplit = current != null && current.sampleCount > 0 && (
+                    current.payloadBytes + sampleSize > NATIVE_TARGET_PAYLOAD_BYTES ||
+                        sampleTimeUs - current.originalStartUs >= NATIVE_MAX_PART_DURATION_US
+                    )
+                if (shouldSplit) {
+                    outputs += finishNativeWriter(current)
+                    activeWriter = null
+                    continue
+                }
+
+                val writer = activeWriter ?: createNativeWriter(
+                    outputDir = outputDir,
+                    partIndex = ++partIndex,
+                    sourceFormat = format,
+                    container = container,
+                    originalStartUs = sampleTimeUs,
+                ).also { activeWriter = it }
+
+                sampleBuffer.position(0)
+                sampleBuffer.limit(sampleSize)
+                info.set(
+                    0,
+                    sampleSize,
+                    (sampleTimeUs - writer.originalStartUs).coerceAtLeast(0L),
+                    mediaCodecFlags(extractor.sampleFlags),
+                )
+                writer.muxer.writeSampleData(writer.muxerTrack, sampleBuffer, info)
+                writer.payloadBytes += sampleSize.toLong()
+                writer.lastOriginalUs = sampleTimeUs
+                writer.sampleCount += 1
+
+                extractor.advance()
+                sampleCounter += 1
+                if (sampleCounter % 96 == 0) {
+                    val ratio = (sampleTimeUs / 1000.0 / durationMs.toDouble()).coerceIn(0.0, 1.0)
+                    onProgress((ratio * 100).toInt().coerceIn(1, 99), 100)
+                }
+            }
+
+            activeWriter?.let {
+                outputs += finishNativeWriter(it)
+                activeWriter = null
+            }
+
+            check(outputs.isNotEmpty()) { "native_audio_empty" }
+            outputs.forEach { part ->
+                check(part.file.isFile && part.file.length() > 0L) { "native_audio_part_empty" }
+                check(part.file.length() <= MAX_PART_BYTES) { "native_audio_part_too_large" }
+            }
+            onProgress(100, 100)
+            Log.i(TAG, "Native audio remux prepared ${outputs.size} part(s), mime=$mime")
+            return outputs
+        } catch (error: Throwable) {
+            activeWriter?.let { abortNativeWriter(it) }
+            outputs.forEach { runCatching { it.file.delete() } }
+            throw error
+        } finally {
+            extractor.release()
+        }
+    }
+
+    private fun findAudioTrack(extractor: MediaExtractor): Int {
+        for (index in 0 until extractor.trackCount) {
+            val format = extractor.getTrackFormat(index)
+            val mime = format.getString(MediaFormat.KEY_MIME).orEmpty()
+            if (mime.startsWith("audio/")) return index
+        }
+        return -1
+    }
+
+    private fun mediaCodecFlags(extractorFlags: Int): Int {
+        var result = 0
+        if (extractorFlags and MediaExtractor.SAMPLE_FLAG_SYNC != 0) {
+            result = result or MediaCodec.BUFFER_FLAG_KEY_FRAME
+        }
+        if (extractorFlags and MediaExtractor.SAMPLE_FLAG_PARTIAL_FRAME != 0) {
+            result = result or MediaCodec.BUFFER_FLAG_PARTIAL_FRAME
+        }
+        return result
+    }
+
+    private fun createNativeWriter(
+        outputDir: File,
+        partIndex: Int,
+        sourceFormat: MediaFormat,
+        container: NativeContainer,
+        originalStartUs: Long,
+    ): NativePartWriter {
+        val file = File(
+            outputDir,
+            "cloud_native_${System.currentTimeMillis()}_${partIndex}.${container.extension}",
+        )
+        val muxer = MediaMuxer(file.absolutePath, container.outputFormat)
+        return try {
+            val muxerTrack = muxer.addTrack(sourceFormat)
+            muxer.start()
+            NativePartWriter(
+                file = file,
+                muxer = muxer,
+                muxerTrack = muxerTrack,
+                originalStartUs = originalStartUs,
+                lastOriginalUs = originalStartUs,
+            )
+        } catch (error: Throwable) {
+            runCatching { muxer.release() }
+            file.delete()
+            throw error
+        }
+    }
+
+    private fun finishNativeWriter(writer: NativePartWriter): CloudAudioPart {
+        try {
+            writer.muxer.stop()
+        } finally {
+            writer.muxer.release()
+        }
+        val durationMs = ((writer.lastOriginalUs - writer.originalStartUs + NATIVE_SAMPLE_TAIL_US) / 1000L)
+            .coerceAtLeast(1L)
+        return CloudAudioPart(
+            file = writer.file,
+            offsetMs = (writer.originalStartUs / 1000L).coerceAtLeast(0L),
+            durationMs = durationMs,
+        )
+    }
+
+    private fun abortNativeWriter(writer: NativePartWriter) {
+        if (writer.sampleCount > 0) runCatching { writer.muxer.stop() }
+        runCatching { writer.muxer.release() }
+        writer.file.delete()
+    }
+
+    private suspend fun prepareWithFfmpeg(
+        uri: Uri,
+        durationMs: Long,
+        outputDir: File,
+        onProgress: (done: Int, total: Int) -> Unit,
+    ): List<CloudAudioPart> {
+        val plan = planParts(durationMs)
         val safInput = FFmpegKitConfig.getSafParameterForRead(context, uri)
         val outputs = ArrayList<CloudAudioPart>(plan.size)
+
         try {
             plan.forEachIndexed { index, spec ->
-                coroutineContext.ensureActive()
-
                 val overlapMs = if (index == 0) 0L else minOf(PART_OVERLAP_MS, spec.first)
                 val actualOffset = spec.first - overlapMs
                 val actualDuration = spec.second + overlapMs
+                val output = File(outputDir, "cloud_ffmpeg_${System.currentTimeMillis()}_${index + 1}.ogg")
 
-                val output = File(outputDir, "cloud_${System.currentTimeMillis()}_${index + 1}.ogg")
                 transcodePart(
                     uri = uri,
                     safInput = safInput,
@@ -63,21 +272,13 @@ internal class CloudAudioExtractor(private val context: Context) {
                 outputs += CloudAudioPart(output, actualOffset, actualDuration)
                 onProgress(index + 1, plan.size)
             }
-            outputs
+            return outputs
         } catch (error: Throwable) {
             outputs.forEach { it.file.delete() }
-            throw IllegalStateException(
-                "تعذر تجهيز صوت الفيلم محليًا. [AUDIO-PREP-2]",
-                error,
-            )
+            throw error
         }
     }
 
-    /**
-     * Some vendor Android builds expose document-provider movies in a way that FFmpegKit's SAF
-     * protocol cannot keep open for a long-running transcode. We therefore try the already-open
-     * Android descriptor first (/proc/self/fd/N), then retry the official SAF URL automatically.
-     */
     private suspend fun transcodePart(
         uri: Uri,
         safInput: String,
@@ -195,11 +396,25 @@ internal class CloudAudioExtractor(private val context: Context) {
             append("-hide_banner -loglevel error -y ")
             if (offsetMs > 0L) append("-ss $startSeconds ")
             append("-i ${quote(input)} -t $durationSeconds -vn -sn -dn -map 0:a:0 ")
-            append("-ac 1 -ar 16000 -c:a libopus -b:a 24k -vbr off ")
-            append("-application voip -compression_level 5 -f ogg ")
+            append("-ac 1 -ar 16000 -c:a libopus -b:a 24k -f ogg ")
             append(quote(output.absolutePath))
         }
     }
+
+    private data class NativeContainer(
+        val outputFormat: Int,
+        val extension: String,
+    )
+
+    private data class NativePartWriter(
+        val file: File,
+        val muxer: MediaMuxer,
+        val muxerTrack: Int,
+        val originalStartUs: Long,
+        var lastOriginalUs: Long,
+        var payloadBytes: Long = 0L,
+        var sampleCount: Int = 0,
+    )
 
     companion object {
         private const val TAG = "CloudAudioExtractor"
@@ -207,11 +422,25 @@ internal class CloudAudioExtractor(private val context: Context) {
         private const val MAX_MOVIE_DURATION_MS = 3L * HOUR_MS
         private const val MAX_PART_BYTES = 24L * 1024L * 1024L
         private const val PART_OVERLAP_MS = 2_500L
+        private const val NATIVE_TARGET_PAYLOAD_BYTES = 20L * 1024L * 1024L
+        private const val NATIVE_MAX_PART_DURATION_US = 60L * 60L * 1_000_000L
+        private const val NATIVE_SAMPLE_TAIL_US = 40_000L
+        private const val DEFAULT_NATIVE_BUFFER_BYTES = 1024 * 1024
+        private const val MAX_NATIVE_BUFFER_BYTES = 4 * 1024 * 1024
 
-        /**
-         * Splits the movie into balanced parts with a target maximum of one hour.
-         * 1:45 => ~52:30 + 52:30, 2:00 => 60 + 60, 3:00 => 60 + 60 + 60.
-         */
+        private fun nativeContainerForMime(mime: String): NativeContainer? = when (mime.lowercase()) {
+            "audio/opus", "audio/vorbis" -> NativeContainer(
+                MediaMuxer.OutputFormat.MUXER_OUTPUT_WEBM,
+                "webm",
+            )
+            "audio/mp4a-latm", "audio/aac", "audio/3gpp", "audio/amr-wb",
+            "audio/mpeg", "audio/ac3", "audio/eac3", "audio/ac4" -> NativeContainer(
+                MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4,
+                "m4a",
+            )
+            else -> null
+        }
+
         internal fun planParts(durationMs: Long): List<Pair<Long, Long>> {
             require(durationMs in 1..MAX_MOVIE_DURATION_MS)
             val partCount = ceil(durationMs.toDouble() / HOUR_MS.toDouble())
