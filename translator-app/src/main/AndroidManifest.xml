@@ -16,7 +16,7 @@
         android:theme="@style/Theme.MovieTranslator">
 
         <activity
-            android:name=".ExactHonor200MainActivity"
+            android:name=".MeasuredReferenceMainActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -24,21 +24,11 @@
             </intent-filter>
         </activity>
 
-        <activity
-            android:name=".HonorReferenceMainActivity"
-            android:exported="false" />
-
-        <activity
-            android:name=".ResponsivePremiumMainActivity"
-            android:exported="false" />
-
-        <activity
-            android:name=".PremiumMainActivity"
-            android:exported="false" />
-
-        <activity
-            android:name=".LightMainActivity"
-            android:exported="false" />
+        <activity android:name=".ExactHonor200MainActivity" android:exported="false" />
+        <activity android:name=".HonorReferenceMainActivity" android:exported="false" />
+        <activity android:name=".ResponsivePremiumMainActivity" android:exported="false" />
+        <activity android:name=".PremiumMainActivity" android:exported="false" />
+        <activity android:name=".LightMainActivity" android:exported="false" />
 
         <service
             android:name=".CloudMovieTranslationService"
