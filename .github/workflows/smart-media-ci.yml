@@ -1,0 +1,41 @@
+name: Smart Media CI
+
+on:
+  pull_request:
+    paths:
+      - 'supabase/functions/media-gateway/**'
+      - 'supabase/functions/_shared/**'
+      - 'cloudflare/media-ingest/**'
+      - 'web/**'
+      - '.github/workflows/smart-media-ci.yml'
+  push:
+    branches:
+      - 'development-smart-media-v1'
+    paths:
+      - 'supabase/functions/media-gateway/**'
+      - 'supabase/functions/_shared/**'
+      - 'cloudflare/media-ingest/**'
+      - 'web/**'
+      - '.github/workflows/smart-media-ci.yml'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Check Supabase Smart Media TypeScript
+        run: |
+          deno check supabase/functions/_shared/smart-media-router.ts
+          deno check supabase/functions/media-gateway/index.ts
+
+      - name: Check web JavaScript
+        run: node --check web/app.js
+
+      - name: Bundle Cloudflare Worker
+        run: npx --yes wrangler@latest deploy cloudflare/media-ingest/src/index.ts --dry-run --compatibility-date=2026-09-08
