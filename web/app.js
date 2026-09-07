@@ -1,6 +1,8 @@
 const SUPABASE_FUNCTION = 'https://abavsspydbpkudhswmzp.supabase.co/functions/v1/media-gateway';
 const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_iuZnOH7ye1WITm-xc44TiQ_CNb2d2qB';
 const PENDING_KEY = 'h_ai_pending_job';
+const ACCOUNT_KEY_STORAGE = 'h_ai_personal_account_key_v1';
+const ACCOUNT_KEY_RE = /^[A-Za-z0-9_-]{32,128}$/;
 
 const form = document.getElementById('translateForm');
 const statusCard = document.getElementById('statusCard');
@@ -10,16 +12,12 @@ const statusText = document.getElementById('statusText');
 const statusTitle = document.getElementById('statusTitle');
 const startButton = document.getElementById('startButton');
 const player = document.getElementById('player');
+const syncKeyInput = document.getElementById('syncKey');
+const copySyncKeyButton = document.getElementById('copySyncKey');
+const newSyncKeyButton = document.getElementById('newSyncKey');
 let currentTrackBlobUrl = null;
 
-function clientId() {
-  let id = localStorage.getItem('h_ai_client_id');
-  if (!id) {
-    id = 'web-' + crypto.randomUUID().replaceAll('-', '').slice(0, 20);
-    localStorage.setItem('h_ai_client_id', id);
-  }
-  return id;
-}
+initializePersonalKey();
 
 form.addEventListener('submit', async (event) => {
   event.preventDefault();
@@ -27,11 +25,16 @@ form.addEventListener('submit', async (event) => {
   const retention = document.getElementById('retention').value;
   if (!/^https?:\/\//i.test(sourceUrl)) return;
 
+  const key = saveAndGetPersonalKey();
+  if (!key) {
+    fail(new Error('مفتاح H AI الشخصي غير صالح.'));
+    return;
+  }
+
   setWorking('إرسال الفيلم للسحابة…');
   try {
     const accepted = await gateway({
       mode: 'translate_url',
-      client_id: clientId(),
       source_url: sourceUrl,
       retention,
       language: 'auto',
@@ -45,10 +48,44 @@ form.addEventListener('submit', async (event) => {
   }
 });
 
+syncKeyInput.addEventListener('change', () => {
+  const previous = localStorage.getItem(ACCOUNT_KEY_STORAGE) || '';
+  const value = syncKeyInput.value.trim();
+  if (!ACCOUNT_KEY_RE.test(value)) {
+    syncKeyInput.value = previous || ensurePersonalKey();
+    fail(new Error('مفتاح المزامنة يجب أن يكون مفتاح H AI صالحًا.'));
+    return;
+  }
+  if (value !== previous) localStorage.removeItem(PENDING_KEY);
+  localStorage.setItem(ACCOUNT_KEY_STORAGE, value);
+});
+
+copySyncKeyButton.addEventListener('click', async () => {
+  const key = saveAndGetPersonalKey();
+  if (!key) return;
+  try {
+    await navigator.clipboard.writeText(key);
+    copySyncKeyButton.textContent = 'تم النسخ';
+    setTimeout(() => { copySyncKeyButton.textContent = 'نسخ'; }, 1400);
+  } catch {
+    syncKeyInput.type = 'text';
+    syncKeyInput.select();
+  }
+});
+
+newSyncKeyButton.addEventListener('click', () => {
+  const ok = window.confirm('إنشاء مفتاح جديد سيفصل هذا المتصفح عن المكتبة المرتبطة بالمفتاح الحالي. هل تريد المتابعة؟');
+  if (!ok) return;
+  const created = generatePersonalKey();
+  localStorage.setItem(ACCOUNT_KEY_STORAGE, created);
+  localStorage.removeItem(PENDING_KEY);
+  syncKeyInput.value = created;
+});
+
 async function watchJob(jobId) {
   setWorking('المهمة تعمل في السحابة… ويمكن إغلاق هذه الصفحة.');
   for (;;) {
-    const root = await gateway({ mode: 'get_job', client_id: clientId(), job_id: jobId });
+    const root = await gateway({ mode: 'get_job', job_id: jobId });
     const job = root.job;
     if (!job) {
       statusText.textContent = 'بانتظار ظهور المهمة على الخادم…';
@@ -76,6 +113,13 @@ async function watchJob(jobId) {
 }
 
 async function gateway(payload) {
+  const body = { ...payload };
+  if (body.mode !== 'plan') {
+    const key = saveAndGetPersonalKey();
+    if (!key) throw new Error('مفتاح H AI الشخصي مطلوب.');
+    body.account_key = key;
+  }
+
   const response = await fetch(SUPABASE_FUNCTION, {
     method: 'POST',
     headers: {
@@ -83,11 +127,39 @@ async function gateway(payload) {
       'apikey': SUPABASE_PUBLISHABLE_KEY,
       'authorization': `Bearer ${SUPABASE_PUBLISHABLE_KEY}`,
     },
-    body: JSON.stringify(payload),
+    body: JSON.stringify(body),
   });
   const data = await response.json().catch(() => ({}));
   if (!response.ok || data.error) throw new Error(data.message || data.error || `Gateway ${response.status}`);
   return data;
+}
+
+function initializePersonalKey() {
+  syncKeyInput.value = ensurePersonalKey();
+}
+
+function ensurePersonalKey() {
+  const existing = localStorage.getItem(ACCOUNT_KEY_STORAGE) || '';
+  if (ACCOUNT_KEY_RE.test(existing)) return existing;
+  const created = generatePersonalKey();
+  localStorage.setItem(ACCOUNT_KEY_STORAGE, created);
+  localStorage.removeItem(PENDING_KEY);
+  return created;
+}
+
+function saveAndGetPersonalKey() {
+  const typed = syncKeyInput.value.trim();
+  if (!ACCOUNT_KEY_RE.test(typed)) return null;
+  localStorage.setItem(ACCOUNT_KEY_STORAGE, typed);
+  return typed;
+}
+
+function generatePersonalKey() {
+  const bytes = new Uint8Array(32);
+  crypto.getRandomValues(bytes);
+  let binary = '';
+  bytes.forEach((b) => { binary += String.fromCharCode(b); });
+  return btoa(binary).replaceAll('+', '-').replaceAll('/', '_').replace(/=+$/g, '');
 }
 
 function setWorking(text) {
@@ -164,7 +236,6 @@ function fillList(id, items, format) {
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
-// If the browser was closed while a movie was processing, resume status tracking.
 const pending = localStorage.getItem(PENDING_KEY);
 if (pending) {
   watchJob(pending).catch(fail);
