@@ -1,5 +1,5 @@
 -- Smart media gateway: durable job state, reusable results, and provider telemetry.
--- Clients never write these tables directly; Edge Functions use server-side credentials.
+-- Clients never write these tables directly; Edge Functions / orchestration use server credentials.
 
 create table if not exists public.media_jobs (
   id uuid primary key default gen_random_uuid(),
@@ -53,9 +53,78 @@ create table if not exists public.provider_route_stats (
   primary key (provider, task, source_language, duration_bucket)
 );
 
+-- Server-side only rolling telemetry. This is the memory used by the Smart Router.
+create or replace function public.record_provider_route_sample(
+  p_provider text,
+  p_task text,
+  p_source_language text,
+  p_duration_bucket text,
+  p_ok boolean,
+  p_latency_ms double precision,
+  p_quality_score double precision default null,
+  p_error text default null
+) returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+begin
+  insert into public.provider_route_stats (
+    provider,
+    task,
+    source_language,
+    duration_bucket,
+    samples,
+    successes,
+    failures,
+    avg_latency_ms,
+    quality_score,
+    last_error,
+    last_used_at,
+    updated_at
+  ) values (
+    p_provider,
+    p_task,
+    coalesce(nullif(p_source_language, ''), 'auto'),
+    coalesce(nullif(p_duration_bucket, ''), 'unknown'),
+    1,
+    case when p_ok then 1 else 0 end,
+    case when p_ok then 0 else 1 end,
+    greatest(coalesce(p_latency_ms, 0), 0),
+    coalesce(p_quality_score, case when p_ok then 0.90 else 0.50 end),
+    case when p_ok then null else p_error end,
+    now(),
+    now()
+  )
+  on conflict (provider, task, source_language, duration_bucket)
+  do update set
+    samples = provider_route_stats.samples + 1,
+    successes = provider_route_stats.successes + case when excluded.successes > 0 then 1 else 0 end,
+    failures = provider_route_stats.failures + case when excluded.failures > 0 then 1 else 0 end,
+    avg_latency_ms = case
+      when provider_route_stats.samples <= 0 then excluded.avg_latency_ms
+      else ((provider_route_stats.avg_latency_ms * provider_route_stats.samples) + excluded.avg_latency_ms)
+        / (provider_route_stats.samples + 1)
+    end,
+    quality_score = case
+      when p_quality_score is null then provider_route_stats.quality_score
+      else (provider_route_stats.quality_score * 0.80) + (greatest(0, least(1, p_quality_score)) * 0.20)
+    end,
+    last_error = case when p_ok then provider_route_stats.last_error else p_error end,
+    last_used_at = now(),
+    updated_at = now();
+end;
+$$;
+
+revoke all on function public.record_provider_route_sample(text,text,text,text,boolean,double precision,double precision,text) from public;
+revoke all on function public.record_provider_route_sample(text,text,text,text,boolean,double precision,double precision,text) from anon;
+revoke all on function public.record_provider_route_sample(text,text,text,text,boolean,double precision,double precision,text) from authenticated;
+grant execute on function public.record_provider_route_sample(text,text,text,text,boolean,double precision,double precision,text) to service_role;
+
 alter table public.media_jobs enable row level security;
 alter table public.provider_route_stats enable row level security;
 
 -- Intentionally no public policies. All access goes through the gateway.
 comment on table public.media_jobs is 'Private Smart Media jobs managed only by server-side gateway credentials.';
 comment on table public.provider_route_stats is 'Adaptive provider telemetry used by the Smart Router; no client writes.';
+comment on function public.record_provider_route_sample is 'Accumulates provider reliability/latency/quality for adaptive routing.';
