@@ -1,0 +1,26 @@
+name = "h-ai-smart-media-orchestrator"
+main = "src/index.ts"
+compatibility_date = "2026-09-08"
+
+[observability]
+enabled = true
+
+[[workflows]]
+name = "h-ai-smart-media-v1"
+binding = "SMART_MEDIA_WORKFLOW"
+class_name = "SmartMediaWorkflow"
+
+[[r2_buckets]]
+binding = "MOVIES"
+bucket_name = "h-ai-movies"
+
+[vars]
+SUPABASE_URL = "https://abavsspydbpkudhswmzp.supabase.co"
+PUBLIC_BASE_URL = ""
+
+# Configure as Worker secrets before deployment:
+# - GROQ_API_KEY
+# - AZURE_TRANSLATOR_KEY (optional)
+# - AZURE_TRANSLATOR_REGION (optional)
+# - SUPABASE_SERVICE_ROLE_KEY
+# - ORCHESTRATOR_TOKEN
