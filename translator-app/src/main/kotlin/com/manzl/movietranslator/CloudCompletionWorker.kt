@@ -29,7 +29,7 @@ internal class CloudCompletionWorker(
         CloudMovieTranslationService.restoreBackgroundState(applicationContext, job)
 
         val advance = try {
-            CloudTranslationClient(applicationContext).advance(job)
+            advanceWithResumableFallback(job)
         } catch (transient: CloudTransientException) {
             val waiting = job.copy(stage = CloudConnectivity.retryMessage(applicationContext, transient))
             store.save(waiting)
@@ -100,6 +100,26 @@ internal class CloudCompletionWorker(
         store.clear()
         notifyComplete(advance.job.movieName)
         return Result.success()
+    }
+
+    private suspend fun advanceWithResumableFallback(job: BackgroundCloudJob): CloudAdvance {
+        val fallback = ResumableTranslationFallbackClient(applicationContext)
+        if (ResumableTranslationFallbackClient.isActive(job)) {
+            return fallback.advance(job)
+        }
+
+        return try {
+            CloudTranslationClient(applicationContext).advance(job)
+        } catch (error: Throwable) {
+            if (!ResumableTranslationFallbackClient.canRecover(job, error)) throw error
+            fallback.advance(
+                job.copy(
+                    translationJobId = null,
+                    stage = "التحويل لمسار ترجمة قابل للاستكمال",
+                    progress = maxOf(job.progress, 0.70f),
+                )
+            )
+        }
     }
 
     private fun notifyComplete(movieName: String) {
