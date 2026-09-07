@@ -10,6 +10,7 @@ const statusText = document.getElementById('statusText');
 const statusTitle = document.getElementById('statusTitle');
 const startButton = document.getElementById('startButton');
 const player = document.getElementById('player');
+let currentTrackBlobUrl = null;
 
 function clientId() {
   let id = localStorage.getItem('h_ai_client_id');
@@ -45,7 +46,7 @@ form.addEventListener('submit', async (event) => {
 });
 
 async function watchJob(jobId) {
-  setWorking('المهمة تعمل في السحابة…');
+  setWorking('المهمة تعمل في السحابة… ويمكن إغلاق هذه الصفحة.');
   for (;;) {
     const root = await gateway({ mode: 'get_job', client_id: clientId(), job_id: jobId });
     const job = root.job;
@@ -109,32 +110,46 @@ function fail(error) {
 function renderJob(job) {
   document.getElementById('movieTitle').textContent = job.title || 'الفيلم';
   document.getElementById('language').textContent = `اللغة: ${job.source_language || 'auto'}`;
-  document.getElementById('providers').textContent = providerText(job.provider_trace);
+  document.getElementById('providers').textContent = providerText(job.provider_trace, job.asr_route);
   document.getElementById('summary').textContent = job.summary?.summary || 'اكتملت الترجمة. لا يوجد ملخص متاح حاليًا.';
   fillList('characters', job.summary?.characters, (x) => typeof x === 'string' ? x : `${x.name || ''}${x.role ? ' — ' + x.role : ''}`);
   fillList('events', job.summary?.major_events, (x) => String(x));
 
+  if (currentTrackBlobUrl) {
+    URL.revokeObjectURL(currentTrackBlobUrl);
+    currentTrackBlobUrl = null;
+  }
+
+  player.pause();
   player.innerHTML = '';
   player.src = job.playback_url || job.source_url;
-  if (job.vtt_text) {
+
+  const track = document.createElement('track');
+  track.kind = 'subtitles';
+  track.label = 'العربية';
+  track.srclang = 'ar';
+  track.default = true;
+
+  if (job.subtitle_url) {
+    track.src = job.subtitle_url;
+    player.appendChild(track);
+  } else if (job.vtt_text) {
     const blob = new Blob([job.vtt_text], { type: 'text/vtt' });
-    const track = document.createElement('track');
-    track.kind = 'subtitles';
-    track.label = 'العربية';
-    track.srclang = 'ar';
-    track.default = true;
-    track.src = URL.createObjectURL(blob);
+    currentTrackBlobUrl = URL.createObjectURL(blob);
+    track.src = currentTrackBlobUrl;
     player.appendChild(track);
   }
+
+  player.load();
   resultCard.classList.remove('hidden');
   statusText.textContent = 'جاهز للمشاهدة';
   statusTitle.textContent = '100%';
 }
 
-function providerText(items) {
-  if (!Array.isArray(items)) return 'Smart Router';
-  const names = [...new Set(items.map((x) => x?.provider).filter(Boolean))];
-  return names.length ? names.join(' + ') : 'Smart Router';
+function providerText(items, asrRoute) {
+  const names = Array.isArray(items) ? [...new Set(items.map((x) => x?.provider).filter(Boolean))] : [];
+  const route = asrRoute ? `ASR: ${asrRoute}` : '';
+  return [names.length ? names.join(' + ') : 'Smart Router', route].filter(Boolean).join(' • ');
 }
 
 function fillList(id, items, format) {
