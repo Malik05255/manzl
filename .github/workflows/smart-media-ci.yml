@@ -5,6 +5,7 @@ on:
     paths:
       - 'supabase/functions/media-gateway/**'
       - 'supabase/functions/_shared/**'
+      - 'supabase/migrations/20260908_smart_media_gateway*.sql'
       - 'cloudflare/media-ingest/**'
       - 'cloudflare/smart-media-orchestrator/**'
       - 'web/**'
@@ -15,6 +16,7 @@ on:
     paths:
       - 'supabase/functions/media-gateway/**'
       - 'supabase/functions/_shared/**'
+      - 'supabase/migrations/20260908_smart_media_gateway*.sql'
       - 'cloudflare/media-ingest/**'
       - 'cloudflare/smart-media-orchestrator/**'
       - 'web/**'
@@ -36,12 +38,15 @@ jobs:
           deno check supabase/functions/_shared/smart-media-router.ts
           deno check supabase/functions/media-gateway/index.ts
 
+      - name: Test Smart Router
+        run: deno test supabase/functions/_shared/smart-media-router.test.ts
+
       - name: Check web JavaScript
         run: node --check web/app.js
 
       - name: Bundle R2 ingest Worker
         run: npx --yes wrangler@latest deploy cloudflare/media-ingest/src/index.ts --dry-run --compatibility-date=2026-09-08
 
-      - name: Bundle durable Smart Media Workflow
+      - name: Bundle durable Smart Media Workflow v3
         working-directory: cloudflare/smart-media-orchestrator
         run: npx --yes wrangler@latest deploy --dry-run
