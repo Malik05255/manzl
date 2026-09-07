@@ -5,6 +5,8 @@ import android.content.Intent
 import android.net.Uri
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import androidx.work.WorkInfo
+import androidx.work.WorkManager
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -45,7 +47,9 @@ class MovieTranslatorViewModel(application: Application) : AndroidViewModel(appl
     val cloudUiError: StateFlow<String?> = _cloudUiError.asStateFlow()
 
     init {
-        CloudMovieTranslationService.restorePending(application.applicationContext)
+        val appContext = application.applicationContext
+        CloudMovieTranslationService.restorePending(appContext)
+        resumePendingWorkerIfNeeded(appContext)
         refreshLibrary()
         refreshPlatforms()
         viewModelScope.launch {
@@ -57,6 +61,21 @@ class MovieTranslatorViewModel(application: Application) : AndroidViewModel(appl
                     refreshPlatforms()
                 }
             }
+        }
+    }
+
+    private fun resumePendingWorkerIfNeeded(appContext: android.content.Context) {
+        viewModelScope.launch(Dispatchers.IO) {
+            if (CloudJobStore(appContext).load() == null) return@launch
+            val workManager = WorkManager.getInstance(appContext)
+            val active = runCatching {
+                workManager.getWorkInfosByTag("movie-cloud-completion").get().any { info ->
+                    info.state == WorkInfo.State.ENQUEUED ||
+                        info.state == WorkInfo.State.RUNNING ||
+                        info.state == WorkInfo.State.BLOCKED
+                }
+            }.getOrDefault(false)
+            if (!active) CloudCompletionWorker.schedule(appContext, 250L)
         }
     }
 
