@@ -28,7 +28,6 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -38,7 +37,6 @@ import androidx.compose.material.icons.filled.AccountCircle
 import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Cloud
-import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Flag
@@ -47,7 +45,6 @@ import androidx.compose.material.icons.filled.GraphicEq
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Movie
-import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.VideoLibrary
@@ -89,7 +86,6 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
 import androidx.core.view.WindowCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -97,14 +93,6 @@ import java.io.File
 import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
 
-/**
- * Pixel-calibrated home rebuilt from a clean layout tree.
- *
- * Source of truth: the approved Honor 200 screenshot, 922 x 2048 physical pixels.
- * No responsive card compression is used on the reference aspect ratio. Instead, every major
- * surface is positioned on the reference grid and uniformly scaled. Other screens keep the
- * existing business logic and premium secondary UI.
- */
 class ExactHonor200MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -209,7 +197,6 @@ private fun ExactHonor200App(viewModel: MovieTranslatorViewModel) {
                     tab = tab,
                     onTab = { tab = it },
                 )
-
                 PremiumTab.PROJECTS -> {
                     PremiumProjectsScreen(
                         modifier = Modifier.fillMaxSize().padding(bottom = 104.dp),
@@ -228,7 +215,6 @@ private fun ExactHonor200App(viewModel: MovieTranslatorViewModel) {
                     )
                     ExactBottomBarOverlay(tab = tab, onTab = { tab = it })
                 }
-
                 PremiumTab.LIBRARY -> {
                     PremiumLibraryScreen(
                         modifier = Modifier.fillMaxSize().padding(bottom = 104.dp),
@@ -256,7 +242,6 @@ private fun ExactHonor200App(viewModel: MovieTranslatorViewModel) {
                     )
                     ExactBottomBarOverlay(tab = tab, onTab = { tab = it })
                 }
-
                 PremiumTab.SETTINGS -> {
                     PremiumSettingsScreen(
                         modifier = Modifier.fillMaxSize().padding(bottom = 104.dp),
@@ -327,31 +312,20 @@ private fun ExactHonor200Home(
         val density = LocalDensity.current
         fun p(px: Float): Dp = (px * scale).dp
         fun f(px: Float): TextUnit = with(density) { p(px).toSp() }
-
         val scroll = rememberScrollState()
 
         Column(
             modifier = Modifier.fillMaxSize().verticalScroll(scroll),
             horizontalAlignment = Alignment.CenterHorizontally,
         ) {
-            Box(
-                modifier = Modifier
-                    .width(frameWidth)
-                    .height(frameHeight)
-                    .background(ExactBg)
-            ) {
+            Box(modifier = Modifier.width(frameWidth).height(frameHeight).background(ExactBg)) {
                 Box(
                     modifier = Modifier
-                        .offset(y = p(0f))
                         .fillMaxWidth()
                         .height(p(775f))
                         .background(
                             Brush.linearGradient(
-                                colors = listOf(
-                                    Color(0xFF112E59),
-                                    Color(0xFF1D4A86),
-                                    Color(0xFF2E68AA),
-                                ),
+                                colors = listOf(Color(0xFF112E59), Color(0xFF1D4A86), Color(0xFF2E68AA)),
                                 start = Offset.Zero,
                                 end = Offset(p(922f).value * density.density, p(720f).value * density.density),
                             )
@@ -359,75 +333,45 @@ private fun ExactHonor200Home(
                 )
 
                 Box(
-                    modifier = Modifier
-                        .offset(x = p(30f), y = p(145f))
-                        .size(p(103f))
-                        .background(Color.White.copy(alpha = 0.12f), CircleShape),
+                    modifier = Modifier.offset(x = p(30f), y = p(145f)).size(p(103f)).background(Color.White.copy(alpha = 0.12f), CircleShape),
                     contentAlignment = Alignment.Center,
                 ) {
-                    Icon(
-                        Icons.Default.AccountCircle,
-                        contentDescription = null,
-                        tint = Color.White,
-                        modifier = Modifier.size(p(72f)),
-                    )
+                    Icon(Icons.Default.AccountCircle, null, tint = Color.White, modifier = Modifier.size(p(72f)))
                 }
 
-                CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
-                    Column(
-                        modifier = Modifier.offset(x = p(142f), y = p(145f)).width(p(230f)),
-                        horizontalAlignment = Alignment.End,
-                    ) {
-                        Text(
-                            "مرحبًا بك",
-                            color = Color.White,
-                            fontSize = f(35f),
-                            fontWeight = FontWeight.Bold,
-                            maxLines = 1,
-                        )
-                        Text(
-                            "فلننجز شيئًا رائعًا اليوم 👋",
-                            color = Color(0xFFE0ECFF),
-                            fontSize = f(26f),
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                            modifier = Modifier.padding(top = p(8f)),
-                        )
-                    }
-                }
-
-                CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
-                    Row(
-                        modifier = Modifier.offset(x = p(374f), y = p(117f)).width(p(500f)),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.End,
-                    ) {
-                        Icon(
-                            Icons.Default.AutoAwesome,
-                            contentDescription = null,
-                            tint = Color(0xFF64B6FF),
-                            modifier = Modifier.size(p(54f)),
-                        )
-                        Spacer(Modifier.width(p(13f)))
-                        Text(
-                            "مترجم الأفلام",
-                            color = Color.White,
-                            fontSize = f(55f),
-                            fontWeight = FontWeight.ExtraBold,
-                            maxLines = 1,
-                            softWrap = false,
-                        )
-                    }
+                Column(
+                    modifier = Modifier.offset(x = p(142f), y = p(145f)).width(p(230f)),
+                    horizontalAlignment = Alignment.End,
+                ) {
+                    Text("مرحبًا بك", color = Color.White, fontSize = f(35f), fontWeight = FontWeight.Bold, maxLines = 1)
                     Text(
-                        "ذكاء اصطناعي لمحتوى بلا حدود",
-                        modifier = Modifier.offset(x = p(376f), y = p(204f)).width(p(458f)),
+                        "فلننجز شيئًا رائعًا اليوم 👋",
                         color = Color(0xFFE0ECFF),
-                        fontSize = f(31f),
-                        textAlign = TextAlign.End,
+                        fontSize = f(26f),
                         maxLines = 1,
-                        softWrap = false,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(top = p(8f)),
                     )
                 }
+
+                Row(
+                    modifier = Modifier.offset(x = p(374f), y = p(117f)).width(p(500f)),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.End,
+                ) {
+                    Icon(Icons.Default.AutoAwesome, null, tint = Color(0xFF64B6FF), modifier = Modifier.size(p(54f)))
+                    Spacer(Modifier.width(p(13f)))
+                    Text("مترجم الأفلام", color = Color.White, fontSize = f(55f), fontWeight = FontWeight.ExtraBold, maxLines = 1, softWrap = false)
+                }
+                Text(
+                    "ذكاء اصطناعي لمحتوى بلا حدود",
+                    modifier = Modifier.offset(x = p(376f), y = p(204f)).width(p(458f)),
+                    color = Color(0xFFE0ECFF),
+                    fontSize = f(31f),
+                    textAlign = TextAlign.End,
+                    maxLines = 1,
+                    softWrap = false,
+                )
 
                 if (state.videoUri == null) {
                     Card(
@@ -442,31 +386,15 @@ private fun ExactHonor200Home(
                             verticalArrangement = Arrangement.Center,
                         ) {
                             Icon(Icons.Default.Movie, null, tint = Color(0xFF88C9FF), modifier = Modifier.size(p(78f)))
-                            Text(
-                                "اختر فيلمًا للترجمة",
-                                color = Color.White,
-                                fontWeight = FontWeight.ExtraBold,
-                                fontSize = f(38f),
-                                modifier = Modifier.padding(top = p(22f)),
-                            )
+                            Text("اختر فيلمًا للترجمة", color = Color.White, fontWeight = FontWeight.ExtraBold, fontSize = f(38f), modifier = Modifier.padding(top = p(22f)))
                             Text("اضغط هنا لاختيار الفيديو", color = Color(0xFFD8E8FF), fontSize = f(24f))
                         }
                     }
                 } else {
-                    ExactMovieCard(
-                        state = state,
-                        onPickMovie = onPickMovie,
-                        p = ::p,
-                        f = ::f,
-                    )
+                    ExactMovieCard(state = state, onPickMovie = onPickMovie, p = ::p, f = ::f)
                 }
 
-                Canvas(
-                    modifier = Modifier
-                        .offset(y = p(725f))
-                        .fillMaxWidth()
-                        .height(p(80f))
-                ) {
+                Canvas(modifier = Modifier.offset(y = p(725f)).fillMaxWidth().height(p(80f))) {
                     val path = Path().apply {
                         moveTo(0f, size.height * 0.18f)
                         quadraticBezierTo(size.width * 0.50f, size.height * 1.04f, size.width, size.height * 0.12f)
@@ -503,10 +431,7 @@ private fun ExactHonor200Home(
         ExactBottomBar(
             tab = tab,
             onTab = onTab,
-            modifier = Modifier
-                .align(Alignment.TopCenter)
-                .offset(y = p(1748f))
-                .width(frameWidth),
+            modifier = Modifier.align(Alignment.TopCenter).offset(y = p(1748f)).width(frameWidth),
             p = ::p,
             f = ::f,
         )
@@ -538,16 +463,13 @@ private fun ExactMovieCard(
             PremiumVideoThumb(
                 uri = state.videoUri,
                 duration = premiumClock(state.videoDurationMs),
-                modifier = Modifier
-                    .offset(x = p(29f), y = p(31f))
-                    .width(p(231f))
-                    .height(p(300f)),
+                modifier = Modifier.offset(x = p(35f), y = p(67f)).width(p(255f)).height(p(335f)),
             )
 
             CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
                 Text(
-                    text = state.videoName.ifBlank { "الفيلم المحدد" },
-                    modifier = Modifier.offset(x = p(294f), y = p(31f)).width(p(405f)),
+                    state.videoName.ifBlank { "الفيلم المحدد" },
+                    modifier = Modifier.offset(x = p(337f), y = p(58f)).width(p(380f)),
                     color = Color.White,
                     fontSize = f(42f),
                     fontWeight = FontWeight.ExtraBold,
@@ -560,17 +482,14 @@ private fun ExactMovieCard(
             IconButton(
                 onClick = onPickMovie,
                 enabled = !state.isRunning,
-                modifier = Modifier
-                    .offset(x = p(735f), y = p(25f))
-                    .size(p(102f))
-                    .background(Color.White.copy(alpha = 0.08f), CircleShape),
+                modifier = Modifier.offset(x = p(735f), y = p(25f)).size(p(102f)).background(Color.White.copy(alpha = 0.08f), CircleShape),
             ) {
                 Icon(Icons.Default.MoreVert, "تغيير الفيلم", tint = Color.White, modifier = Modifier.size(p(48f)))
             }
 
             CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
                 Row(
-                    modifier = Modifier.offset(x = p(315f), y = p(112f)).width(p(510f)).height(p(52f)),
+                    modifier = Modifier.offset(x = p(319f), y = p(148f)).width(p(510f)).height(p(52f)),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(p(12f)),
                 ) {
@@ -585,26 +504,24 @@ private fun ExactMovieCard(
                 }
             }
 
-            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
-                Text(
-                    when {
-                        state.srtFile != null -> "اكتملت الترجمة بنجاح"
-                        state.isRunning -> state.stage.ifBlank { "جاري تجهيز الصوت بالذكاء الاصطناعي" }
-                        else -> "الفيلم جاهز لبدء الترجمة"
-                    },
-                    modifier = Modifier.offset(x = p(302f), y = p(205f)).width(p(390f)),
-                    color = Color.White,
-                    fontSize = f(31f),
-                    fontWeight = FontWeight.Bold,
-                    textAlign = TextAlign.Start,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-            }
+            Text(
+                when {
+                    state.srtFile != null -> "اكتملت الترجمة بنجاح"
+                    state.isRunning -> state.stage.ifBlank { "جاري تجهيز الصوت بالذكاء الاصطناعي" }
+                    else -> "الفيلم جاهز لبدء الترجمة"
+                },
+                modifier = Modifier.offset(x = p(320f), y = p(258f)).width(p(370f)),
+                color = Color.White,
+                fontSize = f(31f),
+                fontWeight = FontWeight.Bold,
+                textAlign = TextAlign.Start,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
 
             Text(
                 "$percent%",
-                modifier = Modifier.offset(x = p(680f), y = p(185f)).width(p(150f)),
+                modifier = Modifier.offset(x = p(690f), y = p(225f)).width(p(165f)),
                 color = Color(0xFF83C7FF),
                 fontSize = f(72f),
                 fontWeight = FontWeight.ExtraBold,
@@ -614,17 +531,13 @@ private fun ExactMovieCard(
 
             LinearProgressIndicator(
                 progress = { state.progress.coerceIn(0f, 1f) },
-                modifier = Modifier
-                    .offset(x = p(315f), y = p(277f))
-                    .width(p(511f))
-                    .height(p(21f))
-                    .clip(RoundedCornerShape(p(999f))),
+                modifier = Modifier.offset(x = p(319f), y = p(336f)).width(p(510f)).height(p(21f)).clip(RoundedCornerShape(p(999f))),
                 color = Color(0xFF70BFFF),
                 trackColor = Color(0xFF668CB9),
             )
 
             Row(
-                modifier = Modifier.offset(x = p(315f), y = p(326f)).width(p(330f)),
+                modifier = Modifier.offset(x = p(319f), y = p(388f)).width(p(360f)),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 Icon(Icons.Default.Schedule, null, tint = Color(0xFFD9E7FA), modifier = Modifier.size(p(31f)))
@@ -641,11 +554,7 @@ private fun ExactMovieCard(
 }
 
 @Composable
-private fun ExactWorkflowCard(
-    state: TranslatorUiState,
-    p: (Float) -> Dp,
-    f: (Float) -> TextUnit,
-) {
+private fun ExactWorkflowCard(state: TranslatorUiState, p: (Float) -> Dp, f: (Float) -> TextUnit) {
     val percent = (state.progress.coerceIn(0f, 1f) * 100f).roundToInt()
     val activeIndex = when {
         state.srtFile != null || percent >= 98 -> 4
@@ -667,36 +576,19 @@ private fun ExactWorkflowCard(
                 color = ExactBlueSoft,
                 shape = RoundedCornerShape(p(32f)),
             ) {
-                CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
-                    Row(
-                        modifier = Modifier.fillMaxSize().padding(horizontal = p(20f)),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.Center,
-                    ) {
-                        Text("مراقبة مباشرة", color = ExactBlue, fontSize = f(31f), fontWeight = FontWeight.Bold)
-                        Spacer(Modifier.width(p(12f)))
-                        Icon(Icons.Default.GraphicEq, null, tint = ExactBlue, modifier = Modifier.size(p(32f)))
-                    }
+                Row(
+                    modifier = Modifier.fillMaxSize().padding(horizontal = p(20f)),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.Center,
+                ) {
+                    Text("مراقبة مباشرة", color = ExactBlue, fontSize = f(31f), fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.width(p(12f)))
+                    Icon(Icons.Default.GraphicEq, null, tint = ExactBlue, modifier = Modifier.size(p(32f)))
                 }
             }
 
-            Text(
-                "خطوات العمل",
-                modifier = Modifier.offset(x = p(342f), y = p(40f)).width(p(420f)),
-                color = ExactInk,
-                fontSize = f(50f),
-                fontWeight = FontWeight.ExtraBold,
-                textAlign = TextAlign.End,
-                maxLines = 1,
-            )
-            Text(
-                "من الملف إلى الترجمة النهائية",
-                modifier = Modifier.offset(x = p(342f), y = p(106f)).width(p(420f)),
-                color = ExactMuted,
-                fontSize = f(27f),
-                textAlign = TextAlign.End,
-                maxLines = 1,
-            )
+            Text("خطوات العمل", modifier = Modifier.offset(x = p(342f), y = p(40f)).width(p(420f)), color = ExactInk, fontSize = f(50f), fontWeight = FontWeight.ExtraBold, textAlign = TextAlign.End, maxLines = 1)
+            Text("من الملف إلى الترجمة النهائية", modifier = Modifier.offset(x = p(342f), y = p(106f)).width(p(420f)), color = ExactMuted, fontSize = f(27f), textAlign = TextAlign.End, maxLines = 1)
 
             val centers = listOf(100f, 267f, 432f, 598f, 765f)
             val specs = listOf(
@@ -709,41 +601,16 @@ private fun ExactWorkflowCard(
 
             listOf(157f, 323f, 489f, 655f).forEachIndexed { index, x ->
                 Box(
-                    modifier = Modifier
-                        .offset(x = p(x), y = p(251f))
-                        .width(p(22f))
-                        .height(p(4f))
+                    modifier = Modifier.offset(x = p(x), y = p(251f)).width(p(22f)).height(p(4f))
                         .background(if (index == 2) ExactBlue else Color(0xFFC8D5E5), RoundedCornerShape(p(99f)))
                 )
             }
 
             specs.forEachIndexed { visualIndex, spec ->
-                val logicalIndex = when (visualIndex) {
-                    0 -> 4
-                    1 -> 3
-                    2 -> 2
-                    3 -> 1
-                    else -> 0
-                }
+                val logicalIndex = when (visualIndex) { 0 -> 4; 1 -> 3; 2 -> 2; 3 -> 1; else -> 0 }
                 val active = logicalIndex == activeIndex
-                val done = when (logicalIndex) {
-                    0 -> true
-                    1 -> percent >= 90
-                    2 -> percent >= 70
-                    3 -> percent >= 98
-                    else -> state.srtFile != null
-                }
-                val centerX = centers[visualIndex]
-                ExactWorkflowStep(
-                    centerX = centerX,
-                    title = spec.first,
-                    subtitle = if (logicalIndex == 2 && !active) "تم" else spec.second,
-                    icon = spec.third,
-                    active = active,
-                    done = done,
-                    p = p,
-                    f = f,
-                )
+                val done = when (logicalIndex) { 0 -> true; 1 -> percent >= 90; 2 -> percent >= 70; 3 -> percent >= 98; else -> state.srtFile != null }
+                ExactWorkflowStep(centers[visualIndex], spec.first, if (logicalIndex == 2 && !active) "تم" else spec.second, spec.third, active, done, p, f)
             }
         }
     }
@@ -763,12 +630,8 @@ private fun ExactWorkflowStep(
     val size = if (active) 118f else 108f
     val left = centerX - size / 2f
     val top = if (active) 193f else 198f
-
     Box(
-        modifier = Modifier
-            .offset(x = p(left), y = p(top))
-            .size(p(size))
-            .background(if (active) Color(0xFFF6FAFF) else Color(0xFFF0F4F9), CircleShape),
+        modifier = Modifier.offset(x = p(left), y = p(top)).size(p(size)).background(if (active) Color(0xFFF6FAFF) else Color(0xFFF0F4F9), CircleShape),
         contentAlignment = Alignment.Center,
     ) {
         if (active) {
@@ -782,86 +645,29 @@ private fun ExactWorkflowStep(
                 )
             }
         }
-        Icon(
-            icon,
-            contentDescription = null,
-            tint = if (active) ExactBlue else Color(0xFF67768C),
-            modifier = Modifier.size(p(if (active) 50f else 42f)),
-        )
+        Icon(icon, null, tint = if (active) ExactBlue else Color(0xFF67768C), modifier = Modifier.size(p(if (active) 50f else 42f)))
         if (done && !active) {
-            Box(
-                modifier = Modifier
-                    .align(Alignment.TopEnd)
-                    .size(p(36f))
-                    .background(ExactGreen, CircleShape),
-                contentAlignment = Alignment.Center,
-            ) {
+            Box(modifier = Modifier.align(Alignment.TopEnd).size(p(36f)).background(ExactGreen, CircleShape), contentAlignment = Alignment.Center) {
                 Icon(Icons.Default.Check, null, tint = Color.White, modifier = Modifier.size(p(23f)))
             }
         }
     }
 
     if (title == "معالجة الصوت") {
-        Text(
-            "معالجة",
-            modifier = Modifier.offset(x = p(centerX - 80f), y = p(330f)).width(p(160f)),
-            color = ExactInk,
-            fontSize = f(28f),
-            fontWeight = FontWeight.Bold,
-            textAlign = TextAlign.Center,
-        )
-        Text(
-            "الصوت",
-            modifier = Modifier.offset(x = p(centerX - 80f), y = p(380f)).width(p(160f)),
-            color = ExactInk,
-            fontSize = f(28f),
-            fontWeight = FontWeight.Bold,
-            textAlign = TextAlign.Center,
-        )
-        Text(
-            subtitle,
-            modifier = Modifier.offset(x = p(centerX - 90f), y = p(454f)).width(p(180f)),
-            color = if (active) ExactBlue else ExactMuted,
-            fontSize = f(23f),
-            textAlign = TextAlign.Center,
-        )
+        Text("معالجة", modifier = Modifier.offset(x = p(centerX - 80f), y = p(330f)).width(p(160f)), color = ExactInk, fontSize = f(28f), fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+        Text("الصوت", modifier = Modifier.offset(x = p(centerX - 80f), y = p(380f)).width(p(160f)), color = ExactInk, fontSize = f(28f), fontWeight = FontWeight.Bold, textAlign = TextAlign.Center)
+        Text(subtitle, modifier = Modifier.offset(x = p(centerX - 90f), y = p(454f)).width(p(180f)), color = if (active) ExactBlue else ExactMuted, fontSize = f(23f), textAlign = TextAlign.Center)
     } else {
-        Text(
-            title,
-            modifier = Modifier.offset(x = p(centerX - 92f), y = p(330f)).width(p(184f)),
-            color = ExactInk,
-            fontSize = f(27f),
-            fontWeight = FontWeight.Bold,
-            textAlign = TextAlign.Center,
-            maxLines = 1,
-        )
-        Text(
-            subtitle,
-            modifier = Modifier.offset(x = p(centerX - 92f), y = p(398f)).width(p(184f)),
-            color = ExactMuted,
-            fontSize = f(21f),
-            textAlign = TextAlign.Center,
-            maxLines = 1,
-        )
+        Text(title, modifier = Modifier.offset(x = p(centerX - 92f), y = p(330f)).width(p(184f)), color = ExactInk, fontSize = f(27f), fontWeight = FontWeight.Bold, textAlign = TextAlign.Center, maxLines = 1)
+        Text(subtitle, modifier = Modifier.offset(x = p(centerX - 92f), y = p(398f)).width(p(184f)), color = ExactMuted, fontSize = f(21f), textAlign = TextAlign.Center, maxLines = 1)
     }
 }
 
 @Composable
-private fun ExactMetricsRow(
-    state: TranslatorUiState,
-    p: (Float) -> Dp,
-    f: (Float) -> TextUnit,
-) {
+private fun ExactMetricsRow(state: TranslatorUiState, p: (Float) -> Dp, f: (Float) -> TextUnit) {
     val remaining = (state.videoDurationMs * (1f - state.progress.coerceIn(0f, 1f))).toLong()
     val percent = (state.progress.coerceIn(0f, 1f) * 100f).roundToInt()
-    val model = when {
-        percent < 15 -> "تجهيز"
-        percent < 70 -> "Whisper"
-        percent < 88 -> "Azure"
-        percent < 97 -> "Groq"
-        else -> "إنهاء"
-    }
-
+    val model = when { percent < 15 -> "تجهيز"; percent < 70 -> "Whisper"; percent < 88 -> "Azure"; percent < 97 -> "Groq"; else -> "إنهاء" }
     ExactMetricCard(32f, Icons.Default.Folder, Color(0xFFE8F8F0), ExactGreen, if (state.srtFile != null) "1/1" else "0/1", "ملفات مكتملة", p, f)
     ExactMetricCard(251f, Icons.Default.Schedule, Color(0xFFFFF1D8), Color(0xFFB97614), if (state.isRunning) premiumClock(remaining) else "—", "الوقت المتبقي", p, f)
     ExactMetricCard(472f, Icons.Default.Description, Color(0xFFF0EAFF), Color(0xFF7658D8), premiumClock(state.videoDurationMs), "مدة الفيديو", p, f)
@@ -869,16 +675,7 @@ private fun ExactMetricsRow(
 }
 
 @Composable
-private fun ExactMetricCard(
-    x: Float,
-    icon: ImageVector,
-    soft: Color,
-    tint: Color,
-    value: String,
-    label: String,
-    p: (Float) -> Dp,
-    f: (Float) -> TextUnit,
-) {
+private fun ExactMetricCard(x: Float, icon: ImageVector, soft: Color, tint: Color, value: String, label: String, p: (Float) -> Dp, f: (Float) -> TextUnit) {
     Card(
         modifier = Modifier.offset(x = p(x), y = p(1430f)).width(p(200f)).height(p(274f)),
         shape = RoundedCornerShape(p(48f)),
@@ -887,30 +684,11 @@ private fun ExactMetricCard(
         elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
     ) {
         Box(Modifier.fillMaxSize()) {
-            Box(
-                modifier = Modifier.offset(x = p(55f), y = p(25f)).size(p(90f)).background(soft, RoundedCornerShape(p(30f))),
-                contentAlignment = Alignment.Center,
-            ) {
+            Box(modifier = Modifier.offset(x = p(55f), y = p(25f)).size(p(90f)).background(soft, RoundedCornerShape(p(30f))), contentAlignment = Alignment.Center) {
                 Icon(icon, null, tint = tint, modifier = Modifier.size(p(48f)))
             }
-            Text(
-                value,
-                modifier = Modifier.offset(x = p(12f), y = p(137f)).width(p(176f)),
-                color = ExactInk,
-                fontSize = f(if (value.length > 7) 36f else 41f),
-                fontWeight = FontWeight.ExtraBold,
-                textAlign = TextAlign.Center,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
-            Text(
-                label,
-                modifier = Modifier.offset(x = p(10f), y = p(219f)).width(p(180f)),
-                color = ExactMuted,
-                fontSize = f(22f),
-                textAlign = TextAlign.Center,
-                maxLines = 1,
-            )
+            Text(value, modifier = Modifier.offset(x = p(12f), y = p(137f)).width(p(176f)), color = ExactInk, fontSize = f(if (value.length > 7) 36f else 41f), fontWeight = FontWeight.ExtraBold, textAlign = TextAlign.Center, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(label, modifier = Modifier.offset(x = p(10f), y = p(219f)).width(p(180f)), color = ExactMuted, fontSize = f(22f), textAlign = TextAlign.Center, maxLines = 1)
         }
     }
 }
@@ -929,28 +707,15 @@ private fun ExactUtilityPeek(p: (Float) -> Dp) {
 }
 
 @Composable
-private fun ExactBottomBar(
-    tab: PremiumTab,
-    onTab: (PremiumTab) -> Unit,
-    modifier: Modifier,
-    p: (Float) -> Dp,
-    f: (Float) -> TextUnit,
-) {
+private fun ExactBottomBar(tab: PremiumTab, onTab: (PremiumTab) -> Unit, modifier: Modifier, p: (Float) -> Dp, f: (Float) -> TextUnit) {
     Surface(
-        modifier = modifier
-            .height(p(216f))
-            .padding(horizontal = p(31f))
-            .shadow(p(20f), RoundedCornerShape(p(54f)), ambientColor = PremiumShadow, spotColor = PremiumShadow),
+        modifier = modifier.height(p(216f)).padding(horizontal = p(31f)).shadow(p(20f), RoundedCornerShape(p(54f)), ambientColor = PremiumShadow, spotColor = PremiumShadow),
         color = Color.White,
         shape = RoundedCornerShape(p(54f)),
         border = BorderStroke(p(2f), Color(0xFFF0F4F9)),
     ) {
         CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
-            Row(
-                modifier = Modifier.fillMaxSize().padding(horizontal = p(34f)),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.Top,
-            ) {
+            Row(modifier = Modifier.fillMaxSize().padding(horizontal = p(34f)), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.Top) {
                 ExactNavItem(PremiumTab.SETTINGS, tab, onTab, "الإعدادات", Icons.Default.Settings, p, f)
                 ExactNavItem(PremiumTab.LIBRARY, tab, onTab, "المكتبة", Icons.Default.VideoLibrary, p, f)
                 ExactNavItem(PremiumTab.PROJECTS, tab, onTab, "مشاريعي", Icons.Default.Folder, p, f)
@@ -961,46 +726,19 @@ private fun ExactBottomBar(
 }
 
 @Composable
-private fun ExactNavItem(
-    item: PremiumTab,
-    selectedTab: PremiumTab,
-    onTab: (PremiumTab) -> Unit,
-    label: String,
-    icon: ImageVector,
-    p: (Float) -> Dp,
-    f: (Float) -> TextUnit,
-) {
+private fun ExactNavItem(item: PremiumTab, selectedTab: PremiumTab, onTab: (PremiumTab) -> Unit, label: String, icon: ImageVector, p: (Float) -> Dp, f: (Float) -> TextUnit) {
     val selected = item == selectedTab
     Column(
-        modifier = Modifier
-            .width(p(150f))
-            .height(p(190f))
-            .clickable { onTab(item) },
+        modifier = Modifier.width(p(150f)).height(p(190f)).clickable { onTab(item) },
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         Box(
-            modifier = Modifier
-                .padding(top = p(20f))
-                .width(p(126f))
-                .height(p(74f))
-                .background(if (selected) ExactBlueSoft else Color.Transparent, RoundedCornerShape(p(40f))),
+            modifier = Modifier.padding(top = p(31f)).width(p(126f)).height(p(74f)).background(if (selected) ExactBlueSoft else Color.Transparent, RoundedCornerShape(p(40f))),
             contentAlignment = Alignment.Center,
         ) {
-            Icon(
-                icon,
-                contentDescription = null,
-                tint = if (selected) ExactBlue else Color(0xFF708198),
-                modifier = Modifier.size(p(50f)),
-            )
+            Icon(icon, null, tint = if (selected) ExactBlue else Color(0xFF708198), modifier = Modifier.size(p(50f)))
         }
-        Text(
-            label,
-            color = if (selected) ExactBlue else Color(0xFF708198),
-            fontSize = f(26f),
-            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
-            modifier = Modifier.padding(top = p(13f)),
-            maxLines = 1,
-        )
+        Text(label, color = if (selected) ExactBlue else Color(0xFF708198), fontSize = f(26f), fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium, modifier = Modifier.padding(top = p(30f)), maxLines = 1)
     }
 }
 
@@ -1011,19 +749,12 @@ private fun ExactBottomBarOverlay(tab: PremiumTab, onTab: (PremiumTab) -> Unit) 
         val density = LocalDensity.current
         fun p(px: Float): Dp = (px * scale).dp
         fun f(px: Float): TextUnit = with(density) { p(px).toSp() }
-        ExactBottomBar(
-            tab = tab,
-            onTab = onTab,
-            modifier = Modifier.align(Alignment.TopCenter).offset(y = p(1748f)).width((EXACT_W * scale).dp),
-            p = ::p,
-            f = ::f,
-        )
+        ExactBottomBar(tab, onTab, Modifier.align(Alignment.TopCenter).offset(y = p(1748f)).width((EXACT_W * scale).dp), ::p, ::f)
     }
 }
 
 private const val EXACT_W = 922f
 private const val EXACT_H = 2048f
-
 private val ExactBg = Color(0xFFF5FAFE)
 private val ExactInk = Color(0xFF142C50)
 private val ExactMuted = Color(0xFF8290A7)
