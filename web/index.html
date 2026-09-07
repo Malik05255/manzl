@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="theme-color" content="#102b53" />
+  <title>مترجم H AI الرقمي</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <section class="hero">
+      <h1>مترجم H AI الرقمي</h1>
+      <p>ألصق رابط فيلم مباشر، وسيتم اكتشاف اللغة وترجمتها للعربية سحابيًا.</p>
+      <form id="translateForm" class="card">
+        <label>رابط الفيلم المباشر</label>
+        <input id="sourceUrl" type="url" required placeholder="https://example.com/movie.mp4" />
+        <label>الاحتفاظ</label>
+        <select id="retention">
+          <option value="none">بدون حفظ</option>
+          <option value="1d">24 ساعة</option>
+          <option value="7d" selected>7 أيام</option>
+          <option value="30d">30 يوم</option>
+          <option value="permanent">دائم</option>
+        </select>
+        <button id="startButton" type="submit">ابدأ الترجمة</button>
+      </form>
+    </section>
+
+    <section id="statusCard" class="card hidden">
+      <div class="status-row"><strong id="statusTitle">جاري العمل…</strong><span id="statusText">H AI يحدد أفضل مسار</span></div>
+      <div class="spinner" id="spinner"></div>
+    </section>
+
+    <section id="resultCard" class="card hidden">
+      <h2 id="movieTitle">الفيلم</h2>
+      <video id="player" controls playsinline></video>
+      <div class="meta"><span id="language"></span><span id="providers"></span></div>
+      <h3>الملخص</h3>
+      <p id="summary"></p>
+      <details><summary>الشخصيات</summary><ul id="characters"></ul></details>
+      <details><summary>أهم الأحداث</summary><ul id="events"></ul></details>
+    </section>
+  </main>
+  <script src="./app.js"></script>
+</body>
+</html>
