@@ -16,7 +16,7 @@
         android:theme="@style/Theme.MovieTranslator">
 
         <activity
-            android:name=".MinimalPremiumMainActivity"
+            android:name=".DigitalAiMainActivity"
             android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
@@ -24,6 +24,7 @@
             </intent-filter>
         </activity>
 
+        <activity android:name=".MinimalPremiumMainActivity" android:exported="false" />
         <activity android:name=".HonorReferenceMainActivity" android:exported="false" />
         <activity android:name=".MeasuredReferenceMainActivity" android:exported="false" />
         <activity android:name=".ExactHonor200MainActivity" android:exported="false" />

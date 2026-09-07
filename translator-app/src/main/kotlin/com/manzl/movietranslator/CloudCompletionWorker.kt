@@ -26,11 +26,21 @@ internal class CloudCompletionWorker(
     override suspend fun doWork(): Result {
         val store = CloudJobStore(applicationContext)
         val job = store.load() ?: return Result.success()
+
+        if (CloudMovieTranslationService.isPauseRequested(applicationContext)) {
+            CloudMovieTranslationService.markBackgroundPaused(applicationContext, job)
+            return Result.success()
+        }
+
         CloudMovieTranslationService.restoreBackgroundState(applicationContext, job)
 
         val advance = try {
             advanceWithResumableFallback(job)
         } catch (transient: CloudTransientException) {
+            if (CloudMovieTranslationService.isPauseRequested(applicationContext)) {
+                CloudMovieTranslationService.markBackgroundPaused(applicationContext, job)
+                return Result.success()
+            }
             val waiting = job.copy(stage = CloudConnectivity.retryMessage(applicationContext, transient))
             store.save(waiting)
             CloudMovieTranslationService.updateBackgroundProgress(applicationContext, waiting)
@@ -43,8 +53,14 @@ internal class CloudCompletionWorker(
         }
 
         store.save(advance.job)
-        CloudMovieTranslationService.updateBackgroundProgress(applicationContext, advance.job)
         val cloud = advance.result
+
+        if (cloud == null && CloudMovieTranslationService.isPauseRequested(applicationContext)) {
+            CloudMovieTranslationService.markBackgroundPaused(applicationContext, advance.job)
+            return Result.success()
+        }
+
+        CloudMovieTranslationService.updateBackgroundProgress(applicationContext, advance.job)
         if (cloud == null) {
             schedule(applicationContext, advance.nextDelayMs)
             return Result.success()
@@ -151,6 +167,7 @@ internal class CloudCompletionWorker(
         private const val COMPLETE_NOTIFICATION_ID = 4310
 
         fun schedule(context: Context, delayMs: Long = 0L) {
+            if (CloudMovieTranslationService.isPauseRequested(context)) return
             val constraints = Constraints.Builder()
                 .setRequiredNetworkType(NetworkType.CONNECTED)
                 .build()
