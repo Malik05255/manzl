@@ -1,25 +1,7 @@
 package com.manzl.movietranslator
 
-import android.Manifest
-import android.app.Activity
-import android.content.Context
-import android.content.pm.PackageManager
-import android.media.MediaMetadataRetriever
-import android.net.Uri
-import android.os.Build
-import android.os.Bundle
-import android.provider.OpenableColumns
-import android.util.TypedValue
-import androidx.activity.ComponentActivity
-import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.compose.setContent
-import androidx.activity.enableEdgeToEdge
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
-import androidx.compose.foundation.Canvas
-import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -29,103 +11,46 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.AccountCircle
-import androidx.compose.material.icons.filled.AutoAwesome
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.CloudDone
 import androidx.compose.material.icons.filled.CloudUpload
-import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.DeleteOutline
 import androidx.compose.material.icons.filled.Description
 import androidx.compose.material.icons.filled.Download
-import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.Flag
 import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.GraphicEq
-import androidx.compose.material.icons.filled.Home
-import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Movie
 import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Schedule
-import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.SignalWifiOff
 import androidx.compose.material.icons.filled.Stop
-import androidx.compose.material.icons.filled.VideoLibrary
-import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
-import androidx.compose.material3.LinearProgressIndicator
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.NavigationBar
-import androidx.compose.material3.NavigationBarItem
-import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextButton
-import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
-import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.produceState
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.shadow
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.asImageBitmap
-import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextOverflow
-import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.viewinterop.AndroidView
-import androidx.compose.ui.window.Dialog
-import androidx.compose.ui.window.DialogProperties
-import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import androidx.lifecycle.viewmodel.compose.viewModel
-import androidx.media3.common.C
-import androidx.media3.common.MediaItem
-import androidx.media3.common.MimeTypes
-import androidx.media3.common.util.UnstableApi
-import androidx.media3.exoplayer.ExoPlayer
-import androidx.media3.ui.AspectRatioFrameLayout
-import androidx.media3.ui.PlayerView
-import java.io.File
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.withContext
 import kotlin.math.roundToInt
 
 @Composable
@@ -137,7 +62,12 @@ internal fun PremiumWorkflowCard(state: TranslatorUiState) {
         percent >= 70 -> 1
         else -> 2
     }
-    val done = setOf(0) + if (percent >= 70) setOf(2) else emptySet() + if (percent >= 90) setOf(1) else emptySet() + if (percent >= 98) setOf(3) else emptySet()
+    val done: Set<Int> = buildSet {
+        add(0)
+        if (percent >= 70) add(2)
+        if (percent >= 90) add(1)
+        if (percent >= 98) add(3)
+    }
 
     PremiumCard {
         Column(modifier = Modifier.padding(horizontal = 14.dp, vertical = 16.dp)) {
@@ -165,15 +95,15 @@ internal fun PremiumWorkflowCard(state: TranslatorUiState) {
                     horizontalArrangement = Arrangement.SpaceBetween,
                     verticalAlignment = Alignment.Top,
                 ) {
-                    PremiumWorkflowStep("تحليل الملف", "تم", Icons.Default.CloudUpload, index = 0, activeIndex = activeIndex, done = true, compact = compact, modifier = Modifier.weight(1f))
-                    PremiumConnector(active = false, compact = compact)
-                    PremiumWorkflowStep("ترجمة", if (activeIndex == 1) "جاري التنفيذ" else "في الانتظار", Icons.Default.Description, index = 1, activeIndex = activeIndex, done = 1 in done, compact = compact, modifier = Modifier.weight(1f))
-                    PremiumConnector(active = activeIndex == 2, compact = compact)
-                    PremiumWorkflowStep("معالجة الصوت", if (activeIndex == 2) "جاري التنفيذ" else "تم", Icons.Default.GraphicEq, index = 2, activeIndex = activeIndex, done = 2 in done, compact = compact, modifier = Modifier.weight(1f))
-                    PremiumConnector(active = false, compact = compact)
-                    PremiumWorkflowStep("دمج وتركيب", "الصوت والترجمة", Icons.Default.Movie, index = 3, activeIndex = activeIndex, done = 3 in done, compact = compact, modifier = Modifier.weight(1f))
-                    PremiumConnector(active = false, compact = compact)
-                    PremiumWorkflowStep("إنهاء", "حفظ الملف", Icons.Default.Flag, index = 4, activeIndex = activeIndex, done = state.srtFile != null, compact = compact, modifier = Modifier.weight(1f))
+                    PremiumWorkflowStep("تحليل الملف", "تم", Icons.Default.CloudUpload, 0, activeIndex, true, compact, Modifier.weight(1f))
+                    PremiumConnector(false, compact)
+                    PremiumWorkflowStep("ترجمة", if (activeIndex == 1) "جاري التنفيذ" else "في الانتظار", Icons.Default.Description, 1, activeIndex, 1 in done, compact, Modifier.weight(1f))
+                    PremiumConnector(activeIndex == 2, compact)
+                    PremiumWorkflowStep("معالجة الصوت", if (activeIndex == 2) "جاري التنفيذ" else "تم", Icons.Default.GraphicEq, 2, activeIndex, 2 in done, compact, Modifier.weight(1f))
+                    PremiumConnector(false, compact)
+                    PremiumWorkflowStep("دمج وتركيب", "الصوت والترجمة", Icons.Default.Movie, 3, activeIndex, 3 in done, compact, Modifier.weight(1f))
+                    PremiumConnector(false, compact)
+                    PremiumWorkflowStep("إنهاء", "حفظ الملف", Icons.Default.Flag, 4, activeIndex, state.srtFile != null, compact, Modifier.weight(1f))
                 }
             }
         }
@@ -184,7 +114,7 @@ internal fun PremiumWorkflowCard(state: TranslatorUiState) {
 internal fun PremiumWorkflowStep(
     title: String,
     subtitle: String,
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    icon: ImageVector,
     index: Int,
     activeIndex: Int,
     done: Boolean,
@@ -257,14 +187,7 @@ internal fun PremiumMetricsRow(state: TranslatorUiState) {
 }
 
 @Composable
-internal fun PremiumMetricCard(
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
-    soft: Color,
-    tint: Color,
-    value: String,
-    label: String,
-    modifier: Modifier,
-) {
+internal fun PremiumMetricCard(icon: ImageVector, soft: Color, tint: Color, value: String, label: String, modifier: Modifier) {
     Card(
         modifier = modifier,
         shape = RoundedCornerShape(24.dp),
