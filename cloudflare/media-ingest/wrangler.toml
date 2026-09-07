@@ -1,0 +1,12 @@
+name = "h-ai-media-ingest"
+main = "src/index.ts"
+compatibility_date = "2026-09-08"
+
+# Bind this to the dedicated movie bucket before deployment.
+[[r2_buckets]]
+binding = "MOVIES"
+bucket_name = "h-ai-movies"
+
+[vars]
+# Replace with your worker/custom-domain base after deploy, e.g. https://media.example.com
+PUBLIC_BASE_URL = ""
