@@ -1,5 +1,5 @@
 name = "h-ai-smart-media-orchestrator"
-main = "src/index.ts"
+main = "src/index-v3.ts"
 compatibility_date = "2026-09-08"
 
 [observability]
@@ -18,9 +18,19 @@ bucket_name = "h-ai-movies"
 SUPABASE_URL = "https://abavsspydbpkudhswmzp.supabase.co"
 PUBLIC_BASE_URL = ""
 
-# Configure as Worker secrets before deployment:
+# Required Worker secrets before deployment:
 # - GROQ_API_KEY
-# - AZURE_TRANSLATOR_KEY (optional)
-# - AZURE_TRANSLATOR_REGION (optional)
 # - SUPABASE_SERVICE_ROLE_KEY
 # - ORCHESTRATOR_TOKEN
+#
+# Recommended for large direct movie URLs up to 2 GB:
+# - GEMINI_API_KEY
+#
+# Optional highest-quality route for movies larger than the direct provider limits:
+# - AUDIO_EXTRACTOR_URL
+# - AUDIO_EXTRACTOR_TOKEN
+#
+# Optional translation fallback:
+# - AZURE_TRANSLATOR_KEY
+# - AZURE_TRANSLATOR_REGION
+# - AZURE_TRANSLATOR_ENDPOINT
