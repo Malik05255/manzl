@@ -6,6 +6,7 @@ on:
       - 'supabase/functions/media-gateway/**'
       - 'supabase/functions/_shared/**'
       - 'cloudflare/media-ingest/**'
+      - 'cloudflare/smart-media-orchestrator/**'
       - 'web/**'
       - '.github/workflows/smart-media-ci.yml'
   push:
@@ -15,6 +16,7 @@ on:
       - 'supabase/functions/media-gateway/**'
       - 'supabase/functions/_shared/**'
       - 'cloudflare/media-ingest/**'
+      - 'cloudflare/smart-media-orchestrator/**'
       - 'web/**'
       - '.github/workflows/smart-media-ci.yml'
 
@@ -37,5 +39,9 @@ jobs:
       - name: Check web JavaScript
         run: node --check web/app.js
 
-      - name: Bundle Cloudflare Worker
+      - name: Bundle R2 ingest Worker
         run: npx --yes wrangler@latest deploy cloudflare/media-ingest/src/index.ts --dry-run --compatibility-date=2026-09-08
+
+      - name: Bundle durable Smart Media Workflow
+        working-directory: cloudflare/smart-media-orchestrator
+        run: npx --yes wrangler@latest deploy --dry-run
