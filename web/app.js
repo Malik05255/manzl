@@ -1,11 +1,13 @@
 const SUPABASE_FUNCTION = 'https://abavsspydbpkudhswmzp.supabase.co/functions/v1/media-gateway';
 const SUPABASE_PUBLISHABLE_KEY = 'sb_publishable_iuZnOH7ye1WITm-xc44TiQ_CNb2d2qB';
+const PENDING_KEY = 'h_ai_pending_job';
 
 const form = document.getElementById('translateForm');
 const statusCard = document.getElementById('statusCard');
 const resultCard = document.getElementById('resultCard');
 const spinner = document.getElementById('spinner');
 const statusText = document.getElementById('statusText');
+const statusTitle = document.getElementById('statusTitle');
 const startButton = document.getElementById('startButton');
 const player = document.getElementById('player');
 
@@ -24,53 +26,98 @@ form.addEventListener('submit', async (event) => {
   const retention = document.getElementById('retention').value;
   if (!/^https?:\/\//i.test(sourceUrl)) return;
 
-  statusCard.classList.remove('hidden');
-  resultCard.classList.add('hidden');
-  spinner.classList.remove('hidden');
-  statusText.textContent = 'اكتشاف اللغة وفهم الحوار وترجمته…';
-  startButton.disabled = true;
-
+  setWorking('إرسال الفيلم للسحابة…');
   try {
-    const response = await fetch(SUPABASE_FUNCTION, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'apikey': SUPABASE_PUBLISHABLE_KEY,
-        'authorization': `Bearer ${SUPABASE_PUBLISHABLE_KEY}`,
-      },
-      body: JSON.stringify({
-        mode: 'translate_url',
-        client_id: clientId(),
-        source_url: sourceUrl,
-        retention,
-        language: 'auto',
-      }),
+    const accepted = await gateway({
+      mode: 'translate_url',
+      client_id: clientId(),
+      source_url: sourceUrl,
+      retention,
+      language: 'auto',
     });
-    const data = await response.json();
-    if (!response.ok || data.error) throw new Error(data.message || data.error || 'تعذر إكمال الترجمة');
-
-    renderResult(data);
-    statusText.textContent = 'جاهز للمشاهدة';
+    const jobId = accepted.job_id;
+    if (!jobId) throw new Error('لم تُرجع البوابة رقم المهمة');
+    localStorage.setItem(PENDING_KEY, jobId);
+    await watchJob(jobId);
   } catch (error) {
-    statusText.textContent = error.message || 'تعذر إكمال المهمة';
-  } finally {
-    spinner.classList.add('hidden');
-    startButton.disabled = false;
+    fail(error);
   }
 });
 
-function renderResult(data) {
-  document.getElementById('movieTitle').textContent = data.title || 'الفيلم';
-  document.getElementById('language').textContent = `اللغة: ${data.detected_language || 'auto'}`;
-  document.getElementById('providers').textContent = providerText(data.providers);
-  document.getElementById('summary').textContent = data.summary?.summary || 'اكتملت الترجمة. لا يوجد ملخص متاح حاليًا.';
-  fillList('characters', data.summary?.characters, (x) => typeof x === 'string' ? x : `${x.name || ''}${x.role ? ' — ' + x.role : ''}`);
-  fillList('events', data.summary?.major_events, (x) => String(x));
+async function watchJob(jobId) {
+  setWorking('المهمة تعمل في السحابة…');
+  for (;;) {
+    const root = await gateway({ mode: 'get_job', client_id: clientId(), job_id: jobId });
+    const job = root.job;
+    if (!job) {
+      statusText.textContent = 'بانتظار ظهور المهمة على الخادم…';
+      await sleep(1600);
+      continue;
+    }
+
+    const percent = Math.round(Math.max(0, Math.min(1, Number(job.progress || 0))) * 100);
+    statusTitle.textContent = `${percent}%`;
+    statusText.textContent = job.stage || 'المعالجة السحابية';
+
+    if (job.status === 'completed') {
+      localStorage.removeItem(PENDING_KEY);
+      spinner.classList.add('hidden');
+      startButton.disabled = false;
+      renderJob(job);
+      return;
+    }
+    if (job.status === 'failed' || job.status === 'cancelled') {
+      localStorage.removeItem(PENDING_KEY);
+      throw new Error(job.error || job.stage || 'تعذر إكمال المهمة');
+    }
+    await sleep(2000);
+  }
+}
+
+async function gateway(payload) {
+  const response = await fetch(SUPABASE_FUNCTION, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'apikey': SUPABASE_PUBLISHABLE_KEY,
+      'authorization': `Bearer ${SUPABASE_PUBLISHABLE_KEY}`,
+    },
+    body: JSON.stringify(payload),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || data.error) throw new Error(data.message || data.error || `Gateway ${response.status}`);
+  return data;
+}
+
+function setWorking(text) {
+  statusCard.classList.remove('hidden');
+  resultCard.classList.add('hidden');
+  spinner.classList.remove('hidden');
+  statusTitle.textContent = 'H AI';
+  statusText.textContent = text;
+  startButton.disabled = true;
+}
+
+function fail(error) {
+  statusCard.classList.remove('hidden');
+  spinner.classList.add('hidden');
+  statusTitle.textContent = 'تعذر الإكمال';
+  statusText.textContent = error?.message || 'تعذر إكمال المهمة';
+  startButton.disabled = false;
+}
+
+function renderJob(job) {
+  document.getElementById('movieTitle').textContent = job.title || 'الفيلم';
+  document.getElementById('language').textContent = `اللغة: ${job.source_language || 'auto'}`;
+  document.getElementById('providers').textContent = providerText(job.provider_trace);
+  document.getElementById('summary').textContent = job.summary?.summary || 'اكتملت الترجمة. لا يوجد ملخص متاح حاليًا.';
+  fillList('characters', job.summary?.characters, (x) => typeof x === 'string' ? x : `${x.name || ''}${x.role ? ' — ' + x.role : ''}`);
+  fillList('events', job.summary?.major_events, (x) => String(x));
 
   player.innerHTML = '';
-  player.src = data.playback_url || data.source_url;
-  if (data.vtt) {
-    const blob = new Blob([data.vtt], { type: 'text/vtt' });
+  player.src = job.playback_url || job.source_url;
+  if (job.vtt_text) {
+    const blob = new Blob([job.vtt_text], { type: 'text/vtt' });
     const track = document.createElement('track');
     track.kind = 'subtitles';
     track.label = 'العربية';
@@ -80,6 +127,8 @@ function renderResult(data) {
     player.appendChild(track);
   }
   resultCard.classList.remove('hidden');
+  statusText.textContent = 'جاهز للمشاهدة';
+  statusTitle.textContent = '100%';
 }
 
 function providerText(items) {
@@ -96,4 +145,12 @@ function fillList(id, items, format) {
     li.textContent = format(item);
     node.appendChild(li);
   });
+}
+
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+// If the browser was closed while a movie was processing, resume status tracking.
+const pending = localStorage.getItem(PENDING_KEY);
+if (pending) {
+  watchJob(pending).catch(fail);
 }
