@@ -7,7 +7,8 @@ import {
   retentionExpiry,
 } from "../_shared/smart-media-router.ts";
 
-const API_REVISION = "2026-09-08-smart-media-v2-durable";
+const API_REVISION = "2026-09-08-smart-media-v3-private";
+const ACCOUNT_KEY_PATTERN = /^[A-Za-z0-9_-]{32,128}$/;
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders() });
@@ -47,6 +48,9 @@ async function handleTranslateUrl(body: any): Promise<Response> {
     return json({ error: "invalid_source_url", message: "الرابط يجب أن يكون رابط HTTP/HTTPS مباشرًا وقابلًا للوصول." }, 400);
   }
 
+  const clientId = await resolvePrivateClientId(body);
+  if (!clientId) return privateKeyRequired();
+
   const orchestratorUrl = String(Deno.env.get("SMART_MEDIA_ORCHESTRATOR_URL") || "").replace(/\/$/, "");
   const orchestratorToken = String(Deno.env.get("SMART_MEDIA_ORCHESTRATOR_TOKEN") || "");
   if (!orchestratorUrl || !orchestratorToken) {
@@ -56,7 +60,6 @@ async function handleTranslateUrl(body: any): Promise<Response> {
     }, 503);
   }
 
-  const clientId = sanitizeClientId(body?.client_id);
   const title = sanitizeTitle(body?.title || titleFromUrl(sourceUrl));
   const durationMs = Math.max(0, Number(body?.duration_ms || 0));
   const language = normalizeLanguage(body?.language);
@@ -119,16 +122,47 @@ async function handleTranslateUrl(body: any): Promise<Response> {
 
 async function handleGetJob(body: any): Promise<Response> {
   const id = String(body?.job_id || "");
-  const clientId = sanitizeClientId(body?.client_id);
   if (!id) return json({ error: "job_id_required" }, 400);
+  const clientId = await resolvePrivateClientId(body);
+  if (!clientId) return privateKeyRequired();
   const rows = await dbSelect(`media_jobs?id=eq.${encodeURIComponent(id)}&client_id=eq.${encodeURIComponent(clientId)}&limit=1`);
   return json({ status: "ok", job: Array.isArray(rows) ? rows[0] || null : null });
 }
 
 async function handleListJobs(body: any): Promise<Response> {
-  const clientId = sanitizeClientId(body?.client_id);
+  const clientId = await resolvePrivateClientId(body);
+  if (!clientId) return privateKeyRequired();
   const rows = await dbSelect(`media_jobs?client_id=eq.${encodeURIComponent(clientId)}&order=created_at.desc&limit=50`);
   return json({ status: "ok", jobs: Array.isArray(rows) ? rows : [] });
+}
+
+/**
+ * A random account key is the bearer credential shared only between the user's
+ * Android app and personal web client. The database stores only a SHA-256 derived
+ * client id, never the raw key. This avoids the old public/hard-coded client id.
+ */
+async function resolvePrivateClientId(body: any): Promise<string | null> {
+  const accountKey = String(body?.account_key || "").trim();
+  if (ACCOUNT_KEY_PATTERN.test(accountKey)) {
+    const bytes = new TextEncoder().encode(`h-ai-personal-account-v1:${accountKey}`);
+    const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+    return `acct-${toHex(digest).slice(0, 48)}`;
+  }
+
+  // Temporary opt-in escape hatch for development migrations only. Never enable
+  // this in a public production deployment.
+  if (Deno.env.get("SMART_MEDIA_ALLOW_LEGACY_CLIENT_ID") === "true") {
+    const legacy = sanitizeClientId(body?.client_id);
+    return legacy === "anonymous" ? null : legacy;
+  }
+  return null;
+}
+
+function privateKeyRequired(): Response {
+  return json({
+    error: "personal_key_required",
+    message: "مفتاح H AI الشخصي مطلوب للوصول إلى مكتبتك السحابية.",
+  }, 401);
 }
 
 async function upsertJob(id: string, values: Record<string, unknown>) {
@@ -189,6 +223,10 @@ function titleFromUrl(value: string): string {
   } catch {
     return "Movie";
   }
+}
+
+function toHex(bytes: Uint8Array): string {
+  return Array.from(bytes, (b) => b.toString(16).padStart(2, "0")).join("");
 }
 
 function json(body: unknown, status = 200): Response {
