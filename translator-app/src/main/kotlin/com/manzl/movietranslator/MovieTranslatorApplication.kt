@@ -17,8 +17,6 @@ class MovieTranslatorApplication : Application() {
         lastSystemFontScale = resources.configuration.fontScale
         applyAdaptiveConfiguration(this, lastSystemFontScale)
 
-        // Apply the same app-only normalization to each Activity before Compose is created.
-        // This makes the layout independent from Android Display size / Screen zoom settings.
         registerActivityLifecycleCallbacks(object : ActivityLifecycleCallbacks {
             override fun onActivityPreCreated(activity: Activity, savedInstanceState: Bundle?) {
                 applyAdaptiveConfiguration(activity, lastSystemFontScale)
@@ -37,7 +35,6 @@ class MovieTranslatorApplication : Application() {
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
-        // Capture the user's real font setting before applying our app-local capped value.
         lastSystemFontScale = newConfig.fontScale
         super.onConfigurationChanged(newConfig)
         applyAdaptiveConfiguration(this, lastSystemFontScale)
@@ -74,9 +71,9 @@ class MovieTranslatorApplication : Application() {
 /**
  * App-local UI metrics derived from physical pixels rather than Android's logical dp size.
  *
- * A 200% Display size setting can halve the logical width Android reports while the phone still
- * has the same physical pixel area. Using the physical pixel bounds as the source of truth keeps
- * the reference layout proportional instead of multiplying already-large cards and typography.
+ * The UI reference is the approved 922 x 2048 Honor 200 capture. The logical reference keeps the
+ * same 922:2048 aspect ratio (430 x 955.3 dp), so display zoom cannot independently stretch width
+ * and height. Other Android devices fit this reference uniformly and keep the same composition.
  */
 internal data class AdaptiveUiMetrics(
     val density: Float,
@@ -110,14 +107,12 @@ internal fun calculateAdaptiveUiMetrics(
 
     return AdaptiveUiMetrics(
         density = fittedDensity.coerceAtLeast(MIN_APP_DENSITY),
-        // Retain modest accessibility scaling, but prevent 150–200% font/display combinations
-        // from clipping dialogs, action buttons and the bottom navigation.
         fontScale = safeSystemFontScale.coerceIn(MIN_APP_FONT_SCALE, MAX_APP_FONT_SCALE),
     )
 }
 
 private const val REFERENCE_PORTRAIT_WIDTH_DP = 430f
-private const val REFERENCE_PORTRAIT_HEIGHT_DP = 820f
+private const val REFERENCE_PORTRAIT_HEIGHT_DP = 955.3f
 private const val MIN_APP_DENSITY = 0.75f
 private const val MIN_APP_FONT_SCALE = 0.85f
 private const val MAX_APP_FONT_SCALE = 1.15f
