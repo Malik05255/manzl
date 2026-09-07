@@ -5,9 +5,10 @@ import kotlin.math.min
 /**
  * Device-independent sizing rules for the premium UI.
  *
- * The UI is intentionally derived from the available logical window, not from a device model.
- * This keeps the same hierarchy on compact phones, tall phones, large-screen phones and tablets,
- * while allowing short windows to compress vertically instead of overlapping.
+ * The approved visual reference is calibrated against the Honor 200 class window (roughly
+ * 430dp wide and 950dp tall after the app-local density normalization). Other Android phones use
+ * the same system with smooth compression/expansion rather than model-name checks, so the layout
+ * remains stable when the APK is installed on another device.
  */
 internal data class PremiumResponsiveSpec(
     val scale: Float,
@@ -44,12 +45,12 @@ internal fun calculatePremiumResponsiveSpec(
         safeHeight < 740f -> 0.76f
         safeHeight < 820f -> 0.82f
         safeHeight < 900f -> 0.90f
-        safeHeight < 940f -> 0.96f
+        safeHeight < 930f -> 0.96f
         else -> 1.00f
     }
 
     // Font scale is already capped app-wide, but reserve a little extra space when accessibility
-    // text is larger so cards compress before labels wrap into each other.
+    // text is larger so labels never collide with icons or neighboring cards.
     val fontGuard = when {
         safeFont > 1.10f -> 0.94f
         safeFont > 1.04f -> 0.97f
@@ -57,24 +58,36 @@ internal fun calculatePremiumResponsiveSpec(
     }
     val scale = min(widthFactor, heightFactor) * fontGuard
 
+    // Honor 200 calibration is geometry-based, not device-name-based. A phone with the same tall
+    // logical window receives the same premium proportions. The blend is continuous so nearby
+    // Samsung/Pixel/Honor sizes stay visually consistent instead of jumping between layouts.
+    val tallPhoneBlend = if (safeWidth in 405f..455f) {
+        ((safeHeight - 915f) / 40f).coerceIn(0f, 1f)
+    } else {
+        0f
+    }
+
+    fun tuned(base: Float, honorTarget: Float): Float =
+        (base + (honorTarget - base) * tallPhoneBlend) * scale
+
     return PremiumResponsiveSpec(
         scale = scale,
         compactWidth = safeWidth < 390f,
         shortHeight = safeHeight < 820f,
-        outerPadding = 12f * scale,
-        verticalGap = 9f * scale,
-        headerTitleSp = 27f * scale,
-        headerSubtitleSp = 13f * scale,
-        greetingTitleSp = 15f * scale,
-        greetingSubtitleSp = 11f * scale,
-        avatarDp = 46f * scale,
-        heroHeightDp = 218f * scale,
-        posterWidthDp = 112f * scale,
-        posterHeightDp = 174f * scale,
-        workflowHeightDp = 180f * scale,
-        metricHeightDp = 112f * scale,
-        statusHeightDp = 80f * scale,
-        stopHeightDp = 64f * scale,
-        bottomBarHeightDp = 74f * scale,
+        outerPadding = tuned(12f, 12f),
+        verticalGap = tuned(9f, 10.5f),
+        headerTitleSp = tuned(27f, 29f),
+        headerSubtitleSp = tuned(13f, 13.5f),
+        greetingTitleSp = tuned(15f, 16f),
+        greetingSubtitleSp = tuned(11f, 11.5f),
+        avatarDp = tuned(46f, 49f),
+        heroHeightDp = tuned(218f, 232f),
+        posterWidthDp = tuned(112f, 116f),
+        posterHeightDp = tuned(174f, 184f),
+        workflowHeightDp = tuned(180f, 205f),
+        metricHeightDp = tuned(112f, 128f),
+        statusHeightDp = tuned(80f, 94f),
+        stopHeightDp = tuned(64f, 76f),
+        bottomBarHeightDp = tuned(74f, 80f),
     )
 }
