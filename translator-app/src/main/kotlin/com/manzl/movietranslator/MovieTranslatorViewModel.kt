@@ -21,6 +21,7 @@ data class TranslatorUiState(
     val movieKey: String = "",
     val videoDurationMs: Long = 0L,
     val isRunning: Boolean = false,
+    val isPaused: Boolean = false,
     val progress: Float = 0f,
     val stage: String = "جاهز",
     val error: String? = null,
@@ -67,6 +68,7 @@ class MovieTranslatorViewModel(application: Application) : AndroidViewModel(appl
     private fun resumePendingWorkerIfNeeded(appContext: android.content.Context) {
         viewModelScope.launch(Dispatchers.IO) {
             if (CloudJobStore(appContext).load() == null) return@launch
+            if (CloudMovieTranslationService.isPauseRequested(appContext)) return@launch
             val workManager = WorkManager.getInstance(appContext)
             val active = runCatching {
                 workManager.getWorkInfosByTag("movie-cloud-completion").get().any { info ->
@@ -120,6 +122,8 @@ class MovieTranslatorViewModel(application: Application) : AndroidViewModel(appl
     }
 
     fun start() = CloudMovieTranslationService.start(getApplication())
+    fun pause() = CloudMovieTranslationService.pause(getApplication())
+    fun resume() = CloudMovieTranslationService.resume(getApplication())
     fun cancel() = CloudMovieTranslationService.cancel(getApplication())
 
     fun refreshLibrary() {
