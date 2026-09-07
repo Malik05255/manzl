@@ -8,6 +8,7 @@ on:
       - 'supabase/migrations/20260908_smart_media_gateway*.sql'
       - 'cloudflare/media-ingest/**'
       - 'cloudflare/smart-media-orchestrator/**'
+      - 'cloud/audio-extractor/**'
       - 'web/**'
       - '.github/workflows/smart-media-ci.yml'
   push:
@@ -19,6 +20,7 @@ on:
       - 'supabase/migrations/20260908_smart_media_gateway*.sql'
       - 'cloudflare/media-ingest/**'
       - 'cloudflare/smart-media-orchestrator/**'
+      - 'cloud/audio-extractor/**'
       - 'web/**'
       - '.github/workflows/smart-media-ci.yml'
 
@@ -43,6 +45,12 @@ jobs:
 
       - name: Check web JavaScript
         run: node --check web/app.js
+
+      - name: Check audio extractor Python
+        run: python -m py_compile cloud/audio-extractor/app.py
+
+      - name: Build audio extractor container
+        run: docker build -t h-ai-audio-extractor:ci cloud/audio-extractor
 
       - name: Bundle R2 ingest Worker
         run: npx --yes wrangler@latest deploy cloudflare/media-ingest/src/index.ts --dry-run --compatibility-date=2026-09-08
