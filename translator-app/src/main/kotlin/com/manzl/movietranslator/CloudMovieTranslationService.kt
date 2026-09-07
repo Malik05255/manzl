@@ -10,6 +10,7 @@ import android.content.Intent
 import android.media.MediaMetadataRetriever
 import android.net.Uri
 import android.os.IBinder
+import android.os.PowerManager
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -32,10 +33,15 @@ class CloudMovieTranslationService : Service() {
         private const val ACTION_CANCEL = "com.manzl.movietranslator.cloud.CANCEL"
         private const val ACTION_PAUSE = "com.manzl.movietranslator.cloud.PAUSE"
         private const val ACTION_RESUME = "com.manzl.movietranslator.cloud.RESUME"
+        private const val EXTRA_VIDEO_URI = "video_uri"
+        private const val EXTRA_VIDEO_NAME = "video_name"
+        private const val EXTRA_MOVIE_KEY = "movie_key"
+        private const val EXTRA_DURATION_MS = "duration_ms"
         private const val CHANNEL_ID = "cloud_movie_translation"
         private const val NOTIFICATION_ID = 4201
         private const val TWO_HOURS_MS = 2L * 60L * 60_000L
         private const val MAX_MOVIE_MS = 3L * 60L * 60_000L
+        private const val WAKE_LOCK_TIMEOUT_MS = 4L * 60L * 60_000L
         private const val CONTROL_PREFS = "cloud_translation_control"
         private const val KEY_PAUSED = "paused"
 
@@ -67,7 +73,8 @@ class CloudMovieTranslationService : Service() {
 
         fun start(context: Context) {
             val current = _state.value
-            if (current.videoUri == null || current.isRunning) return
+            val uri = current.videoUri ?: return
+            if (current.isRunning) return
             if (current.videoDurationMs > MAX_MOVIE_MS) {
                 _state.update { it.copy(error = "الحد الحالي للفيلم 3 ساعات.") }
                 return
@@ -93,6 +100,10 @@ class CloudMovieTranslationService : Service() {
                 context.applicationContext.startForegroundService(
                     Intent(context.applicationContext, CloudMovieTranslationService::class.java)
                         .setAction(ACTION_START)
+                        .putExtra(EXTRA_VIDEO_URI, uri.toString())
+                        .putExtra(EXTRA_VIDEO_NAME, current.videoName)
+                        .putExtra(EXTRA_MOVIE_KEY, current.movieKey)
+                        .putExtra(EXTRA_DURATION_MS, current.videoDurationMs)
                 )
             }.onFailure { error ->
                 _state.update {
@@ -131,10 +142,15 @@ class CloudMovieTranslationService : Service() {
                 if (pending != null) {
                     CloudCompletionWorker.schedule(context, 150L)
                 } else if (_state.value.videoUri != null) {
+                    val snapshot = _state.value
                     runCatching {
                         context.applicationContext.startForegroundService(
                             Intent(context.applicationContext, CloudMovieTranslationService::class.java)
                                 .setAction(ACTION_RESUME)
+                                .putExtra(EXTRA_VIDEO_URI, snapshot.videoUri.toString())
+                                .putExtra(EXTRA_VIDEO_NAME, snapshot.videoName)
+                                .putExtra(EXTRA_MOVIE_KEY, snapshot.movieKey)
+                                .putExtra(EXTRA_DURATION_MS, snapshot.videoDurationMs)
                         )
                     }
                 }
@@ -283,18 +299,52 @@ class CloudMovieTranslationService : Service() {
             ACTION_CANCEL -> cancelWork()
             ACTION_PAUSE -> requestPause()
             ACTION_RESUME -> {
+                restoreStateFromIntent(intent)
                 requestResume()
                 if (worker?.isActive != true && CloudJobStore(applicationContext).load() == null && _state.value.videoUri != null) {
                     startForeground(NOTIFICATION_ID, notification("استمرار الترجمة", (_state.value.progress * 100f).toInt(), false))
                     beginUploadHandoff()
                 }
             }
-            ACTION_START, null -> if (worker?.isActive != true) {
-                startForeground(NOTIFICATION_ID, notification("تجهيز الصوت", 1, true))
-                beginUploadHandoff()
+            ACTION_START -> {
+                val pending = CloudJobStore(applicationContext).load()
+                if (pending != null) {
+                    restoreBackgroundState(applicationContext, pending)
+                    CloudCompletionWorker.schedule(applicationContext, 100L)
+                    stopSelf(startId)
+                    return START_NOT_STICKY
+                }
+                restoreStateFromIntent(intent)
+                if (worker?.isActive != true && _state.value.videoUri != null) {
+                    startForeground(NOTIFICATION_ID, notification("تجهيز الصوت", maxOf(1, (_state.value.progress * 100f).toInt()), true))
+                    beginUploadHandoff()
+                }
             }
+            null -> Unit
         }
-        return START_NOT_STICKY
+        return when (intent?.action) {
+            ACTION_START, ACTION_RESUME -> START_REDELIVER_INTENT
+            else -> START_NOT_STICKY
+        }
+    }
+
+    private fun restoreStateFromIntent(intent: Intent) {
+        if (_state.value.videoUri != null && _state.value.videoName.isNotBlank()) return
+        val uri = intent.getStringExtra(EXTRA_VIDEO_URI)?.let { runCatching { Uri.parse(it) }.getOrNull() } ?: return
+        val name = intent.getStringExtra(EXTRA_VIDEO_NAME).orEmpty().ifBlank { "movie.mp4" }
+        val duration = intent.getLongExtra(EXTRA_DURATION_MS, 0L)
+        val movieKey = intent.getStringExtra(EXTRA_MOVIE_KEY).orEmpty().ifBlank { CloudLibraryClient.movieKey(name, duration) }
+        _state.value = TranslatorUiState(
+            videoUri = uri,
+            videoName = name,
+            movieKey = movieKey,
+            videoDurationMs = duration,
+            isRunning = true,
+            isPaused = false,
+            progress = 0f,
+            stage = "استعادة المهمة في الخلفية",
+            partCount = if (duration > TWO_HOURS_MS) 2 else 1,
+        )
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -335,6 +385,11 @@ class CloudMovieTranslationService : Service() {
         maxUploadProgress = snapshot.progress.takeIf { it in 0.15f..0.45f }?.let { (it - 0.15f) / 0.30f } ?: 0f
 
         worker = scope.launch {
+            val powerManager = getSystemService(PowerManager::class.java)
+            val wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:cloud_translation").apply {
+                setReferenceCounted(false)
+                acquire(WAKE_LOCK_TIMEOUT_MS)
+            }
             var parts: List<CloudAudioPart> = emptyList()
             try {
                 awaitIfPaused("تجهيز الصوت")
@@ -388,6 +443,7 @@ class CloudMovieTranslationService : Service() {
                 }
             } finally {
                 parts.forEach { runCatching { it.file.delete() } }
+                if (wakeLock.isHeld) runCatching { wakeLock.release() }
                 runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
             }
         }
