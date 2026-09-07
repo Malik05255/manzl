@@ -2,6 +2,8 @@ package com.manzl.movietranslator
 
 import android.content.Context
 import android.net.Uri
+import android.os.ParcelFileDescriptor
+import android.util.Log
 import com.arthenica.ffmpegkit.FFmpegKit
 import com.arthenica.ffmpegkit.FFmpegKitConfig
 import com.arthenica.ffmpegkit.ReturnCode
@@ -42,14 +44,18 @@ internal class CloudAudioExtractor(private val context: Context) {
             plan.forEachIndexed { index, spec ->
                 coroutineContext.ensureActive()
 
-                // Keep a tiny overlap after the first part so a sentence crossing the boundary is not lost.
-                // Duplicate lines are removed after ASR using their absolute timestamp and normalized text.
                 val overlapMs = if (index == 0) 0L else minOf(PART_OVERLAP_MS, spec.first)
                 val actualOffset = spec.first - overlapMs
                 val actualDuration = spec.second + overlapMs
 
                 val output = File(outputDir, "cloud_${System.currentTimeMillis()}_${index + 1}.ogg")
-                transcodePart(safInput, output, actualOffset, actualDuration)
+                transcodePart(
+                    uri = uri,
+                    safInput = safInput,
+                    output = output,
+                    offsetMs = actualOffset,
+                    durationMs = actualDuration,
+                )
                 check(output.isFile && output.length() > 0L) { "تعذر تجهيز الصوت للسحابة." }
                 check(output.length() <= MAX_PART_BYTES) {
                     "الصوت المضغوط أكبر من حد الرفع المجاني. جرّب الملف مرة أخرى بعد تحديث التطبيق."
@@ -60,44 +66,143 @@ internal class CloudAudioExtractor(private val context: Context) {
             outputs
         } catch (error: Throwable) {
             outputs.forEach { it.file.delete() }
-            throw error
+            throw IllegalStateException(
+                "تعذر تجهيز صوت الفيلم محليًا. [AUDIO-PREP-2]",
+                error,
+            )
         }
     }
 
+    /**
+     * Some vendor Android builds expose document-provider movies in a way that FFmpegKit's SAF
+     * protocol cannot keep open for a long-running transcode. We therefore try the already-open
+     * Android descriptor first (/proc/self/fd/N), then retry the official SAF URL automatically.
+     */
     private suspend fun transcodePart(
+        uri: Uri,
+        safInput: String,
+        output: File,
+        offsetMs: Long,
+        durationMs: Long,
+    ) {
+        val directAttempt = runCatching {
+            transcodeUsingFileDescriptor(uri, output, offsetMs, durationMs)
+        }
+        if (directAttempt.isSuccess) return
+
+        Log.w(TAG, "Direct descriptor path failed; retrying FFmpegKit SAF", directAttempt.exceptionOrNull())
+        output.delete()
+
+        val safAttempt = runCatching {
+            transcodeUsingInput(safInput, output, offsetMs, durationMs)
+        }
+        if (safAttempt.isSuccess) return
+
+        Log.e(TAG, "Both direct-descriptor and SAF audio preparation failed", safAttempt.exceptionOrNull())
+        output.delete()
+        throw safAttempt.exceptionOrNull()
+            ?: directAttempt.exceptionOrNull()
+            ?: IllegalStateException("audio_prepare_failed")
+    }
+
+    private suspend fun transcodeUsingFileDescriptor(
+        uri: Uri,
+        output: File,
+        offsetMs: Long,
+        durationMs: Long,
+    ) = suspendCancellableCoroutine<Unit> { continuation ->
+        val descriptor: ParcelFileDescriptor = try {
+            context.contentResolver.openFileDescriptor(uri, "r")
+                ?: throw IllegalStateException("audio_input_descriptor_unavailable")
+        } catch (error: Throwable) {
+            continuation.resumeWithException(error)
+            return@suspendCancellableCoroutine
+        }
+
+        val command = buildFfmpegCommand(
+            input = "/proc/self/fd/${descriptor.fd}",
+            output = output,
+            offsetMs = offsetMs,
+            durationMs = durationMs,
+        )
+
+        var sessionId: Long? = null
+        val session = FFmpegKit.executeAsync(command) { completed ->
+            runCatching { descriptor.close() }
+            if (!continuation.isActive) return@executeAsync
+            if (ReturnCode.isSuccess(completed.returnCode)) {
+                continuation.resume(Unit)
+            } else {
+                val diagnostic = completed.allLogs
+                    .takeLast(8)
+                    .joinToString(" | ") { it.message.trim() }
+                    .take(800)
+                Log.e(TAG, "FFmpeg fd failed (${completed.returnCode}): $diagnostic")
+                continuation.resumeWithException(
+                    IllegalStateException("ffmpeg_fd_failed:${completed.returnCode}")
+                )
+            }
+        }
+        sessionId = session.sessionId
+
+        continuation.invokeOnCancellation {
+            sessionId?.let { FFmpegKit.cancel(it) }
+            runCatching { descriptor.close() }
+            output.delete()
+        }
+    }
+
+    private suspend fun transcodeUsingInput(
         input: String,
         output: File,
         offsetMs: Long,
         durationMs: Long,
     ) = suspendCancellableCoroutine<Unit> { continuation ->
-        val startSeconds = String.format(Locale.US, "%.3f", offsetMs / 1000.0)
-        val durationSeconds = String.format(Locale.US, "%.3f", durationMs / 1000.0)
-        val command = buildString {
-            append("-hide_banner -loglevel error -y ")
-            if (offsetMs > 0L) append("-ss $startSeconds ")
-            append("-i $input -t $durationSeconds -vn -map 0:a:0 ")
-            // FFmpeg 8.x no longer supports the legacy runtime -ac option in this pipeline.
-            // Force mono + 16 kHz through aformat instead so FFmpegKit 8.1.7 can build the audio graph.
-            append("-af \"aformat=sample_rates=16000:channel_layouts=mono\" ")
-            append("-c:a libopus -b:a 24k -vbr off ")
-            append("-application voip -compression_level 5 -f ogg ")
-            append(quote(output.absolutePath))
-        }
-
+        val command = buildFfmpegCommand(input, output, offsetMs, durationMs)
         var sessionId: Long? = null
         val session = FFmpegKit.executeAsync(command) { completed ->
             if (!continuation.isActive) return@executeAsync
-            if (ReturnCode.isSuccess(completed.returnCode)) continuation.resume(Unit)
-            else continuation.resumeWithException(IllegalStateException("تعذر ضغط صوت الفيلم للمسار السحابي."))
+            if (ReturnCode.isSuccess(completed.returnCode)) {
+                continuation.resume(Unit)
+            } else {
+                val diagnostic = completed.allLogs
+                    .takeLast(8)
+                    .joinToString(" | ") { it.message.trim() }
+                    .take(800)
+                Log.e(TAG, "FFmpeg SAF failed (${completed.returnCode}): $diagnostic")
+                continuation.resumeWithException(
+                    IllegalStateException("ffmpeg_saf_failed:${completed.returnCode}")
+                )
+            }
         }
         sessionId = session.sessionId
+
         continuation.invokeOnCancellation {
             sessionId?.let { FFmpegKit.cancel(it) }
             output.delete()
         }
     }
 
+    private fun buildFfmpegCommand(
+        input: String,
+        output: File,
+        offsetMs: Long,
+        durationMs: Long,
+    ): String {
+        val startSeconds = String.format(Locale.US, "%.3f", offsetMs / 1000.0)
+        val durationSeconds = String.format(Locale.US, "%.3f", durationMs / 1000.0)
+        return buildString {
+            append("-hide_banner -loglevel error -y ")
+            if (offsetMs > 0L) append("-ss $startSeconds ")
+            append("-i ${quote(input)} -t $durationSeconds -vn -sn -dn -map 0:a:0 ")
+            append("-ac 1 -ar 16000 -c:a libopus -b:a 24k -vbr off ")
+            append("-application voip -compression_level 5 -f ogg ")
+            append(quote(output.absolutePath))
+        }
+    }
+
     companion object {
+        private const val TAG = "CloudAudioExtractor"
         private const val HOUR_MS = 60L * 60_000L
         private const val MAX_MOVIE_DURATION_MS = 3L * HOUR_MS
         private const val MAX_PART_BYTES = 24L * 1024L * 1024L
