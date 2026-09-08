@@ -1,0 +1,65 @@
+name: Smart Media CI
+
+on:
+  pull_request:
+    paths:
+      - 'supabase/functions/media-gateway/**'
+      - 'supabase/functions/_shared/**'
+      - 'supabase/migrations/20260908_smart_media_*.sql'
+      - 'cloudflare/media-ingest/**'
+      - 'cloudflare/smart-media-orchestrator/**'
+      - 'cloud/audio-extractor/**'
+      - 'scripts/smoke-smart-media-gateway.mjs'
+      - 'web/**'
+      - '.github/workflows/smart-media-ci.yml'
+  push:
+    branches:
+      - 'development-smart-media-v1'
+    paths:
+      - 'supabase/functions/media-gateway/**'
+      - 'supabase/functions/_shared/**'
+      - 'supabase/migrations/20260908_smart_media_*.sql'
+      - 'cloudflare/media-ingest/**'
+      - 'cloudflare/smart-media-orchestrator/**'
+      - 'cloud/audio-extractor/**'
+      - 'scripts/smoke-smart-media-gateway.mjs'
+      - 'web/**'
+      - '.github/workflows/smart-media-ci.yml'
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Check Supabase Smart Media TypeScript
+        run: |
+          deno check supabase/functions/_shared/smart-media-router.ts
+          deno check supabase/functions/media-gateway/index.ts
+
+      - name: Test Smart Router
+        run: deno test supabase/functions/_shared/smart-media-router.test.ts
+
+      - name: Check web JavaScript
+        run: node --check web/app.js
+
+      - name: Smoke test deployed Smart Media gateway
+        run: node scripts/smoke-smart-media-gateway.mjs
+
+      - name: Check audio extractor Python
+        run: python -m py_compile cloud/audio-extractor/app.py
+
+      - name: Build audio extractor container
+        run: docker build -t h-ai-audio-extractor:ci cloud/audio-extractor
+
+      - name: Bundle R2 ingest Worker
+        run: npx --yes wrangler@latest deploy cloudflare/media-ingest/src/index.ts --dry-run --compatibility-date=2026-09-08
+
+      - name: Bundle durable Smart Media Workflow v3
+        working-directory: cloudflare/smart-media-orchestrator
+        run: npx --yes wrangler@latest deploy --dry-run

@@ -1,0 +1,31 @@
+services:
+  - type: web
+    name: h-ai-audio-extractor
+    runtime: docker
+    plan: free
+    region: frankfurt
+    branch: development-smart-media-v1
+    rootDir: cloud/audio-extractor
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeployTrigger: checksPass
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: AUDIO_EXTRACTOR_TOKEN
+        sync: false
+      - key: MAX_SOURCE_BYTES
+        value: "8589934592"
+      - key: SOURCE_TIMEOUT_SECONDS
+        value: "1800"
+      - key: GROQ_TIMEOUT_SECONDS
+        value: "600"
+
+  - type: web
+    name: h-ai-smart-media-web
+    runtime: static
+    branch: development-smart-media-v1
+    rootDir: web
+    staticPublishPath: .
+    autoDeployTrigger: checksPass

@@ -1,0 +1,31 @@
+name: Smart Media capability check
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - development-smart-media-v1
+    paths:
+      - '.github/workflows/smart-media-capability-check.yml'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CF_ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      GROQ_KEY: ${{ secrets.GROQ_API_KEY }}
+      GEMINI_KEY: ${{ secrets.GEMINI_API_KEY }}
+      SUPABASE_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      RENDER_HOOK: ${{ secrets.RENDER_DEPLOY_HOOK }}
+    steps:
+      - name: Report deployment capabilities without exposing secrets
+        shell: bash
+        run: |
+          present() { if [ -n "$2" ]; then echo "$1=present"; else echo "$1=missing"; fi; }
+          present CLOUDFLARE_API_TOKEN "$CF_TOKEN"
+          present CLOUDFLARE_ACCOUNT_ID "$CF_ACCOUNT"
+          present GROQ_API_KEY "$GROQ_KEY"
+          present GEMINI_API_KEY "$GEMINI_KEY"
+          present SUPABASE_ACCESS_TOKEN "$SUPABASE_TOKEN"
+          present RENDER_DEPLOY_HOOK "$RENDER_HOOK"
