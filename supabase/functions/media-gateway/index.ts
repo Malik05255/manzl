@@ -67,7 +67,6 @@ async function handleTranslateUrl(body: any): Promise<Response> {
     }, 503);
   }
 
-  // Hard free-tier guard. A cloud movie job cannot start after the daily cap.
   const quota = await reserveDailySlot();
   if (!quota.allowed) {
     return json({
@@ -180,10 +179,6 @@ function dailyJobLimit(): number {
   return Number.isFinite(raw) ? Math.max(1, Math.min(100, Math.floor(raw))) : DEFAULT_DAILY_JOB_LIMIT;
 }
 
-/**
- * The raw personal sync key is never persisted server-side. Only its SHA-256-derived
- * account id is used to partition private movie jobs between Android and web.
- */
 async function resolvePrivateClientId(body: any): Promise<string | null> {
   const accountKey = String(body?.account_key || "").trim();
   if (ACCOUNT_KEY_PATTERN.test(accountKey)) {
@@ -264,9 +259,13 @@ function validProjectApiKey(req: Request): boolean {
 function parseKeyMap(value: string | undefined): Record<string, string> {
   if (!value) return {};
   try {
-    const root = JSON.parse(value);
+    const root: unknown = JSON.parse(value);
     if (!root || typeof root !== "object" || Array.isArray(root)) return {};
-    return Object.fromEntries(Object.entries(root).filter(([, v]) => typeof v === "string" && v));
+    const out: Record<string, string> = {};
+    for (const [name, candidate] of Object.entries(root as Record<string, unknown>)) {
+      if (typeof candidate === "string" && candidate) out[name] = candidate;
+    }
+    return out;
   } catch {
     return {};
   }
