@@ -9,7 +9,7 @@ services:
     dockerfilePath: ./Dockerfile
     dockerContext: .
     healthCheckPath: /health
-    autoDeployTrigger: off
+    autoDeployTrigger: checksPass
     envVars:
       - key: GROQ_API_KEY
         sync: false
@@ -28,4 +28,4 @@ services:
     branch: development-smart-media-v1
     rootDir: web
     staticPublishPath: .
-    autoDeployTrigger: off
+    autoDeployTrigger: checksPass
