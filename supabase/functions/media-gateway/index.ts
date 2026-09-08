@@ -7,12 +7,19 @@ import {
   retentionExpiry,
 } from "../_shared/smart-media-router.ts";
 
-const API_REVISION = "2026-09-08-smart-media-v3-private";
+const API_REVISION = "2026-09-08-smart-media-v4-zero-bill";
 const ACCOUNT_KEY_PATTERN = /^[A-Za-z0-9_-]{32,128}$/;
+const DEFAULT_DAILY_JOB_LIMIT = 5;
+
+type ServerAuth = { url: string; key: string; legacyJwt: boolean };
+type DailyQuota = { allowed: boolean; used: number; limit: number };
 
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders() });
   if (req.method !== "POST") return json({ error: "method_not_allowed" }, 405);
+  if (!validProjectApiKey(req)) {
+    return json({ error: "invalid_api_key", message: "مفتاح مشروع H AI غير صالح." }, 401);
+  }
 
   try {
     const body = await req.json();
@@ -39,7 +46,7 @@ function handlePlan(body: any): Response {
     language: body?.language,
     retention: body?.retention,
   });
-  return json({ status: "ok", revision: API_REVISION, plan });
+  return json({ status: "ok", revision: API_REVISION, plan, daily_job_limit: dailyJobLimit() });
 }
 
 async function handleTranslateUrl(body: any): Promise<Response> {
@@ -58,6 +65,17 @@ async function handleTranslateUrl(body: any): Promise<Response> {
       error: "orchestrator_not_configured",
       message: "مسار المعالجة الطويلة غير مفعّل بعد على خادم التطوير.",
     }, 503);
+  }
+
+  // Hard free-tier guard. A cloud movie job cannot start after the daily cap.
+  const quota = await reserveDailySlot();
+  if (!quota.allowed) {
+    return json({
+      error: "daily_free_limit_reached",
+      message: `اكتمل حد H AI المجاني اليوم (${quota.limit} أفلام). جرّب غدًا.`,
+      used: quota.used,
+      limit: quota.limit,
+    }, 429);
   }
 
   const title = sanitizeTitle(body?.title || titleFromUrl(sourceUrl));
@@ -116,6 +134,7 @@ async function handleTranslateUrl(body: any): Promise<Response> {
     playback_url: sourceUrl,
     retention,
     expires_at: retentionExpiry(retention),
+    quota: { used: quota.used, limit: quota.limit, remaining: Math.max(0, quota.limit - quota.used) },
     plan: makeRoutePlan({ sourceKind: "url", durationMs, language, retention }),
   }, 202);
 }
@@ -136,10 +155,34 @@ async function handleListJobs(body: any): Promise<Response> {
   return json({ status: "ok", jobs: Array.isArray(rows) ? rows : [] });
 }
 
+async function reserveDailySlot(): Promise<DailyQuota> {
+  const auth = serverAuth();
+  if (!auth) throw new Error("Supabase server credentials unavailable");
+  const limit = dailyJobLimit();
+  const response = await fetch(`${auth.url}/rest/v1/rpc/reserve_media_daily_slot`, {
+    method: "POST",
+    headers: restHeaders(auth),
+    body: JSON.stringify({ p_limit: limit }),
+  });
+  const text = await response.text();
+  if (!response.ok) throw new Error(`quota_reservation_${response.status}:${text.slice(0, 200)}`);
+  const root = JSON.parse(text || "[]");
+  const row = Array.isArray(root) ? root[0] : root;
+  return {
+    allowed: Boolean(row?.allowed),
+    used: Math.max(0, Number(row?.used || 0)),
+    limit: Math.max(1, Number(row?.quota_limit || limit)),
+  };
+}
+
+function dailyJobLimit(): number {
+  const raw = Number(Deno.env.get("SMART_MEDIA_DAILY_JOB_LIMIT") || DEFAULT_DAILY_JOB_LIMIT);
+  return Number.isFinite(raw) ? Math.max(1, Math.min(100, Math.floor(raw))) : DEFAULT_DAILY_JOB_LIMIT;
+}
+
 /**
- * A random account key is the bearer credential shared only between the user's
- * Android app and personal web client. The database stores only a SHA-256 derived
- * client id, never the raw key. This avoids the old public/hard-coded client id.
+ * The raw personal sync key is never persisted server-side. Only its SHA-256-derived
+ * account id is used to partition private movie jobs between Android and web.
  */
 async function resolvePrivateClientId(body: any): Promise<string | null> {
   const accountKey = String(body?.account_key || "").trim();
@@ -149,8 +192,6 @@ async function resolvePrivateClientId(body: any): Promise<string | null> {
     return `acct-${toHex(digest).slice(0, 48)}`;
   }
 
-  // Temporary opt-in escape hatch for development migrations only. Never enable
-  // this in a public production deployment.
   if (Deno.env.get("SMART_MEDIA_ALLOW_LEGACY_CLIENT_ID") === "true") {
     const legacy = sanitizeClientId(body?.client_id);
     return legacy === "anonymous" ? null : legacy;
@@ -179,9 +220,7 @@ async function patchJob(id: string, values: Record<string, unknown>) {
 async function dbSelect(path: string): Promise<any> {
   const auth = serverAuth();
   if (!auth) throw new Error("Supabase server credentials unavailable");
-  const response = await fetch(`${auth.url}/rest/v1/${path}`, {
-    headers: { apikey: auth.key, Authorization: `Bearer ${auth.key}` },
-  });
+  const response = await fetch(`${auth.url}/rest/v1/${path}`, { headers: restHeaders(auth, false) });
   if (!response.ok) throw new Error(`database_read_${response.status}`);
   return response.json();
 }
@@ -191,21 +230,46 @@ async function dbWrite(method: string, path: string, body: unknown, prefer?: str
   if (!auth) throw new Error("Supabase server credentials unavailable");
   const response = await fetch(`${auth.url}/rest/v1/${path}`, {
     method,
-    headers: {
-      apikey: auth.key,
-      Authorization: `Bearer ${auth.key}`,
-      "content-type": "application/json",
-      ...(prefer ? { Prefer: prefer } : {}),
-    },
+    headers: { ...restHeaders(auth), ...(prefer ? { Prefer: prefer } : {}) },
     body: JSON.stringify(body),
   });
   if (!response.ok) throw new Error(`database_write_${response.status}:${(await response.text()).slice(0, 200)}`);
 }
 
-function serverAuth(): { url: string; key: string } | null {
+function restHeaders(auth: ServerAuth, jsonBody = true): Record<string, string> {
+  return {
+    apikey: auth.key,
+    ...(auth.legacyJwt ? { Authorization: `Bearer ${auth.key}` } : {}),
+    ...(jsonBody ? { "content-type": "application/json" } : {}),
+  };
+}
+
+function serverAuth(): ServerAuth | null {
   const url = Deno.env.get("SUPABASE_URL") || "";
-  const key = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
-  return url && key ? { url, key } : null;
+  const secretMap = parseKeyMap(Deno.env.get("SUPABASE_SECRET_KEYS"));
+  const modernSecret = secretMap.default || Object.values(secretMap)[0] || "";
+  const legacy = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY") || "";
+  const key = modernSecret || legacy;
+  return url && key ? { url, key, legacyJwt: key.startsWith("eyJ") } : null;
+}
+
+function validProjectApiKey(req: Request): boolean {
+  const supplied = String(req.headers.get("apikey") || "").trim();
+  if (!supplied) return false;
+  const publishable = Object.values(parseKeyMap(Deno.env.get("SUPABASE_PUBLISHABLE_KEYS")));
+  const legacyAnon = Deno.env.get("SUPABASE_ANON_KEY") || "";
+  return publishable.includes(supplied) || (!!legacyAnon && supplied === legacyAnon);
+}
+
+function parseKeyMap(value: string | undefined): Record<string, string> {
+  if (!value) return {};
+  try {
+    const root = JSON.parse(value);
+    if (!root || typeof root !== "object" || Array.isArray(root)) return {};
+    return Object.fromEntries(Object.entries(root).filter(([, v]) => typeof v === "string" && v));
+  } catch {
+    return {};
+  }
 }
 
 function sanitizeClientId(value: unknown): string {
