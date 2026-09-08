@@ -125,7 +125,6 @@ async function gateway(payload) {
     headers: {
       'content-type': 'application/json',
       'apikey': SUPABASE_PUBLISHABLE_KEY,
-      'authorization': `Bearer ${SUPABASE_PUBLISHABLE_KEY}`,
     },
     body: JSON.stringify(body),
   });
