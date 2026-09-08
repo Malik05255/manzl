@@ -1,0 +1,29 @@
+name: Source Bundle
+
+on:
+  push:
+    branches:
+      - tmp-smart-media-source-bundle
+    paths:
+      - '.github/workflows/source-bundle.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smart-media-source
+          path: |
+            cloudflare/smart-media-orchestrator
+            supabase/functions/media-gateway
+            supabase/functions/_shared
+            web
+            .github/workflows/smart-media-ci.yml
+            .github/workflows/smart-media-dev-deploy.yml
+          if-no-files-found: error
