@@ -1,0 +1,33 @@
+name: Runtime Pipeline CI
+
+on:
+  push:
+    branches: ["main", "dev"]
+    paths:
+      - "backend/render/**"
+      - "cloudflare/movie-workflow/**"
+      - "supabase/functions/movie-gateway/**"
+      - ".github/workflows/runtime-pipeline-ci.yml"
+  pull_request:
+    branches: ["main", "dev"]
+    paths:
+      - "backend/render/**"
+      - "cloudflare/movie-workflow/**"
+      - "supabase/functions/movie-gateway/**"
+      - ".github/workflows/runtime-pipeline-ci.yml"
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Check Render Python services
+        run: python -m py_compile backend/render/audio-normalizer/app.py backend/render/groq-asr/app.py
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Check Cloudflare worker syntax
+        run: node --check cloudflare/movie-workflow/src/index.js
