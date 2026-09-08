@@ -50,6 +50,6 @@ internal class CloudTranslationClient(context: Context) {
     companion object {
         internal const val ENDPOINT = "https://abavsspydbpkudhswmzp.supabase.co/functions/v1/movie-gateway"
         internal const val PUBLISHABLE_KEY = "sb_publishable_iuZnOH7ye1WITm-xc44TiQ_CNb2d2qB"
-        internal const val ANON_JWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXAiOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+        internal const val ANON_JWT = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFiYXZzc3B5ZGJwa3VkaHN3bXpwIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODgzNjAzODIsImV4cCI6MjEwMzkzNjM4Mn0.uBG_5xHNo760PUq2bZLeUqURo9cqIICTeiHpMh-kYxE"
     }
 }
