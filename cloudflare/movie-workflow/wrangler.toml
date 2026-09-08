@@ -1,0 +1,16 @@
+name = "manzl-movie-workflow"
+main = "src/index.js"
+compatibility_date = "2026-09-08"
+workers_dev = true
+
+[[workflows]]
+name = "manzl-movie-audio-workflow"
+binding = "MOVIE_WORKFLOW"
+class_name = "MovieAudioWorkflow"
+
+[[r2_buckets]]
+binding = "MOVIE_AUDIO"
+bucket_name = "manzl-movie-audio"
+
+[triggers]
+crons = ["17 */6 * * *"]
