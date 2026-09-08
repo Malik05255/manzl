@@ -34,9 +34,11 @@ const GEMINI_UPLOAD = "https://generativelanguage.googleapis.com/upload/v1beta/f
 const GEMINI_API = "https://generativelanguage.googleapis.com/v1beta";
 const GEMINI_MODEL = "gemini-3.8-flash";
 
-// Groq documents 25 MB/file on free tier. Keep margin for provider/proxy variation.
+// Direct file uploads on Groq free tier are capped at 25 MB. This constant is
+// therefore used for extractor-generated chunks. Remote URL input is tried first
+// even for larger movies because Groq explicitly supports the `url` parameter for
+// files that are too large to attach directly.
 export const GROQ_DIRECT_SAFE_BYTES = 24 * 1024 * 1024;
-// Gemini File API documents a 2 GB per-file limit on free tier. Use decimal GB conservatively.
 export const GEMINI_FREE_FILE_BYTES = 2_000_000_000;
 
 export async function transcribeRemoteMedia(
@@ -52,18 +54,26 @@ export async function transcribeRemoteMedia(
 ): Promise<RemoteAsrResult> {
   const probe = await probeRemoteMedia(input.sourceUrl);
   const size = probe.sizeBytes;
+  let directError: unknown = null;
 
-  // Small direct files use Whisper. This remains the highest-quality fast path.
-  if (size != null && size <= GROQ_DIRECT_SAFE_BYTES) {
-    return await groqWithFallback(env, input, trace, probe);
+  // Fastest/cheapest path: let Groq pull the remote media itself. This avoids
+  // downloading/transcoding the movie on our infrastructure and keeps the phone idle.
+  // If the provider rejects a particular URL/size/host, the durable workflow falls
+  // through to the FFmpeg extractor or Gemini without changing the client app.
+  if (isGroqSupportedMedia(probe.mimeType, probe.url)) {
+    try {
+      return await groqWithFallback(env, { ...input, sourceUrl: probe.url }, trace, probe);
+    } catch (error) {
+      directError = error;
+    }
   }
 
-  // If an external extractor is configured, prefer it for large movies. It can
-  // remux/extract only the audio and feed <25 MB chunks to Whisper without using
-  // the phone CPU or uploading the full movie to the ASR provider.
+  // High-quality cloud fallback for long movies: stream the source once, extract only
+  // speech-optimized audio, split it under the free direct-upload ceiling, and send the
+  // chunks to Whisper. No full movie is written to the phone.
   if (env.AUDIO_EXTRACTOR_URL) {
     try {
-      return await extractorTranscribe(env, input, trace, probe);
+      return await extractorTranscribe(env, { ...input, sourceUrl: probe.url }, trace, probe);
     } catch (error) {
       trace.push({
         task: "asr",
@@ -76,33 +86,26 @@ export async function transcribeRemoteMedia(
     }
   }
 
-  // Cloud-only free fallback for typical <=2 GB movie files. Gemini receives the
-  // remote file by server-side streaming and returns timestamped source dialogue.
-  // Whisper remains preferred whenever a dedicated extractor is available.
-  if (env.GEMINI_API_KEY && size != null && size > 0 && size <= GEMINI_FREE_FILE_BYTES && isGeminiVideoMime(probe.mimeType, input.sourceUrl)) {
-    return await geminiVideoTranscribe(env, input, trace, probe);
-  }
-
-  // Some servers hide Content-Length. Trying Whisper once is useful for small
-  // signed URLs whose size cannot be probed. Provider 413 errors stay explicit.
-  if (size == null) {
-    try {
-      return await groqWithFallback(env, input, trace, probe);
-    } catch (error) {
-      throw new Error(
-        `تعذر تحديد حجم الفيلم، ولم يقبل Whisper الرابط مباشرة. ${shortError(error)}`,
-      );
-    }
+  // Cloud-only fallback for supported video files up to Gemini File API's configured
+  // free-file ceiling. It is below Whisper in the quality preference order.
+  if (
+    env.GEMINI_API_KEY &&
+    size != null &&
+    size > 0 &&
+    size <= GEMINI_FREE_FILE_BYTES &&
+    isGeminiVideoMime(probe.mimeType, probe.url)
+  ) {
+    return await geminiVideoTranscribe(env, { ...input, sourceUrl: probe.url }, trace, probe);
   }
 
   if (size > GEMINI_FREE_FILE_BYTES) {
     throw new Error(
-      "الفيلم أكبر من 2GB. للحفاظ على الجودة والمجانية يلزم تفعيل AUDIO_EXTRACTOR_URL ليُستخرج الصوت سحابيًا ثم يُقسّم إلى أجزاء Whisper صغيرة.",
+      `تعذر مسار Whisper المباشر، والفيلم أكبر من 2GB. فعّل AUDIO_EXTRACTOR_URL لمسار الصوت السحابي. ${shortError(directError)}`,
     );
   }
 
   throw new Error(
-    "الفيلم أكبر من حد Whisper المباشر. فعّل Gemini أو AUDIO_EXTRACTOR_URL لمسار الأفلام الطويلة.",
+    `لم تقبل منصات الفهم المتاحة رابط الفيلم. ${shortError(directError)}`,
   );
 }
 
@@ -143,7 +146,7 @@ export async function probeRemoteMedia(sourceUrl: string): Promise<RemoteProbe> 
       acceptsRanges = ranged.status === 206 || /bytes/i.test(ranged.headers.get("accept-ranges") || "");
       await ranged.body?.cancel().catch(() => undefined);
     } catch {
-      // Keep unknown size; caller decides the fallback.
+      // Keep unknown size; provider URL path can still succeed.
     }
   }
 
@@ -157,7 +160,8 @@ async function groqWithFallback(
   probe: RemoteProbe,
 ): Promise<RemoteAsrResult> {
   let lastError: unknown = null;
-  for (const model of [input.primaryModel, input.fallbackModel]) {
+  const models = [...new Set([input.primaryModel, input.fallbackModel])];
+  for (const model of models) {
     try {
       const root = await groqTranscribe(env, input.sourceUrl, model, input.language, trace);
       return {
@@ -435,6 +439,15 @@ function inferMime(url: string, headerMime: string): string {
   if (path.endsWith(".wav")) return "audio/wav";
   if (path.endsWith(".flac")) return "audio/flac";
   return raw || "application/octet-stream";
+}
+
+function isGroqSupportedMedia(mime: string, url: string): boolean {
+  const normalized = inferMime(url, mime);
+  if (["video/mp4", "video/webm", "video/mpeg", "audio/mpeg", "audio/mp4", "audio/ogg", "audio/wav", "audio/flac"].includes(normalized)) {
+    return true;
+  }
+  const path = (() => { try { return new URL(url).pathname.toLowerCase(); } catch { return url.toLowerCase(); } })();
+  return /\.(flac|mp3|mp4|mpeg|mpga|m4a|ogg|wav|webm)$/.test(path);
 }
 
 function isGeminiVideoMime(mime: string, url: string): boolean {
