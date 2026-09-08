@@ -5,7 +5,7 @@ on:
     paths:
       - 'supabase/functions/media-gateway/**'
       - 'supabase/functions/_shared/**'
-      - 'supabase/migrations/20260908_smart_media_gateway*.sql'
+      - 'supabase/migrations/20260908_smart_media_*.sql'
       - 'cloudflare/media-ingest/**'
       - 'cloudflare/smart-media-orchestrator/**'
       - 'cloud/audio-extractor/**'
@@ -17,7 +17,7 @@ on:
     paths:
       - 'supabase/functions/media-gateway/**'
       - 'supabase/functions/_shared/**'
-      - 'supabase/migrations/20260908_smart_media_gateway*.sql'
+      - 'supabase/migrations/20260908_smart_media_*.sql'
       - 'cloudflare/media-ingest/**'
       - 'cloudflare/smart-media-orchestrator/**'
       - 'cloud/audio-extractor/**'
